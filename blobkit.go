@@ -74,9 +74,32 @@ func (c *Client) Put(ctx context.Context, r io.Reader, opts PutOptions) (savedOb
 	// 1. Assign or generate canonical logical ObjectID (UUIDv7)
 	objID := opts.ID
 	if objID == "" {
-		objID, err = key.NewObjectID()
-		if err != nil {
-			return nil, WrapError("put", "", "", err)
+		// New upload: auto-generate candidate ID with collision retry loop
+		for attempt := 0; attempt < 5; attempt++ {
+			candidateID, genErr := key.NewObjectID()
+			if genErr != nil {
+				return nil, WrapError("put_generate_id", "", "", genErr)
+			}
+			objID = candidateID
+			if c.registry != nil {
+				existing, getErr := c.registry.GetByID(ctx, objID)
+				if getErr == nil && existing != nil {
+					// Extremely rare UUIDv7 collision: regenerate new ID
+					continue
+				}
+			}
+			break
+		}
+	} else if c.registry != nil {
+		// Intentional update of existing object: verify object is not locked
+		existing, getErr := c.registry.GetByID(ctx, objID)
+		if getErr == nil && existing != nil {
+			if existing.LegalHold {
+				return nil, WrapError("put_overwrite", existing.Key, existing.Provider, ErrObjectLocked)
+			}
+			if existing.RetentionUntil != nil && existing.RetentionUntil.After(time.Now().UTC()) {
+				return nil, WrapError("put_overwrite", existing.Key, existing.Provider, ErrObjectLocked)
+			}
 		}
 	}
 
@@ -510,6 +533,22 @@ func (c *Client) Rename(ctx context.Context, target string, newFilename string) 
 	return ErrUnsupportedOperation
 }
 
+// UpdateMetadata replaces or updates user-defined metadata attributes for an object.
+func (c *Client) UpdateMetadata(ctx context.Context, target string, metadata map[string]string) error {
+	if c.registry == nil {
+		return ErrUnsupportedOperation
+	}
+	objID := target
+	cleanKey := strings.TrimLeft(target, "/")
+	if rec, err := c.registry.GetByKey(ctx, cleanKey); err == nil && rec != nil {
+		objID = rec.ObjectID
+	}
+	if err := c.registry.UpdateMetadata(ctx, objID, metadata); err != nil {
+		return WrapError("update_metadata", objID, "", err)
+	}
+	return nil
+}
+
 // BatchUpdateMetadata applies metadata key-value updates across multiple objects in the registry.
 func (c *Client) BatchUpdateMetadata(ctx context.Context, updates map[string]map[string]string) error {
 	if c.registry == nil {
@@ -539,9 +578,19 @@ func (c *Client) Copy(ctx context.Context, srcTarget string, dstOpts PutOptions)
 
 	dstID := dstOpts.ID
 	if dstID == "" {
-		dstID, err = key.NewObjectID()
-		if err != nil {
-			return nil, WrapError("copy_dst_id", "", "", err)
+		for attempt := 0; attempt < 5; attempt++ {
+			candidateID, genErr := key.NewObjectID()
+			if genErr != nil {
+				return nil, WrapError("copy_generate_id", "", "", genErr)
+			}
+			dstID = candidateID
+			if c.registry != nil {
+				existing, getErr := c.registry.GetByID(ctx, dstID)
+				if getErr == nil && existing != nil {
+					continue
+				}
+			}
+			break
 		}
 	}
 
