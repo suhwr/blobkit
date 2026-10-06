@@ -17,10 +17,10 @@ func TestMemoryStore_CRUD(t *testing.T) {
 
 	rec := &registry.Record{
 		ObjectID:         "01925b3a-7f28-7102-8f92-9428ad0e451b",
-		Namespace:        "bots/autorespon",
-		OwnerID:          "bot_123",
-		Key:              "bots/autorespon/2026/10/06/audio.ogg",
-		Bucket:           "shiro-storage",
+		Namespace:        "media/audio",
+		OwnerID:          "tenant_123",
+		Key:              "media/audio/2026/10/06/audio.ogg",
+		Bucket:           "app-storage",
 		Provider:         "r2-primary",
 		MIMEType:         "audio/ogg",
 		Size:             45000,
@@ -29,8 +29,8 @@ func TestMemoryStore_CRUD(t *testing.T) {
 		Visibility:       blobkit.VisibilityPrivate,
 		Status:           blobkit.StatePending,
 		Metadata: map[string]string{
-			"trigger_word": "halo",
-			"group_id":     "group_abc",
+			"trigger_word": "greeting",
+			"room_id":      "room_abc",
 		},
 	}
 
@@ -45,12 +45,12 @@ func TestMemoryStore_CRUD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetByID failed: %v", err)
 	}
-	if fetched.OwnerID != "bot_123" || fetched.Status != blobkit.StatePending {
+	if fetched.OwnerID != "tenant_123" || fetched.Status != blobkit.StatePending {
 		t.Fatalf("unexpected fetched record: %+v", fetched)
 	}
 
 	// 3. GetByKey
-	byKey, err := store.GetByKey(ctx, "bots/autorespon/2026/10/06/audio.ogg")
+	byKey, err := store.GetByKey(ctx, "media/audio/2026/10/06/audio.ogg")
 	if err != nil {
 		t.Fatalf("GetByKey failed: %v", err)
 	}
@@ -70,8 +70,8 @@ func TestMemoryStore_CRUD(t *testing.T) {
 
 	// 5. Query / Find by Namespace and OwnerID without knowing URL
 	results, err := store.Find(ctx, registry.Filter{
-		Namespace: "bots/autorespon",
-		OwnerID:   "bot_123",
+		Namespace: "media/audio",
+		OwnerID:   "tenant_123",
 		Status:    blobkit.StateCommitted,
 	})
 	if err != nil {
@@ -86,7 +86,7 @@ func TestMemoryStore_CRUD(t *testing.T) {
 
 	// 6. Query by metadata tag
 	metaResults, err := store.Find(ctx, registry.Filter{
-		Metadata: map[string]string{"trigger_word": "halo"},
+		Metadata: map[string]string{"trigger_word": "greeting"},
 	})
 	if err != nil || len(metaResults) != 1 {
 		t.Fatalf("expected 1 metadata match, got %d (err: %v)", len(metaResults), err)

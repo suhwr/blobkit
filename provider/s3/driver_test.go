@@ -97,7 +97,7 @@ func TestURLResolution(t *testing.T) {
 	// CDN configured
 	driverCDN, err := s3.NewDriver(s3.Config{
 		Bucket:        "assets",
-		PublicBaseURL: "https://cdn.shiroine.com",
+		PublicBaseURL: "https://cdn.example.com",
 	})
 	if err != nil {
 		t.Fatalf("unexpected driver init error: %v", err)
@@ -108,7 +108,7 @@ func TestURLResolution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected ResolveURL error: %v", err)
 	}
-	if u != "https://cdn.shiroine.com/avatars/user.png" {
+	if u != "https://cdn.example.com/avatars/user.png" {
 		t.Fatalf("unexpected CDN URL: %s", u)
 	}
 

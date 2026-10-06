@@ -83,9 +83,9 @@ func TestClient_StandaloneDirectUpload(t *testing.T) {
 func TestClient_WithRegistryDiscoveryAndAccess(t *testing.T) {
 	ctx := context.Background()
 	memDriver := memory.NewDriver(memory.Config{
-		Name:          "r2-primary",
-		Bucket:        "shiro-storage",
-		PublicBaseURL: "https://media.shiroine.com",
+		Name:          "primary-storage",
+		Bucket:        "app-storage",
+		PublicBaseURL: "https://media.example.com",
 	})
 	regStore := registry.NewMemoryStore()
 
@@ -103,8 +103,8 @@ func TestClient_WithRegistryDiscoveryAndAccess(t *testing.T) {
 
 	// 1. Upload declaring semantic intent (no raw key, no bucket, no provider, no URL)
 	uploaded, err := client.Put(ctx, bytes.NewReader(audioData), blobkit.PutOptions{
-		Namespace: "bots/autorespon",
-		OwnerID:   "bot_123",
+		Namespace: "media/audio",
+		OwnerID:   "tenant_123",
 		Filename:  "welcome.ogg",
 		Metadata: map[string]string{
 			"trigger": "!halo",
@@ -120,8 +120,8 @@ func TestClient_WithRegistryDiscoveryAndAccess(t *testing.T) {
 
 	// 2. Application discovers object by semantic query (namespace, owner_id) WITHOUT knowing URL or raw key!
 	found, err := client.Find(ctx, registry.Filter{
-		Namespace: "bots/autorespon",
-		OwnerID:   "bot_123",
+		Namespace: "media/audio",
+		OwnerID:   "tenant_123",
 		Status:    blobkit.StateCommitted,
 	})
 	if err != nil {
@@ -152,7 +152,7 @@ func TestClient_WithRegistryDiscoveryAndAccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveURL failed: %v", err)
 	}
-	if !strings.HasPrefix(deliveryURL, "https://media.shiroine.com/bots/autorespon/") {
+	if !strings.HasPrefix(deliveryURL, "https://media.example.com/media/audio/") {
 		t.Fatalf("unexpected delivery URL: %s", deliveryURL)
 	}
 
