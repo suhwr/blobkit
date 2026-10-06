@@ -42,10 +42,11 @@ BlobKit is intentionally designed as an **infrastructure orchestration layer**, 
   - [8. WORM Retention, Legal Hold & Lifecycle](#8-worm-retention-legal-hold--lifecycle)
   - [9. Resumable Multipart Upload Pipeline](#9-resumable-multipart-upload-pipeline)
   - [10. URL Resolution & Presigned Access](#10-url-resolution--presigned-access)
-  - [11. Bounded LRU Caching & Stampede Defense](#11-bounded-lru-caching--stampede-defense)
-  - [12. Decoupled Background Sweeper](#12-decoupled-background-sweeper)
-  - [13. Vendor-Neutral Telemetry & Observability](#13-vendor-neutral-telemetry--observability)
-  - [14. Consumer Unit Testing with Test Fixtures](#14-consumer-unit-testing-with-test-fixtures)
+  - [11. Pluggable Metadata Registries (Memory, SQLite3, PostgreSQL)](#11-pluggable-metadata-registries-memory-sqlite3-postgresql)
+  - [12. Bounded LRU Caching & Stampede Defense](#12-bounded-lru-caching--stampede-defense)
+  - [13. Decoupled Background Sweeper](#13-decoupled-background-sweeper)
+  - [14. Vendor-Neutral Telemetry & Observability](#14-vendor-neutral-telemetry--observability)
+  - [15. Consumer Unit Testing with Test Fixtures](#15-consumer-unit-testing-with-test-fixtures)
 - [Performance Benchmarks](#performance-benchmarks)
 - [License](#license)
 
@@ -562,7 +563,42 @@ fmt.Printf("Direct Upload Target: %s\n", presignedPut.URL)
 
 ---
 
-### 11. Bounded LRU Caching & Stampede Defense
+### 11. Pluggable Metadata Registries (Memory, SQLite3, PostgreSQL)
+
+BlobKit provides first-class, swappable metadata store implementations for `blobkit.MetadataStore`. Applications can select the storage engine that matches their deployment architecture:
+
+```go
+// Option A: In-Memory Store (Zero setup, ephemeral, perfect for tests & workers)
+import "github.com/suhwr/blobkit/registry"
+memStore := registry.NewMemoryStore()
+
+// Option B: SQLite3 Store (Embedded local ACID database, zero external dependencies)
+import "github.com/suhwr/blobkit/registry/sqlite"
+sqliteStore, err := sqlite.New(sqlite.Config{
+    FilePath:    "metadata.db", // Or ":memory:" for tests
+    BusyTimeout: 5 * time.Second,
+    WAL:         true,
+    AutoMigrate: true, // Automatically creates tables and indexes
+})
+
+// Option C: PostgreSQL Store (Clustered, enterprise production database)
+import "github.com/suhwr/blobkit/registry/postgres"
+pgStore, err := postgres.New(postgres.Config{
+    DSN:         "postgres://user:pass@localhost:5432/app_db?sslmode=disable",
+    MaxOpenConns: 25,
+    AutoMigrate:  true, // Automatically creates tables and indexes
+})
+
+// Initialize BlobKit with any chosen store:
+client, _ := blobkit.New(
+    blobkit.WithDriver(r2Driver),
+    blobkit.WithRegistry(sqliteStore), // Or memStore, pgStore
+)
+```
+
+---
+
+### 12. Bounded LRU Caching & Stampede Defense
 
 Prevent cache stampedes and accelerate repeated metadata lookups:
 
@@ -584,7 +620,7 @@ client, _ := blobkit.New(
 
 ---
 
-### 12. Decoupled Background Sweeper
+### 13. Decoupled Background Sweeper
 
 Reclaim storage space and eliminate abandoned upload costs using the decoupled sweeper engine:
 
@@ -613,7 +649,7 @@ defer sweeper.Stop()
 
 ---
 
-### 13. Vendor-Neutral Telemetry & Observability
+### 14. Vendor-Neutral Telemetry & Observability
 
 Monitor throughput, error rates, latencies, and memory semaphore wait times:
 
@@ -648,7 +684,7 @@ type Observer interface {
 
 ---
 
-### 14. Consumer Unit Testing with Test Fixtures
+### 15. Consumer Unit Testing with Test Fixtures
 
 Test consumer applications without external network calls, cloud credentials, or MinIO containers using `testutil`:
 

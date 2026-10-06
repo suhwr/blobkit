@@ -16,4 +16,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.0 // indirect
 	github.com/aws/smithy-go v1.28.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/lib/pq v1.12.3 // indirect
+	github.com/mattn/go-sqlite3 v1.14.52 // indirect
 )
