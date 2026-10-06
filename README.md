@@ -4,42 +4,44 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/suhwr/blobkit)](https://goreportcard.com/report/github.com/suhwr/blobkit)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-BlobKit is a high-performance, high-level object storage infrastructure library for Go. Built on top of AWS SDK v2, it provides an idiomatic, provider-agnostic infrastructure layer for applications interfacing with S3-compatible backends—including **Cloudflare R2**, **AWS S3**, **MinIO**, **Wasabi**, and **Backblaze B2**.
+BlobKit is a high-performance, resilient object storage infrastructure library for Go. Built on top of AWS SDK v2, it provides a clean, provider-agnostic infrastructure layer for modern applications interfacing with S3-compatible backends—including **Cloudflare R2**, **AWS S3**, **MinIO**, **Wasabi**, and **Backblaze B2**.
 
-BlobKit is intentionally designed as an **infrastructure orchestrator**, not a superficial SDK wrapper. It decouples application business domains from physical storage wire details, manages canonical object identity, enforces bounded memory budgets, routes across multiple providers, and separates physical storage from delivery access.
+BlobKit is deliberately engineered as an **infrastructure orchestration layer**, not a superficial SDK wrapper. It decouples application business intent from raw storage wire details, manages canonical object identity, enforces strict streaming memory budgets, routes across multiple cloud providers with circuit breaking and load balancing, safeguards against security vulnerabilities, and coordinates comprehensive object lifecycles.
 
 ---
 
-## Architecture & Responsibilities
+## Architectural Principles & Strict Separation of Concerns
 
-BlobKit enforces a strict three-tier separation of concerns:
+BlobKit enforces a strict three-tier architecture:
 
 ```
 +-----------------------------------------------------------------------------------+
-| 1. APPLICATION LAYER (Consumer: shiro, shiroine-web, microservices)              |
+| 1. APPLICATION LAYER (e.g., bot engines, web backends, microservices)             |
 |    - Declares semantic intent: Namespace, OwnerID, Original Filename, Visibility |
 |    - Passes streaming data (io.Reader)                                            |
-|    - Discovers objects by metadata attributes without knowing URLs or raw keys    |
+|    - Discovers objects by metadata attributes without knowing raw bucket keys     |
 +-----------------------------------------------------------------------------------+
                                          |
                                          v
 +-----------------------------------------------------------------------------------+
 | 2. BLOBKIT INFRASTRUCTURE LAYER (Orchestration Engine)                            |
-|    - Logical ObjectID generation (UUIDv7)                                         |
-|    - Structured physical ObjectKey generation (date-prefix, sharded, namespaced)  |
-|    - Zero-rewind 512-byte MIME sniffing (io.MultiReader)                          |
-|    - Strict bounded memory enforcement (per-upload concurrency & global limiter)  |
-|    - Deterministic provider routing & circuit failover                            |
-|    - Dynamic access URL delivery (CDN resolver vs presigned URLs)                 |
-|    - Metadata Registry coordination (Database source of truth for indexes)        |
+|    - Logical ObjectID generation (UUIDv7) & structured key generation             |
+|    - Zero-rewind 512B MIME sniffing & streaming SHA-256 integrity verification     |
+|    - Security Policy Engine (MIME/extension whitelist, path & CRLF sanitization)  |
+|    - Resumable multipart upload session lifecycle & state tracking                |
+|    - Retention policies, legal hold enforcement & decoupled background sweeper    |
+|    - Advanced Routing (Weighted traffic, 3-state Circuit Breaker, Capability bits) |
+|    - Bounded LRU caching with negative caching & vendor-neutral telemetry         |
+|    - Database Metadata Registry coordination (Database source of truth)           |
 +-----------------------------------------------------------------------------------+
                                          |
                                          v
 +-----------------------------------------------------------------------------------+
-| 3. PROVIDER DRIVER LAYER (Storage Abstraction)                                    |
+| 3. PROVIDER DRIVER LAYER (Storage Driver Abstraction)                             |
 |    - AWS SDK v2 Driver (R2, S3, MinIO) with persistent pooled HTTP/2 transport   |
-|    - Pure In-Memory Driver for offline testing and ephemeral workloads            |
+|    - Pure In-Memory Driver for offline unit tests and ephemeral workloads         |
 |    - Error scrubbing (sanitizes internal proxy dials and secret tokens)           |
+|    - Native server-side copy & driver multipart chunking                          |
 +-----------------------------------------------------------------------------------+
                                          |
                                          v
@@ -60,21 +62,67 @@ BlobKit strictly decouples four distinct concepts:
 | **Logical Identity** | `ObjectID` | `01925b3a-7f28-7102-8f92-9428ad0e451b` (UUIDv7) | **Yes** (Primary Key) |
 | **Physical Storage Key** | `ObjectKey` | `bots/autorespon/2026/10/06/01925b3a...png` | **Yes** (Storage Index) |
 | **Client Presentation** | `Original Filename` | `voice_note.ogg` | **Yes** (Header/Audit) |
-| **Delivery URL** | `Access URL` | `https://cdn.example.com/...` (CDN) or `https://...?X-Amz-...` | **NO** (Generated on-demand) |
+| **Delivery URL** | `Access URL` | `https://cdn.example.com/...` or signed presigned URL | **NO** (Generated on-demand) |
 
 > [!IMPORTANT]
 > **URLs are delivery details, never canonical identifiers.** Storing full URLs in databases causes schema rot when domains migrate, buckets change, or certificates rotate. In BlobKit, URLs are resolved dynamically via `ResolveURL` or `PresignGet`.
 
 ---
 
-## Features
+## Core Features Across 9 Categories
 
-- **Streaming-First & Zero-Rewind Sniffing**: Uses `io.ReadFull(512B)` + `io.MultiReader` to detect MIME types without buffering entire files in RAM.
-- **Bounded Memory Budgets**: Multipart streaming uploads enforce per-upload worker concurrency (default 2 workers, 5MB chunks) and a client-wide byte semaphore ceiling (default 64MB) to prevent OOM spikes.
-- **Persistent Connection Pooling**: The S3 driver configures a tuned HTTP/2 `*http.Transport` with connection pooling, avoiding connection churn under high concurrency.
-- **Sanitized Error Boundary**: Internal network topology, private proxy dial failures, and credential tokens are scrubbed from error messages automatically.
-- **Multi-Provider Routing**: Supports single primary (`Fixed`), active-passive circuit failover with cooldown probing (`Failover`), and namespace-based routing (`Namespace`).
-- **Optional Metadata Registry**: Coordinate two-phase uploads or rich metadata queries (`Find`) by owner, namespace, or custom tags while maintaining the ability to run standalone without a database.
+### 1. Lifecycle Management & Background Automation
+- **Retention Policies & Legal Hold**: Protect objects against premature deletion (`RetentionUntil`, `LegalHold`). Attempting to delete a locked object returns `ErrObjectLocked`.
+- **Expiration**: Ephemeral blobs auto-expire based on `ExpiresAt`.
+- **Soft Delete & Restore**: Mark records as deleted (`SoftDelete`) while keeping physical bytes, or recover them (`Restore`). Soft-deleted objects are shielded from regular `Get`/`Head` queries.
+- **Permanent Purge**: Cleanly wipe physical blobs from storage drivers and delete registry records via `PermanentDelete`.
+- **Decoupled Background Sweeper**: `lifecycle.NewSweeper` periodically reclaims expired objects, purges soft-deleted objects older than `SoftDeleteTTL`, and aborts abandoned multipart uploads.
+
+### 2. High-Level Object Operations
+- **Server-Side & Cross-Driver Copy**: Fast server-side copy when source and destination share the same provider supporting `CapCopy`; seamless streaming fallback across different drivers.
+- **Move**: Atomic copy-and-delete pipeline.
+- **Rename**: Instant logical filename updates in metadata registry without touching physical storage keys.
+- **Batch Metadata Updates**: Multi-key metadata updates (`BatchUpdateMetadata`).
+- **Bounded Concurrency DeleteBatch**: Efficient bulk deletion with chunked provider calls.
+- **Existence Checks & Head**: `Exists` and `Head` inspect metadata without transferring body payloads.
+
+### 3. Integrity & Verification
+- **Streaming SHA-256 Calculation**: Computes SHA-256 digests on-the-fly during upload via `io.TeeReader` with zero file buffering in RAM.
+- **Client Checksum Verification**: If caller provides an expected hash (`ClientChecksum`), BlobKit aborts and purges the blob if the computed hash mismatches (`ErrChecksumMismatch`).
+- **ETag & Size Verification**: Strict bounds checking prevents corrupted or truncated uploads.
+
+### 4. Resumable Multipart Uploads
+- **Upload Sessions**: Long-running uploads track lifecycle states (`SessionActive`, `SessionCommitted`, `SessionAborted`).
+- **Reliable Part Chunking**: Upload individual parts (`UploadPart`), list completed chunks (`ListSessionParts`), and commit into a finalized object (`CommitResumableUpload`).
+- **Stale Session Abort**: Automatically aborts abandoned sessions to prevent runaway cloud storage costs.
+
+### 5. Vendor-Neutral Observability
+- **Pluggable Observer Interface**: Implement `blobkit.Observer` to export metrics to Prometheus, OpenTelemetry, Datadog, or Zap.
+- **MetricsCollector**: Thread-safe in-memory metrics collector tracking operation latencies, error counts, byte volumes, and limiter contention.
+- **Zero Credential Leaks**: Sensitive proxy endpoints, tokens, and query parameters are scrubbed before reaching telemetry spans or logs.
+
+### 6. Modular Caching Layer
+- **Bounded LRU Cache**: Memory-efficient `cache.NewLRUCache(capacity)` stores hot object metadata.
+- **Negative Caching**: Cache object-not-found misses (`SetNegative`) with short TTLs to shield downstream storage backends from stampedes.
+- **Race-Safe Invalidation**: Mutex-guarded cache invalidation triggers automatically on `Put`, `Delete`, `Copy`, `Move`, and `PermanentDelete`.
+
+### 7. Advanced Multi-Provider Routing
+- **Fixed Router**: Directs traffic to a single primary backend.
+- **Namespace Router**: Routes by domain or category (e.g. `avatars` to R2, `backups` to S3).
+- **Failover Router**: Automatic active-passive failover with consecutive failure thresholds and cooldown canary probes.
+- **Weighted Router**: Proportional load balancing across multiple providers based on integer weights.
+- **3-State Circuit Breaker**: Wraps drivers in `Closed`, `Open`, and `HalfOpen` states with failure thresholds and canary probes.
+- **Capability-Based Router**: Filters candidate drivers by required capability bitmasks (`CapDirectPut`, `CapMultipartSession`, `CapCopy`, `CapByteRangeGet`).
+
+### 8. Security Policy & Sanitization
+- **Policy Engine**: Configurable MIME type and extension whitelists/blacklists and file size ceilings.
+- **Content/MIME Mismatch Defense**: Detects executable files or discrepancies between claimed file extensions and byte magic signatures (`ErrMIMEMismatch`).
+- **Filename Sanitization**: Automatically scrubs path traversal sequences (`../`), null bytes (`\x00`), and control characters.
+- **Header Injection Defense**: Strips CRLF (`\r\n`) injection attempts from `Content-Disposition` and `Cache-Control` headers.
+
+### 9. Developer Experience
+- **Typed Sentinel Errors**: Idiomatic error predicates: `IsNotFound`, `IsSecurityViolation`, `IsObjectLocked`, `IsChecksumMismatch`, `IsSizeMismatch`.
+- **Test Fixtures**: `testutil.NewMockStorage()` provides an ephemeral in-memory BlobKit environment for unit testing without cloud credentials.
 
 ---
 
@@ -86,9 +134,9 @@ go get github.com/suhwr/blobkit
 
 ---
 
-## Quick Start
+## Quick Start Examples
 
-### 1. Standalone Direct Upload & Retrieval
+### 1. Direct Upload with Security Policy & Observability
 
 ```go
 package main
@@ -100,14 +148,15 @@ import (
     "log"
 
     "github.com/suhwr/blobkit"
-    "github.com/suhwr/blobkit/key"
+    "github.com/suhwr/blobkit/observer"
+    "github.com/suhwr/blobkit/policy"
     "github.com/suhwr/blobkit/provider/s3"
 )
 
 func main() {
     ctx := context.Background()
 
-    // 1. Initialize S3 / Cloudflare R2 driver with connection pooling
+    // 1. Configure Cloudflare R2 / S3 driver
     driver, err := s3.NewDriver(s3.Config{
         Name:            "r2-primary",
         Endpoint:        "https://<account_id>.r2.cloudflarestorage.com",
@@ -120,115 +169,118 @@ func main() {
         log.Fatal(err)
     }
 
-    // 2. Initialize BlobKit client
+    // 2. Define upload security policy
+    uploadPolicy := policy.NewBuilder().
+        AllowExtensions(".jpg", ".jpeg", ".png", ".webp").
+        AllowMIME("image/jpeg", "image/png", "image/webp").
+        MaxSize(10 * 1024 * 1024). // 10MB
+        DisallowMIMEMismatch(true).
+        Build()
+
+    // 3. Attach telemetry collector
+    collector := observer.NewMetricsCollector()
+
+    // 4. Initialize BlobKit client
     client, err := blobkit.New(
         blobkit.WithDriver(driver),
-        blobkit.WithKeyGenerator(key.NewDatePrefixGenerator()),
+        blobkit.WithPolicy(uploadPolicy),
+        blobkit.WithObserver(collector),
     )
     if err != nil {
         log.Fatal(err)
     }
     defer client.Close()
 
-    // 3. Application declares semantic intent
-    data := bytes.NewReader([]byte("Hello from BlobKit!"))
+    // 5. Upload stream
+    data := bytes.NewReader([]byte("fake image data"))
     obj, err := client.Put(ctx, data, blobkit.PutOptions{
-        Namespace: "documents",
-        OwnerID:   "usr_123",
-        Filename:  "welcome.txt",
+        Namespace: "avatars",
+        OwnerID:   "user_123",
+        Filename:  "profile.png",
     })
     if err != nil {
         log.Fatal(err)
     }
 
-    fmt.Printf("Uploaded ObjectID: %s\n", obj.ID)
-    fmt.Printf("Physical Key:      %s\n", obj.Key)
-    fmt.Printf("Detected MIME:     %s\n", obj.ContentType)
-
-    // 4. Resolve delivery URL dynamically
-    url, err := client.ResolveURL(ctx, obj.Key)
-    if err != nil {
-        log.Fatal(err)
-    }
-    fmt.Printf("Delivery URL:      %s\n", url)
+    fmt.Printf("Created ObjectID: %s\n", obj.ID)
+    fmt.Printf("Storage Key:      %s\n", obj.Key)
+    fmt.Printf("SHA-256 Digest:   %s\n", obj.ChecksumSHA256)
 }
 ```
 
----
-
-### 2. Metadata Discovery & Access by ObjectID
-
-When using an enabled metadata registry, applications discover and access blobs by logical attributes without ever managing physical bucket paths:
+### 2. Resumable Multipart Upload
 
 ```go
-// 1. Find objects by semantic criteria
-objects, err := client.Find(ctx, blobkit.Filter{
-    Namespace: "bots/autorespon",
-    OwnerID:   "bot_123",
-    Status:    blobkit.StateCommitted,
+// 1. Initiate session
+session, err := client.InitiateResumableUpload(ctx, blobkit.PutOptions{
+    Namespace: "recordings",
+    Filename:  "video.mp4",
+}, 5*1024*1024, 24*time.Hour)
+
+// 2. Upload chunks concurrently or sequentially
+part1, err := client.UploadPart(ctx, session.ID, 1, chunk1Reader, chunk1Size)
+part2, err := client.UploadPart(ctx, session.ID, 2, chunk2Reader, chunk2Size)
+
+// 3. Finalize into committed object
+finalObj, err := client.CommitResumableUpload(ctx, session.ID)
+fmt.Printf("Uploaded size: %d bytes\n", finalObj.Size)
+```
+
+### 3. Automated Lifecycle Sweeper
+
+```go
+import "github.com/suhwr/blobkit/lifecycle"
+
+// Initialize background sweeper
+sweeper, err := lifecycle.NewSweeper(client, lifecycle.SweeperConfig{
+    Interval:          1 * time.Hour,
+    SoftDeleteTTL:     30 * 24 * time.Hour, // purge after 30 days
+    MultipartStaleTTL: 24 * time.Hour,      // abort abandoned sessions after 24 hours
+    BatchSize:         100,
 })
 if err != nil {
     log.Fatal(err)
 }
 
-for _, obj := range objects {
-    // 2. Download directly by logical ObjectID
-    reader, err := client.Get(ctx, obj.ID, blobkit.GetOptions{})
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer reader.Close()
-
-    // 3. Or generate a secure time-limited presigned URL
-    presigned, err := client.PresignGet(ctx, obj.ID, blobkit.PresignOptions{
-        Expiry: 15 * time.Minute,
-    })
-    fmt.Printf("Presigned URL: %s\n", presigned.URL)
-}
+// Start in background goroutine
+_ = sweeper.Start(ctx)
+defer sweeper.Stop()
 ```
 
----
-
-### 3. Namespace-Based Provider Routing
-
-Route different types of objects across different storage backends automatically:
+### 4. Advanced Circuit Breaker & Weighted Routing
 
 ```go
-import (
-    "github.com/suhwr/blobkit"
-    "github.com/suhwr/blobkit/provider/s3"
-    "github.com/suhwr/blobkit/router"
-)
+import "github.com/suhwr/blobkit/router"
 
-// Primary fast storage (Cloudflare R2)
-r2Driver, _ := s3.NewDriver(s3.Config{Name: "r2-hot", Bucket: "hot-media", ...})
+// 3-State Circuit Breaker router
+cbRouter := router.NewCircuitBreakerRouter(router.CircuitBreakerConfig{
+    Primary:          r2PrimaryDriver,
+    Fallback:         s3BackupDriver,
+    FailureThreshold: 3,
+    SuccessThreshold: 2,
+    Cooldown:         30 * time.Second,
+})
 
-// Cold archival storage (AWS S3 Glacier / Backblaze B2)
-b2Driver, _ := s3.NewDriver(s3.Config{Name: "b2-cold", Bucket: "cold-backups", ...})
-
-// Configure namespace router
-nsRouter := router.NewNamespaceRouter(r2Driver)
-nsRouter.Register("backups", b2Driver)
-nsRouter.Register("archives", b2Driver)
-
-client, _ := blobkit.New(blobkit.WithRouter(nsRouter))
+client, _ := blobkit.New(blobkit.WithRouter(cbRouter))
 ```
 
 ---
 
 ## Benchmarks
 
-Measured on Go 1.27 (Linux x86_64):
+Measured on AMD EPYC 7C13 64-Core Processor (Linux x86_64, Go 1.24):
 
-| Benchmark | Operations | Speed (ns/op) | Memory (B/op) | Allocs/op |
+| Benchmark | Operations | Latency (ns/op) | Memory (B/op) | Allocs/op |
 | :--- | :--- | :--- | :--- | :--- |
-| `BenchmarkMIMESniff` | 1,400,000+ | 765 ns/op | 624 B/op | 3 allocs/op |
-| `BenchmarkKeyGeneration_UUIDv7` | 2,500,000+ | 482 ns/op | 208 B/op | 4 allocs/op |
-| `BenchmarkKeyGeneration_DatePrefix` | 1,500,000+ | 817 ns/op | 256 B/op | 5 allocs/op |
-| `BenchmarkKeyGeneration_HashSharded` | 1,600,000+ | 857 ns/op | 416 B/op | 7 allocs/op |
-| `BenchmarkClient_Get_ByObjectID` | 1,500,000+ | 1,040 ns/op | 610 B/op | 4 allocs/op |
-| `BenchmarkClient_Put_Standalone` | 250,000+ | 4,420 ns/op | 2,429 B/op | 16 allocs/op |
-| `BenchmarkClient_Put_WithRegistry` | 170,000+ | 6,763 ns/op | 3,374 B/op | 19 allocs/op |
+| `BenchmarkCircuitBreaker_Select` | 75,700,000+ | **14.68 ns/op** | **0 B/op** | **0 allocs/op** |
+| `BenchmarkLRUCache_Hit` | 3,030,000+ | **402.7 ns/op** | **320 B/op** | **1 allocs/op** |
+| `BenchmarkKeyGeneration_UUIDv7` | 2,420,000+ | **530.6 ns/op** | **208 B/op** | **4 allocs/op** |
+| `BenchmarkMIMESniff` | 1,340,000+ | **894.8 ns/op** | **624 B/op** | **3 allocs/op** |
+| `BenchmarkKeyGeneration_DatePrefix` | 1,430,000+ | **855.1 ns/op** | **256 B/op** | **5 allocs/op** |
+| `BenchmarkKeyGeneration_HashSharded`| 1,480,000+ | **874.9 ns/op** | **416 B/op** | **7 allocs/op** |
+| `BenchmarkClient_Get_ByObjectID` | 1,000,000+ | **1,457 ns/op** | **707 B/op** | **4 allocs/op** |
+| `BenchmarkClient_Put_Standalone` | 163,000+ | **7,347 ns/op** | **3,019 B/op** | **27 allocs/op** |
+| `BenchmarkClient_Put_WithRegistry` | 122,000+ | **10,795 ns/op** | **4,290 B/op** | **30 allocs/op** |
 
 ---
 

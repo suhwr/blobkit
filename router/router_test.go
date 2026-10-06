@@ -118,3 +118,125 @@ func TestNamespaceRouter(t *testing.T) {
 		t.Fatalf("expected forced 's3-backups', got %v", sel)
 	}
 }
+
+func TestWeightedRouter(t *testing.T) {
+	ctx := context.Background()
+	d1 := memory.NewDriver(memory.Config{Name: "d1"})
+	d2 := memory.NewDriver(memory.Config{Name: "d2"})
+
+	wr, err := router.NewWeightedRouter([]router.WeightedTarget{
+		{Driver: d1, Weight: 80},
+		{Driver: d2, Weight: 20},
+	})
+	if err != nil {
+		t.Fatalf("NewWeightedRouter failed: %v", err)
+	}
+
+	counts := make(map[string]int)
+	for i := 0; i < 1000; i++ {
+		sel, err := wr.Select(ctx, router.RouteContext{Op: router.OpPut})
+		if err != nil {
+			t.Fatalf("Select failed: %v", err)
+		}
+		counts[sel.Name()]++
+	}
+
+	if counts["d1"] < 650 {
+		t.Fatalf("expected d1 (weight 80) to receive >= 650 requests, got %d", counts["d1"])
+	}
+
+	// ForcedProvider test
+	forced, err := wr.Select(ctx, router.RouteContext{ForcedProvider: "d2"})
+	if err != nil || forced.Name() != "d2" {
+		t.Fatalf("expected forced d2, got %v", forced)
+	}
+}
+
+func TestCircuitBreakerRouter(t *testing.T) {
+	ctx := context.Background()
+	primary := memory.NewDriver(memory.Config{Name: "cb-primary"})
+	fallback := memory.NewDriver(memory.Config{Name: "cb-fallback"})
+
+	cb := router.NewCircuitBreakerRouter(router.CircuitBreakerConfig{
+		Primary:          primary,
+		Fallback:         fallback,
+		FailureThreshold: 2,
+		SuccessThreshold: 2,
+		Cooldown:         50 * time.Millisecond,
+	})
+
+	// 1. Initial Closed state
+	if cb.State() != router.CircuitClosed {
+		t.Fatalf("expected CircuitClosed, got %s", cb.State())
+	}
+	sel, err := cb.Select(ctx, router.RouteContext{Op: router.OpPut})
+	if err != nil || sel.Name() != "cb-primary" {
+		t.Fatalf("expected primary in closed state, got %v", sel)
+	}
+
+	// 2. 1 failure -> still closed
+	cb.ReportFailure("cb-primary", errors.New("timeout"))
+	if cb.State() != router.CircuitClosed {
+		t.Fatalf("expected CircuitClosed after 1 fail, got %s", cb.State())
+	}
+
+	// 3. 2nd failure -> trips to Open
+	cb.ReportFailure("cb-primary", errors.New("timeout"))
+	if cb.State() != router.CircuitOpen {
+		t.Fatalf("expected CircuitOpen after 2 fails, got %s", cb.State())
+	}
+
+	// In Open state, traffic diverts to fallback
+	sel, err = cb.Select(ctx, router.RouteContext{Op: router.OpPut})
+	if err != nil || sel.Name() != "cb-fallback" {
+		t.Fatalf("expected fallback in open state, got %v", sel)
+	}
+
+	// 4. Wait for Cooldown -> enters HalfOpen
+	time.Sleep(60 * time.Millisecond)
+	if cb.State() != router.CircuitHalfOpen {
+		t.Fatalf("expected CircuitHalfOpen after cooldown, got %s", cb.State())
+	}
+
+	// Canary probe to primary
+	sel, err = cb.Select(ctx, router.RouteContext{Op: router.OpPut})
+	if err != nil || sel.Name() != "cb-primary" {
+		t.Fatalf("expected primary canary probe in half-open, got %v", sel)
+	}
+
+	// 5. Success 1 -> still HalfOpen (threshold is 2)
+	cb.ReportSuccess("cb-primary")
+	if cb.State() != router.CircuitHalfOpen {
+		t.Fatalf("expected still HalfOpen after 1 success, got %s", cb.State())
+	}
+
+	// 6. Success 2 -> resets to Closed
+	cb.ReportSuccess("cb-primary")
+	if cb.State() != router.CircuitClosed {
+		t.Fatalf("expected CircuitClosed after 2 successes, got %s", cb.State())
+	}
+
+	sel, err = cb.Select(ctx, router.RouteContext{Op: router.OpPut})
+	if err != nil || sel.Name() != "cb-primary" {
+		t.Fatalf("expected primary after recovery, got %v", sel)
+	}
+}
+
+func TestCapabilityRouter(t *testing.T) {
+	ctx := context.Background()
+	d1 := memory.NewDriver(memory.Config{Name: "mem-copy"})
+	d2 := memory.NewDriver(memory.Config{Name: "mem-multi"})
+
+	cr := router.NewCapabilityRouter(d1, d2)
+	all := cr.AllDrivers()
+	if len(all) != 2 {
+		t.Fatalf("expected 2 drivers, got %d", len(all))
+	}
+
+	// Select copy operation
+	sel, err := cr.Select(ctx, router.RouteContext{Op: router.OpCopy})
+	if err != nil || sel == nil {
+		t.Fatalf("failed to select driver with capability: %v", err)
+	}
+}
+

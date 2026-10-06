@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -79,7 +81,9 @@ func (d *Driver) Capabilities() blobkit.Capability {
 		blobkit.CapPresignGet |
 		blobkit.CapPresignPut |
 		blobkit.CapBatchDelete |
-		blobkit.CapByteRangeGet
+		blobkit.CapByteRangeGet |
+		blobkit.CapCopy |
+		blobkit.CapMultipartSession
 }
 
 func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts blobkit.PutOptions) (*blobkit.Object, error) {
@@ -428,6 +432,140 @@ func (d *Driver) ResolveURL(key string) (string, error) {
 		return fmt.Sprintf("%s/%s", strings.TrimRight(d.cfg.Endpoint, "/"), cleanKey), nil
 	}
 	return fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", d.cfg.Bucket, d.cfg.Region, cleanKey), nil
+}
+
+func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
+	source := url.PathEscape(d.cfg.Bucket + "/" + strings.TrimLeft(srcKey, "/"))
+	_, err := d.client.CopyObject(ctx, &s3client.CopyObjectInput{
+		Bucket:     aws.String(d.cfg.Bucket),
+		Key:        aws.String(strings.TrimLeft(dstKey, "/")),
+		CopySource: aws.String(source),
+	})
+	if err != nil {
+		return d.wrapError("copy", srcKey, err)
+	}
+	return nil
+}
+
+func (d *Driver) CreateMultipart(ctx context.Context, obj *blobkit.Object, opts blobkit.PutOptions) (string, error) {
+	input := &s3client.CreateMultipartUploadInput{
+		Bucket:      aws.String(d.cfg.Bucket),
+		Key:         aws.String(obj.Key),
+		ContentType: aws.String(obj.ContentType),
+	}
+	if len(opts.Metadata) > 0 {
+		input.Metadata = opts.Metadata
+	}
+	if opts.ContentDisposition != "" {
+		input.ContentDisposition = aws.String(opts.ContentDisposition)
+	}
+	if opts.CacheControl != "" {
+		input.CacheControl = aws.String(opts.CacheControl)
+	}
+	resp, err := d.client.CreateMultipartUpload(ctx, input)
+	if err != nil {
+		return "", d.wrapError("create_multipart", obj.Key, err)
+	}
+	return *resp.UploadId, nil
+}
+
+func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, partNumber int32, r io.Reader, size int64) (string, error) {
+	resp, err := d.client.UploadPart(ctx, &s3client.UploadPartInput{
+		Bucket:        aws.String(d.cfg.Bucket),
+		Key:           aws.String(key),
+		UploadId:      aws.String(uploadID),
+		PartNumber:    aws.Int32(partNumber),
+		Body:          r,
+		ContentLength: aws.Int64(size),
+	})
+	if err != nil {
+		return "", d.wrapError("upload_part", key, err)
+	}
+	if resp.ETag != nil {
+		return *resp.ETag, nil
+	}
+	return "", nil
+}
+
+func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, uploadID string, parts []blobkit.CompletedPart) (*blobkit.Object, error) {
+	completed := make([]types.CompletedPart, len(parts))
+	var totalSize int64
+	for i, p := range parts {
+		completed[i] = types.CompletedPart{
+			PartNumber: aws.Int32(p.PartNumber),
+			ETag:       aws.String(p.ETag),
+		}
+		totalSize += p.Size
+	}
+	sort.Slice(completed, func(i, j int) bool {
+		return *completed[i].PartNumber < *completed[j].PartNumber
+	})
+
+	resp, err := d.client.CompleteMultipartUpload(ctx, &s3client.CompleteMultipartUploadInput{
+		Bucket:   aws.String(d.cfg.Bucket),
+		Key:      aws.String(obj.Key),
+		UploadId: aws.String(uploadID),
+		MultipartUpload: &types.CompletedMultipartUpload{
+			Parts: completed,
+		},
+	})
+	if err != nil {
+		return nil, d.wrapError("complete_multipart", obj.Key, err)
+	}
+
+	stored := *obj
+	stored.Bucket = d.cfg.Bucket
+	stored.Size = totalSize
+	if resp.ETag != nil {
+		stored.ETag = *resp.ETag
+	}
+	stored.UpdatedAt = time.Now().UTC()
+	stored.Provider = d.cfg.Name
+	return &stored, nil
+}
+
+func (d *Driver) AbortMultipart(ctx context.Context, key string, uploadID string) error {
+	_, err := d.client.AbortMultipartUpload(ctx, &s3client.AbortMultipartUploadInput{
+		Bucket:   aws.String(d.cfg.Bucket),
+		Key:      aws.String(key),
+		UploadId: aws.String(uploadID),
+	})
+	if err != nil {
+		return d.wrapError("abort_multipart", key, err)
+	}
+	return nil
+}
+
+func (d *Driver) ListParts(ctx context.Context, key string, uploadID string) ([]blobkit.CompletedPart, error) {
+	resp, err := d.client.ListParts(ctx, &s3client.ListPartsInput{
+		Bucket:   aws.String(d.cfg.Bucket),
+		Key:      aws.String(key),
+		UploadId: aws.String(uploadID),
+	})
+	if err != nil {
+		return nil, d.wrapError("list_parts", key, err)
+	}
+	var parts []blobkit.CompletedPart
+	for _, p := range resp.Parts {
+		var num int32
+		if p.PartNumber != nil {
+			num = *p.PartNumber
+		}
+		var etag string
+		if p.ETag != nil {
+			etag = *p.ETag
+		}
+		var size int64
+		if p.Size != nil {
+			size = *p.Size
+		}
+		parts = append(parts, blobkit.CompletedPart{
+			PartNumber: num,
+			ETag:       etag,
+			Size:       size,
+		})
+	}
+	return parts, nil
 }
 
 func (d *Driver) Close() error {

@@ -74,6 +74,21 @@ type Object struct {
 	// Metadata contains user-defined metadata key-value pairs.
 	Metadata map[string]string `json:"metadata,omitempty"`
 
+	// RetentionUntil specifies when retention expires. The object cannot be deleted before this date.
+	RetentionUntil *time.Time `json:"retention_until,omitempty"`
+
+	// ExpiresAt specifies when the object expires and is eligible for garbage collection.
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+
+	// LegalHold prevents deletion or modification when true, regardless of retention expiration.
+	LegalHold bool `json:"legal_hold,omitempty"`
+
+	// DeletedAt records when the object was soft-deleted.
+	DeletedAt *time.Time `json:"deleted_at,omitempty"`
+
+	// ClientChecksum is the optional client-declared payload checksum.
+	ClientChecksum string `json:"client_checksum,omitempty"`
+
 	// CreatedAt is the logical creation timestamp.
 	CreatedAt time.Time `json:"created_at"`
 
@@ -141,6 +156,24 @@ type PutOptions struct {
 
 	// CacheControl customizes the Cache-Control HTTP header (e.g. "public, max-age=31536000, immutable").
 	CacheControl string
+
+	// RetentionUntil locks the object against deletion or modification until this timestamp.
+	RetentionUntil *time.Time
+
+	// ExpiresAt marks the object to expire automatically after this timestamp.
+	ExpiresAt *time.Time
+
+	// LegalHold marks the object with an active legal hold.
+	LegalHold bool
+
+	// ClientChecksum specifies an expected payload SHA-256 hash to enforce on upload.
+	ClientChecksum string
+
+	// VerifyIntegrity forces BlobKit to stream-hash and verify the payload SHA-256 during upload.
+	VerifyIntegrity bool
+
+	// Policy overrides client-wide upload validation rules for this specific upload.
+	Policy *Policy
 
 	// Provider forces the upload to use a specific registered driver instead of the router policy.
 	Provider string

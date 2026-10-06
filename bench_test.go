@@ -7,10 +7,12 @@ import (
 	"testing"
 
 	"github.com/suhwr/blobkit"
+	"github.com/suhwr/blobkit/cache"
 	"github.com/suhwr/blobkit/key"
 	"github.com/suhwr/blobkit/mime"
 	"github.com/suhwr/blobkit/provider/memory"
 	"github.com/suhwr/blobkit/registry"
+	"github.com/suhwr/blobkit/router"
 )
 
 func BenchmarkMIMESniff(b *testing.B) {
@@ -181,5 +183,42 @@ func BenchmarkClient_Get_ByObjectID(b *testing.B) {
 		}
 		_, _ = io.Copy(io.Discard, reader)
 		_ = reader.Close()
+	}
+}
+
+func BenchmarkLRUCache_Hit(b *testing.B) {
+	c := cache.NewLRUCache(1000)
+	obj := &blobkit.Object{ID: "bench-obj", Key: "bench-key", Size: 1024}
+	c.Set("bench-obj", obj, 0)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_, ok := c.Get("bench-obj")
+		if !ok {
+			b.Fatal("cache miss")
+		}
+	}
+}
+
+func BenchmarkCircuitBreaker_Select(b *testing.B) {
+	ctx := context.Background()
+	primary := memory.NewDriver(memory.Config{Name: "bench-primary"})
+	fallback := memory.NewDriver(memory.Config{Name: "bench-fallback"})
+	cb := router.NewCircuitBreakerRouter(router.CircuitBreakerConfig{
+		Primary:  primary,
+		Fallback: fallback,
+	})
+	rc := router.RouteContext{Op: router.OpPut}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_, err := cb.Select(ctx, rc)
+		if err != nil {
+			b.Fatal(err)
+		}
 	}
 }

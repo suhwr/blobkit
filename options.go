@@ -48,3 +48,25 @@ func WithDefaultVisibility(vis Visibility) Option {
 		c.defaultVisibility = vis
 	}
 }
+
+// WithPolicy sets the default upload security and validation policy for the client.
+func WithPolicy(p Policy) Option {
+	return func(c *Client) {
+		c.policy = &p
+	}
+}
+
+// WithObserver sets a vendor-neutral observability instrumentation hook.
+func WithObserver(obs Observer) Option {
+	return func(c *Client) {
+		c.observer = obs
+	}
+}
+
+// WithCache sets an optional caching layer for object metadata and negative lookups.
+func WithCache(cache Cache) Option {
+	return func(c *Client) {
+		c.cache = cache
+	}
+}
+

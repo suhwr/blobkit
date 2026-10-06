@@ -6,12 +6,19 @@ import "context"
 type Operation string
 
 const (
-	OpPut     Operation = "put"
-	OpGet     Operation = "get"
-	OpHead    Operation = "head"
-	OpDelete  Operation = "delete"
-	OpList    Operation = "list"
-	OpPresign Operation = "presign"
+	OpPut             Operation = "put"
+	OpGet             Operation = "get"
+	OpHead            Operation = "head"
+	OpDelete          Operation = "delete"
+	OpList            Operation = "list"
+	OpPresign         Operation = "presign"
+	OpCopy            Operation = "copy"
+	OpMove            Operation = "move"
+	OpUploadPart      Operation = "upload_part"
+	OpMultipart       Operation = "multipart"
+	OpSoftDelete      Operation = "soft_delete"
+	OpRestore         Operation = "restore"
+	OpPermanentDelete Operation = "permanent_delete"
 )
 
 // RouteContext carries routing intent from the application or BlobKit core to the router.

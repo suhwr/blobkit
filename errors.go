@@ -35,11 +35,38 @@ var (
 	// ErrUnsupportedOperation indicates that the provider does not support the requested operation.
 	ErrUnsupportedOperation = errors.New("blobkit: unsupported operation")
 
+	// ErrNotSupported is an alias for ErrUnsupportedOperation.
+	ErrNotSupported = ErrUnsupportedOperation
+
 	// ErrMemoryBudgetExceeded indicates that the global or stream multipart memory budget has been exhausted.
 	ErrMemoryBudgetExceeded = errors.New("blobkit: memory budget exceeded")
 
 	// ErrNilReader indicates that a nil io.Reader was passed to an upload operation.
 	ErrNilReader = errors.New("blobkit: nil reader provided")
+
+	// ErrSecurityViolation indicates that an operation violated security policies (e.g. traversal, forbidden extensions).
+	ErrSecurityViolation = errors.New("blobkit: security violation")
+
+	// ErrMIMEMismatch indicates that the content stream magic bytes contradict the claimed file extension.
+	ErrMIMEMismatch = errors.New("blobkit: MIME type mismatch with content")
+
+	// ErrInvalidFilename indicates that the provided filename is empty, malformed, or too long.
+	ErrInvalidFilename = errors.New("blobkit: invalid filename")
+
+	// ErrChecksumMismatch indicates that the computed payload hash does not match the expected checksum.
+	ErrChecksumMismatch = errors.New("blobkit: checksum mismatch")
+
+	// ErrSizeMismatch indicates that the uploaded byte count differs from the declared size.
+	ErrSizeMismatch = errors.New("blobkit: size mismatch")
+
+	// ErrObjectLocked indicates that retention policy or active legal hold prohibits modification or deletion.
+	ErrObjectLocked = errors.New("blobkit: object retention locked or legal hold active")
+
+	// ErrSessionNotFound indicates that the referenced resumable multipart upload session does not exist.
+	ErrSessionNotFound = errors.New("blobkit: upload session not found")
+
+	// ErrSessionExpired indicates that the resumable multipart upload session has expired.
+	ErrSessionExpired = errors.New("blobkit: upload session expired")
 )
 
 // Regex patterns to scrub sensitive data from error messages (tokens, credentials, internal IP/proxy addresses).
@@ -142,4 +169,36 @@ func NewErrorf(op, key, provider, format string, a ...any) error {
 		Provider: provider,
 		Err:      fmt.Errorf(format, a...),
 	}
+}
+
+// Error predicate helpers for idiomatic developer experience:
+
+// IsNotFound reports whether err represents an object or bucket not found error.
+func IsNotFound(err error) bool {
+	return errors.Is(err, ErrObjectNotFound) || errors.Is(err, ErrBucketNotFound)
+}
+
+// IsPreconditionFailed reports whether err represents a precondition failure.
+func IsPreconditionFailed(err error) bool {
+	return errors.Is(err, ErrPreconditionFailed)
+}
+
+// IsProviderUnavailable reports whether err represents a backend outage or network failure.
+func IsProviderUnavailable(err error) bool {
+	return errors.Is(err, ErrProviderUnavailable)
+}
+
+// IsQuotaExceeded reports whether err represents a storage quota limit error.
+func IsQuotaExceeded(err error) bool {
+	return errors.Is(err, ErrQuotaExceeded)
+}
+
+// IsSecurityViolation reports whether err represents a security or validation policy rejection.
+func IsSecurityViolation(err error) bool {
+	return errors.Is(err, ErrSecurityViolation) || errors.Is(err, ErrMIMEMismatch)
+}
+
+// IsObjectLocked reports whether err represents a retention lock or legal hold block.
+func IsObjectLocked(err error) bool {
+	return errors.Is(err, ErrObjectLocked)
 }

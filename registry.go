@@ -36,6 +36,9 @@ type Record struct {
 	// ChecksumSHA256 is the hex-encoded SHA-256 payload digest.
 	ChecksumSHA256 string `json:"checksum_sha256,omitempty"`
 
+	// ETag is the HTTP entity tag from the storage provider.
+	ETag string `json:"etag,omitempty"`
+
 	// OriginalFilename is the client-facing filename (e.g. "photo.png").
 	OriginalFilename string `json:"original_filename,omitempty"`
 
@@ -47,6 +50,18 @@ type Record struct {
 
 	// Metadata holds arbitrary user-defined key-value attributes.
 	Metadata map[string]string `json:"metadata,omitempty"`
+
+	// RetentionUntil specifies when retention lock expires.
+	RetentionUntil *time.Time `json:"retention_until,omitempty"`
+
+	// ExpiresAt specifies when the object automatically expires.
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+
+	// LegalHold prevents deletion or modification when true.
+	LegalHold bool `json:"legal_hold,omitempty"`
+
+	// ClientChecksum is the client-provided checksum (if any).
+	ClientChecksum string `json:"client_checksum,omitempty"`
 
 	// CreatedAt is the logical creation timestamp.
 	CreatedAt time.Time `json:"created_at"`
@@ -68,11 +83,17 @@ func (r *Record) ToObject() Object {
 		Bucket:           r.Bucket,
 		Size:             r.Size,
 		ContentType:      r.MIMEType,
+		ETag:             r.ETag,
 		ChecksumSHA256:   r.ChecksumSHA256,
 		OriginalFilename: r.OriginalFilename,
 		Visibility:       r.Visibility,
 		Status:           r.Status,
 		Metadata:         r.Metadata,
+		RetentionUntil:   r.RetentionUntil,
+		ExpiresAt:        r.ExpiresAt,
+		LegalHold:        r.LegalHold,
+		DeletedAt:        r.DeletedAt,
+		ClientChecksum:   r.ClientChecksum,
 		CreatedAt:        r.CreatedAt,
 		UpdatedAt:        r.UpdatedAt,
 		Provider:         r.Provider,
@@ -83,6 +104,9 @@ func (r *Record) ToObject() Object {
 type Filter struct {
 	// ObjectID filters by canonical identifier.
 	ObjectID string
+
+	// Key filters by physical storage key.
+	Key string
 
 	// Namespace filters by category or sub-category (e.g. "bots/autorespon").
 	Namespace string
@@ -136,8 +160,32 @@ type MetadataStore interface {
 	// UpdateStatus transitions an object lifecycle state (e.g. pending -> committed, or soft deleted).
 	UpdateStatus(ctx context.Context, objectID string, status LifecycleState) error
 
-	// Delete permanently removes or soft-deletes a record from the registry.
+	// UpdateMetadata replaces or updates the user-defined metadata map for an object.
+	UpdateMetadata(ctx context.Context, objectID string, metadata map[string]string) error
+
+	// UpdateFilename updates the client-facing filename of an object without moving physical bytes.
+	UpdateFilename(ctx context.Context, objectID string, newFilename string) error
+
+	// Delete marks an object as soft-deleted or removes it.
 	Delete(ctx context.Context, objectID string) error
+
+	// HardDelete permanently purges the record from the database registry.
+	HardDelete(ctx context.Context, objectID string) error
+
+	// FindExpired returns committed objects whose ExpiresAt is on or before the given timestamp.
+	FindExpired(ctx context.Context, before time.Time, limit int) ([]Record, error)
+
+	// SaveSession persists or updates a resumable multipart upload session.
+	SaveSession(ctx context.Context, session *UploadSession) error
+
+	// GetSession retrieves an active upload session by ID.
+	GetSession(ctx context.Context, sessionID string) (*UploadSession, error)
+
+	// DeleteSession removes a session upon completion or abort.
+	DeleteSession(ctx context.Context, sessionID string) error
+
+	// FindStaleSessions returns active sessions whose ExpiresAt is on or before the given timestamp.
+	FindStaleSessions(ctx context.Context, before time.Time, limit int) ([]UploadSession, error)
 
 	// Close gracefully closes any open database pool connections.
 	Close() error

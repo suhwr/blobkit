@@ -21,6 +21,13 @@ type storedItem struct {
 	data []byte
 }
 
+type memMultipartSession struct {
+	uploadID string
+	key      string
+	obj      blobkit.Object
+	parts    map[int32][]byte
+}
+
 // Driver implements an in-memory storage driver, ideal for offline unit tests and local development.
 type Driver struct {
 	mu            sync.RWMutex
@@ -28,6 +35,7 @@ type Driver struct {
 	bucket        string
 	publicBaseURL string
 	items         map[string]storedItem
+	sessions      map[string]*memMultipartSession
 }
 
 // Config specifies settings for the memory driver.
@@ -52,6 +60,7 @@ func NewDriver(cfg Config) *Driver {
 		bucket:        bucket,
 		publicBaseURL: strings.TrimRight(cfg.PublicBaseURL, "/"),
 		items:         make(map[string]storedItem),
+		sessions:      make(map[string]*memMultipartSession),
 	}
 }
 
@@ -64,7 +73,9 @@ func (d *Driver) Capabilities() blobkit.Capability {
 		blobkit.CapPresignGet |
 		blobkit.CapPresignPut |
 		blobkit.CapBatchDelete |
-		blobkit.CapByteRangeGet
+		blobkit.CapByteRangeGet |
+		blobkit.CapCopy |
+		blobkit.CapMultipartSession
 }
 
 func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts blobkit.PutOptions) (*blobkit.Object, error) {
@@ -91,6 +102,7 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 	if stored.CreatedAt.IsZero() {
 		stored.CreatedAt = now
 	}
+	stored.Status = blobkit.StateCommitted
 	stored.Provider = d.name
 
 	d.mu.Lock()
@@ -254,9 +266,148 @@ func (d *Driver) ResolveURL(key string) (string, error) {
 	return fmt.Sprintf("mem://%s/%s", d.bucket, strings.TrimLeft(key, "/")), nil
 }
 
+func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	item, ok := d.items[srcKey]
+	if !ok {
+		return blobkit.WrapError("copy", srcKey, d.name, blobkit.ErrObjectNotFound)
+	}
+
+	copiedObj := item.obj
+	copiedObj.Key = dstKey
+	copiedObj.UpdatedAt = time.Now().UTC()
+
+	// Clone payload bytes
+	copiedData := make([]byte, len(item.data))
+	copy(copiedData, item.data)
+
+	d.items[dstKey] = storedItem{
+		obj:  copiedObj,
+		data: copiedData,
+	}
+	return nil
+}
+
+func (d *Driver) CreateMultipart(ctx context.Context, obj *blobkit.Object, opts blobkit.PutOptions) (string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	uploadID := fmt.Sprintf("mem-upload-%d", time.Now().UnixNano())
+	d.sessions[uploadID] = &memMultipartSession{
+		uploadID: uploadID,
+		key:      obj.Key,
+		obj:      *obj,
+		parts:    make(map[int32][]byte),
+	}
+	return uploadID, nil
+}
+
+func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, partNumber int32, r io.Reader, size int64) (string, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return "", blobkit.WrapError("upload_part", key, d.name, err)
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	session, ok := d.sessions[uploadID]
+	if !ok {
+		return "", blobkit.WrapError("upload_part", key, d.name, blobkit.ErrSessionNotFound)
+	}
+
+	session.parts[partNumber] = data
+	h := sha256.Sum256(data)
+	etag := fmt.Sprintf("\"%s\"", hex.EncodeToString(h[:16]))
+	return etag, nil
+}
+
+func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, uploadID string, parts []blobkit.CompletedPart) (*blobkit.Object, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	session, ok := d.sessions[uploadID]
+	if !ok {
+		return nil, blobkit.WrapError("complete_multipart", obj.Key, d.name, blobkit.ErrSessionNotFound)
+	}
+
+	// Sort and concatenate parts
+	sort.Slice(parts, func(i, j int) bool {
+		return parts[i].PartNumber < parts[j].PartNumber
+	})
+
+	var total bytes.Buffer
+	for _, p := range parts {
+		data, exists := session.parts[p.PartNumber]
+		if !exists {
+			return nil, blobkit.WrapError("complete_multipart", obj.Key, d.name, fmt.Errorf("part %d missing", p.PartNumber))
+		}
+		total.Write(data)
+	}
+
+	finalData := total.Bytes()
+	h := sha256.Sum256(finalData)
+	hashHex := hex.EncodeToString(h[:])
+	etag := fmt.Sprintf("\"%s-%d\"", hashHex[:16], len(parts))
+
+	now := time.Now().UTC()
+	stored := session.obj
+	stored.Bucket = d.bucket
+	stored.Size = int64(len(finalData))
+	stored.ETag = etag
+	stored.ChecksumSHA256 = hashHex
+	stored.UpdatedAt = now
+	if stored.CreatedAt.IsZero() {
+		stored.CreatedAt = now
+	}
+	stored.Provider = d.name
+
+	d.items[stored.Key] = storedItem{
+		obj:  stored,
+		data: finalData,
+	}
+	delete(d.sessions, uploadID)
+
+	return &stored, nil
+}
+
+func (d *Driver) AbortMultipart(ctx context.Context, key string, uploadID string) error {
+	d.mu.Lock()
+	delete(d.sessions, uploadID)
+	d.mu.Unlock()
+	return nil
+}
+
+func (d *Driver) ListParts(ctx context.Context, key string, uploadID string) ([]blobkit.CompletedPart, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	session, ok := d.sessions[uploadID]
+	if !ok {
+		return nil, blobkit.WrapError("list_parts", key, d.name, blobkit.ErrSessionNotFound)
+	}
+
+	res := make([]blobkit.CompletedPart, 0, len(session.parts))
+	for num, data := range session.parts {
+		h := sha256.Sum256(data)
+		res = append(res, blobkit.CompletedPart{
+			PartNumber: num,
+			ETag:       fmt.Sprintf("\"%s\"", hex.EncodeToString(h[:16])),
+			Size:       int64(len(data)),
+		})
+	}
+	sort.Slice(res, func(i, j int) bool {
+		return res[i].PartNumber < res[j].PartNumber
+	})
+	return res, nil
+}
+
 func (d *Driver) Close() error {
 	d.mu.Lock()
 	d.items = make(map[string]storedItem)
+	d.sessions = make(map[string]*memMultipartSession)
 	d.mu.Unlock()
 	return nil
 }

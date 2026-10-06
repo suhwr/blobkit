@@ -1,0 +1,217 @@
+package blobkit
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"path/filepath"
+	"regexp"
+	"strings"
+)
+
+var (
+	// DefaultMaxFilenameLength is the maximum allowed client filename length.
+	DefaultMaxFilenameLength = 255
+
+	// Dangerous control characters and shell metacharacters
+	reControlChars = regexp.MustCompile(`[\x00-\x1f\x7f]`)
+	reCRLF         = regexp.MustCompile(`[\r\n]`)
+)
+
+// ValidationInput supplies parameters for policy enforcement.
+type ValidationInput struct {
+	Namespace    string
+	Filename     string
+	ContentType  string
+	Size         int64
+	StreamReader io.Reader
+}
+
+// Policy enforces upload security constraints, format whitelists, and size boundaries.
+type Policy struct {
+	// AllowedMIMEs is a whitelist of permitted MIME types (e.g. ["image/jpeg", "image/*", "audio/*"]).
+	AllowedMIMEs []string
+
+	// DeniedMIMEs is a blacklist of forbidden MIME types (e.g. ["application/x-dosexec", "application/x-sh"]).
+	DeniedMIMEs []string
+
+	// AllowedExtensions is a whitelist of permitted file extensions (e.g. [".jpg", ".png", ".pdf"]).
+	AllowedExtensions []string
+
+	// DeniedExtensions is a blacklist of forbidden extensions (e.g. [".exe", ".sh", ".bat", ".cmd", ".php"]).
+	DeniedExtensions []string
+
+	// MaxObjectSize is the maximum allowed payload size in bytes (0 means unlimited).
+	MaxObjectSize int64
+
+	// MinObjectSize is the minimum required payload size in bytes (0 means no minimum).
+	MinObjectSize int64
+
+	// MaxFilenameLength is the maximum allowed filename length (defaults to 255).
+	MaxFilenameLength int
+
+	// DisallowMIMEMismatch flags whether an obvious mismatch between file extension and detected MIME is forbidden.
+	DisallowMIMEMismatch bool
+
+	// ContentScanner is an optional custom scanner hook (e.g. antivirus or deep payload inspection).
+	ContentScanner func(ctx context.Context, r io.Reader, filename, mime string) error
+}
+
+// Validate executes policy rules against the given input.
+func (p *Policy) Validate(ctx context.Context, in ValidationInput) error {
+	if p == nil {
+		return nil
+	}
+
+	maxLen := p.MaxFilenameLength
+	if maxLen <= 0 {
+		maxLen = DefaultMaxFilenameLength
+	}
+
+	// 1. Filename validation
+	if in.Filename != "" {
+		if len(in.Filename) > maxLen {
+			return fmt.Errorf("%w: filename exceeds maximum length of %d", ErrInvalidFilename, maxLen)
+		}
+		if reControlChars.MatchString(in.Filename) || strings.Contains(in.Filename, "\x00") {
+			return fmt.Errorf("%w: filename contains control characters or null bytes", ErrSecurityViolation)
+		}
+		if strings.Contains(in.Filename, "..") {
+			return fmt.Errorf("%w: path traversal detected in filename", ErrSecurityViolation)
+		}
+	}
+
+	// 2. Size boundary check (if size is known)
+	if in.Size > 0 {
+		if p.MaxObjectSize > 0 && in.Size > p.MaxObjectSize {
+			return fmt.Errorf("%w: size %d exceeds policy limit %d", ErrUploadTooLarge, in.Size, p.MaxObjectSize)
+		}
+		if p.MinObjectSize > 0 && in.Size < p.MinObjectSize {
+			return fmt.Errorf("%w: size %d is below minimum required %d", ErrSecurityViolation, in.Size, p.MinObjectSize)
+		}
+	}
+
+	// 3. Extension policy
+	if in.Filename != "" {
+		ext := strings.ToLower(filepath.Ext(in.Filename))
+		if len(p.DeniedExtensions) > 0 {
+			for _, denied := range p.DeniedExtensions {
+				if ext == strings.ToLower(denied) {
+					return fmt.Errorf("%w: file extension %q is forbidden by security policy", ErrSecurityViolation, ext)
+				}
+			}
+		}
+
+		if len(p.AllowedExtensions) > 0 {
+			allowed := false
+			for _, a := range p.AllowedExtensions {
+				if ext == strings.ToLower(a) {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				return fmt.Errorf("%w: file extension %q is not in allowed extensions list", ErrSecurityViolation, ext)
+			}
+		}
+	}
+
+	// 4. MIME type policy
+	if in.ContentType != "" {
+		cleanMIME := strings.ToLower(strings.TrimSpace(in.ContentType))
+
+		if len(p.DeniedMIMEs) > 0 {
+			for _, denied := range p.DeniedMIMEs {
+				if matchMIME(cleanMIME, denied) {
+					return fmt.Errorf("%w: MIME type %q is denied by policy", ErrSecurityViolation, cleanMIME)
+				}
+			}
+		}
+
+		if len(p.AllowedMIMEs) > 0 {
+			allowed := false
+			for _, a := range p.AllowedMIMEs {
+				if matchMIME(cleanMIME, a) {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				return fmt.Errorf("%w: MIME type %q is not allowed by policy", ErrSecurityViolation, cleanMIME)
+			}
+		}
+
+		// 5. Obvious MIME / extension mismatch detection
+		if p.DisallowMIMEMismatch && in.Filename != "" {
+			if err := checkMIMEMismatch(in.Filename, cleanMIME); err != nil {
+				return err
+			}
+		}
+	}
+
+	// 6. Optional ContentScanner hook
+	if p.ContentScanner != nil && in.StreamReader != nil {
+		if err := p.ContentScanner(ctx, in.StreamReader, in.Filename, in.ContentType); err != nil {
+			return fmt.Errorf("%w: content scan failed: %v", ErrSecurityViolation, err)
+		}
+	}
+
+	return nil
+}
+
+// SanitizeFilename removes directory components, null bytes, CRLF characters, and path traversals.
+func SanitizeFilename(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	cleaned := filepath.Base(raw)
+	cleaned = strings.ReplaceAll(cleaned, "\\", "")
+	cleaned = strings.ReplaceAll(cleaned, "\x00", "")
+	cleaned = reCRLF.ReplaceAllString(cleaned, "")
+	cleaned = reControlChars.ReplaceAllString(cleaned, "")
+	cleaned = strings.TrimSpace(cleaned)
+	if cleaned == "." || cleaned == ".." {
+		return ""
+	}
+	return cleaned
+}
+
+// SanitizeHeader removes CRLF characters to prevent HTTP response splitting / header injection.
+func SanitizeHeader(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	return reCRLF.ReplaceAllString(raw, " ")
+}
+
+func matchMIME(actual, pattern string) bool {
+	pattern = strings.ToLower(pattern)
+	if pattern == "*/*" || pattern == "*" {
+		return true
+	}
+	if strings.HasSuffix(pattern, "/*") {
+		prefix := strings.TrimSuffix(pattern, "/*")
+		return strings.HasPrefix(actual, prefix+"/")
+	}
+	return actual == pattern
+}
+
+func checkMIMEMismatch(filename, mime string) error {
+	ext := strings.ToLower(filepath.Ext(filename))
+	if ext == "" {
+		return nil
+	}
+
+	// Flag obvious deceptive mismatches: e.g. claiming image extension with HTML or executable payload
+	if (ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".webp") &&
+		(strings.HasPrefix(mime, "text/html") || strings.Contains(mime, "x-dosexec") || strings.Contains(mime, "x-sh")) {
+		return fmt.Errorf("%w: image extension %q conflicts with payload type %q", ErrMIMEMismatch, ext, mime)
+	}
+
+	if (ext == ".mp3" || ext == ".ogg" || ext == ".wav") &&
+		(strings.HasPrefix(mime, "text/") || strings.Contains(mime, "x-dosexec")) {
+		return fmt.Errorf("%w: audio extension %q conflicts with payload type %q", ErrMIMEMismatch, ext, mime)
+	}
+
+	return nil
+}
