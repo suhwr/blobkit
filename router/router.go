@@ -13,7 +13,8 @@ const (
 	OpHead            = blobkit.OpHead
 	OpDelete          = blobkit.OpDelete
 	OpList            = blobkit.OpList
-	OpPresign         = blobkit.OpPresign
+	OpPresignGet      = blobkit.OpPresignGet
+	OpPresignPut      = blobkit.OpPresignPut
 	OpCopy            = blobkit.OpCopy
 	OpMove            = blobkit.OpMove
 	OpUploadPart      = blobkit.OpUploadPart

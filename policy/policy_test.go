@@ -20,7 +20,7 @@ func TestPolicy_MIMEAndExtensionRules(t *testing.T) {
 	}
 
 	// 1. Valid image
-	err := pol.Validate(ctx, policy.ValidationInput{
+	_, err := pol.Validate(ctx, policy.ValidationInput{
 		Filename:    "avatar.png",
 		ContentType: "image/png",
 		Size:        500 * 1024,
@@ -30,7 +30,7 @@ func TestPolicy_MIMEAndExtensionRules(t *testing.T) {
 	}
 
 	// 2. Denied extension
-	err = pol.Validate(ctx, policy.ValidationInput{
+	_, err = pol.Validate(ctx, policy.ValidationInput{
 		Filename:    "script.sh",
 		ContentType: "text/x-sh",
 		Size:        100,
@@ -40,7 +40,7 @@ func TestPolicy_MIMEAndExtensionRules(t *testing.T) {
 	}
 
 	// 3. Size exceeding limit
-	err = pol.Validate(ctx, policy.ValidationInput{
+	_, err = pol.Validate(ctx, policy.ValidationInput{
 		Filename:    "large.pdf",
 		ContentType: "application/pdf",
 		Size:        2 * 1024 * 1024,
@@ -67,7 +67,7 @@ func TestPolicy_SanitizeAndInjectionDefense(t *testing.T) {
 
 	// 3. Path traversal detection via Validate
 	pol := &policy.Policy{}
-	err := pol.Validate(context.Background(), policy.ValidationInput{
+	_, err := pol.Validate(context.Background(), policy.ValidationInput{
 		Filename: "../secret.txt",
 	})
 	if !errors.Is(err, blobkit.ErrSecurityViolation) {
@@ -81,7 +81,7 @@ func TestPolicy_MIMEMismatch(t *testing.T) {
 	}
 
 	// Deceptive payload: .jpg extension but text/html content
-	err := pol.Validate(context.Background(), policy.ValidationInput{
+	_, err := pol.Validate(context.Background(), policy.ValidationInput{
 		Filename:    "trojan.jpg",
 		ContentType: "text/html",
 	})

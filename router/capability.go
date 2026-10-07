@@ -35,7 +35,10 @@ func (r *CapabilityRouter) Select(ctx context.Context, rc RouteContext) (blobkit
 		required = blobkit.CapCopy
 	case blobkit.OpUploadPart, blobkit.OpMultipart:
 		required = blobkit.CapMultipartSession
-	case blobkit.OpPresign:
+	case blobkit.OpPresignGet:
+		required = blobkit.CapPresignGet
+	case blobkit.OpPresignPut:
+		required = blobkit.CapPresignPut
 		required = blobkit.CapPresignGet
 	default:
 		required = blobkit.CapDirectPut

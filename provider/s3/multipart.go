@@ -102,13 +102,27 @@ func (d *Driver) uploadMultipart(ctx context.Context, obj *blobkit.Object, r io.
 	// Collector goroutine
 	var completedParts []types.CompletedPart
 	var collectErr error
+	var errMu sync.Mutex
+	setErr := func(e error) {
+		errMu.Lock()
+		if collectErr == nil {
+			collectErr = e
+		}
+		errMu.Unlock()
+	}
+	getErr := func() error {
+		errMu.Lock()
+		defer errMu.Unlock()
+		return collectErr
+	}
+
 	var collectWg sync.WaitGroup
 	collectWg.Add(1)
 	go func() {
 		defer collectWg.Done()
 		for res := range results {
-			if res.err != nil && collectErr == nil {
-				collectErr = res.err
+			if res.err != nil {
+				setErr(res.err)
 			} else if res.err == nil {
 				completedParts = append(completedParts, types.CompletedPart{
 					PartNumber: aws.Int32(res.number),
@@ -125,17 +139,17 @@ func (d *Driver) uploadMultipart(ctx context.Context, obj *blobkit.Object, r io.
 uploadLoop:
 	for {
 		if ctx.Err() != nil {
-			collectErr = ctx.Err()
+			setErr(ctx.Err())
 			break
 		}
-		if collectErr != nil {
+		if getErr() != nil {
 			break
 		}
 
 		// Allocate chunk with memory limiter budget
 		chunkSize := d.cfg.MultipartPartSize
 		if err := d.cfg.GlobalMemoryLimiter.Acquire(ctx, chunkSize); err != nil {
-			collectErr = err
+			setErr(err)
 			break
 		}
 
@@ -156,7 +170,7 @@ uploadLoop:
 			case <-ctx.Done():
 				d.putChunkBuffer(bufPtr)
 				d.cfg.GlobalMemoryLimiter.Release(int64(n))
-				collectErr = ctx.Err()
+				setErr(ctx.Err())
 				break uploadLoop
 			}
 		} else {
@@ -169,7 +183,7 @@ uploadLoop:
 			break
 		}
 		if readErr != nil {
-			collectErr = readErr
+			setErr(readErr)
 			break
 		}
 	}
@@ -179,9 +193,9 @@ uploadLoop:
 	close(results)
 	collectWg.Wait()
 
-	if collectErr != nil {
+	if err := getErr(); err != nil {
 		abortUpload()
-		return nil, d.wrapError("upload_multipart", obj.Key, collectErr)
+		return nil, d.wrapError("upload_multipart", obj.Key, err)
 	}
 
 	if sr, ok := r.(*blobkit.SizeReader); ok {

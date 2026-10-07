@@ -261,6 +261,14 @@ func (d *Driver) AbortMultipart(ctx context.Context, key string, uploadID string
 	if !ok || expectedKey != key {
 		return blobkit.WrapError("abort_multipart", key, d.cfg.Name, blobkit.ErrSessionNotFound)
 	}
+
+	// In Azure, there is no direct "Abort" API. Uncommitted blocks are garbage collected after 7 days.
+	// However, if the blob itself is not yet committed (no existing data to protect),
+	// we can issue a Delete request which also destroys uncommitted blocks.
+	if _, err := d.Head(ctx, key); err != nil && blobkit.IsNotFound(err) {
+		_ = d.Delete(ctx, key)
+	}
+
 	return nil
 }
 

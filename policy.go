@@ -54,13 +54,16 @@ type Policy struct {
 	DisallowMIMEMismatch bool
 
 	// ContentScanner is an optional custom scanner hook (e.g. antivirus or deep payload inspection).
-	ContentScanner func(ctx context.Context, r io.Reader, filename, mime string) error
+	// It MUST return an io.Reader that allows subsequent operations to read the full payload,
+	// either by returning the original reader unconsumed, or by returning a new reader that buffers/replays the consumed bytes.
+	ContentScanner func(ctx context.Context, r io.Reader, filename, mime string) (io.Reader, error)
 }
 
 // Validate executes policy rules against the given input.
-func (p *Policy) Validate(ctx context.Context, in ValidationInput) error {
+// It returns a potentially replacement io.Reader if the ContentScanner consumes bytes.
+func (p *Policy) Validate(ctx context.Context, in ValidationInput) (io.Reader, error) {
 	if p == nil {
-		return nil
+		return in.StreamReader, nil
 	}
 
 	maxLen := p.MaxFilenameLength
@@ -71,23 +74,23 @@ func (p *Policy) Validate(ctx context.Context, in ValidationInput) error {
 	// 1. Filename validation
 	if in.Filename != "" {
 		if len(in.Filename) > maxLen {
-			return fmt.Errorf("%w: filename exceeds maximum length of %d", ErrInvalidFilename, maxLen)
+			return nil, fmt.Errorf("%w: filename exceeds maximum length of %d", ErrInvalidFilename, maxLen)
 		}
 		if reControlChars.MatchString(in.Filename) || strings.Contains(in.Filename, "\x00") {
-			return fmt.Errorf("%w: filename contains control characters or null bytes", ErrSecurityViolation)
+			return nil, fmt.Errorf("%w: filename contains control characters or null bytes", ErrSecurityViolation)
 		}
 		if strings.Contains(in.Filename, "..") {
-			return fmt.Errorf("%w: path traversal detected in filename", ErrSecurityViolation)
+			return nil, fmt.Errorf("%w: path traversal detected in filename", ErrSecurityViolation)
 		}
 	}
 
 	// 2. Size boundary check (if size is known)
 	if in.Size > 0 {
 		if p.MaxObjectSize > 0 && in.Size > p.MaxObjectSize {
-			return fmt.Errorf("%w: size %d exceeds policy limit %d", ErrUploadTooLarge, in.Size, p.MaxObjectSize)
+			return nil, fmt.Errorf("%w: size %d exceeds policy limit %d", ErrUploadTooLarge, in.Size, p.MaxObjectSize)
 		}
 		if p.MinObjectSize > 0 && in.Size < p.MinObjectSize {
-			return fmt.Errorf("%w: size %d is below minimum required %d", ErrSecurityViolation, in.Size, p.MinObjectSize)
+			return nil, fmt.Errorf("%w: size %d is below minimum required %d", ErrSecurityViolation, in.Size, p.MinObjectSize)
 		}
 	}
 
@@ -97,7 +100,7 @@ func (p *Policy) Validate(ctx context.Context, in ValidationInput) error {
 		if len(p.DeniedExtensions) > 0 {
 			for _, denied := range p.DeniedExtensions {
 				if ext == strings.ToLower(denied) {
-					return fmt.Errorf("%w: file extension %q is forbidden by security policy", ErrSecurityViolation, ext)
+					return nil, fmt.Errorf("%w: file extension %q is forbidden by security policy", ErrSecurityViolation, ext)
 				}
 			}
 		}
@@ -111,7 +114,7 @@ func (p *Policy) Validate(ctx context.Context, in ValidationInput) error {
 				}
 			}
 			if !allowed {
-				return fmt.Errorf("%w: file extension %q is not in allowed extensions list", ErrSecurityViolation, ext)
+				return nil, fmt.Errorf("%w: file extension %q is not in allowed extensions list", ErrSecurityViolation, ext)
 			}
 		}
 	}
@@ -123,7 +126,7 @@ func (p *Policy) Validate(ctx context.Context, in ValidationInput) error {
 		if len(p.DeniedMIMEs) > 0 {
 			for _, denied := range p.DeniedMIMEs {
 				if matchMIME(cleanMIME, denied) {
-					return fmt.Errorf("%w: MIME type %q is denied by policy", ErrSecurityViolation, cleanMIME)
+					return nil, fmt.Errorf("%w: MIME type %q is denied by policy", ErrSecurityViolation, cleanMIME)
 				}
 			}
 		}
@@ -137,26 +140,28 @@ func (p *Policy) Validate(ctx context.Context, in ValidationInput) error {
 				}
 			}
 			if !allowed {
-				return fmt.Errorf("%w: MIME type %q is not allowed by policy", ErrSecurityViolation, cleanMIME)
+				return nil, fmt.Errorf("%w: MIME type %q is not allowed by policy", ErrSecurityViolation, cleanMIME)
 			}
 		}
 
 		// 5. Obvious MIME / extension mismatch detection
 		if p.DisallowMIMEMismatch && in.Filename != "" {
 			if err := checkMIMEMismatch(in.Filename, cleanMIME); err != nil {
-				return err
+				return nil, err
 			}
 		}
 	}
 
 	// 6. Optional ContentScanner hook
 	if p.ContentScanner != nil && in.StreamReader != nil {
-		if err := p.ContentScanner(ctx, in.StreamReader, in.Filename, in.ContentType); err != nil {
-			return fmt.Errorf("%w: content scan failed: %v", ErrSecurityViolation, err)
+		newReader, err := p.ContentScanner(ctx, in.StreamReader, in.Filename, in.ContentType)
+		if err != nil {
+			return nil, fmt.Errorf("%w: content scan failed: %v", ErrSecurityViolation, err)
 		}
+		return newReader, nil
 	}
 
-	return nil
+	return in.StreamReader, nil
 }
 
 // SanitizeFilename removes directory components, null bytes, CRLF characters, and path traversals.

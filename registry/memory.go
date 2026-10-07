@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"fmt"
 	"context"
 	"sort"
 	"strings"
@@ -42,6 +43,18 @@ func (s *MemoryStore) Save(ctx context.Context, record *Record) error {
 		rec.CreatedAt = now
 	}
 	rec.UpdatedAt = now
+
+	if rec.Key != "" {
+		if existingID, ok := s.byKey[rec.Key]; ok && existingID != rec.ObjectID {
+			return blobkit.WrapError("registry_save", rec.Key, "", fmt.Errorf("key collision: key %q already belongs to object %q", rec.Key, existingID))
+		}
+	}
+
+	if oldRec, ok := s.records[rec.ObjectID]; ok {
+		if oldRec.Key != rec.Key && oldRec.Key != "" {
+			delete(s.byKey, oldRec.Key)
+		}
+	}
 
 	s.records[rec.ObjectID] = rec
 	if rec.Key != "" {

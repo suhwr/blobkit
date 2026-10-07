@@ -121,15 +121,17 @@ func (c *Client) Put(ctx context.Context, r io.Reader, opts PutOptions) (savedOb
 		activePolicy = c.policy
 	}
 	if activePolicy != nil {
-		if err := activePolicy.Validate(ctx, ValidationInput{
+		newReader, err := activePolicy.Validate(ctx, ValidationInput{
 			Namespace:    opts.Namespace,
 			Filename:     opts.Filename,
 			ContentType:  detectedMIME,
 			Size:         opts.Size,
 			StreamReader: reconstructedReader,
-		}); err != nil {
+		})
+		if err != nil {
 			return nil, WrapError("policy_validation", "", "", err)
 		}
+		reconstructedReader = newReader
 	}
 
 	// 4. Formulate physical storage key
@@ -600,10 +602,22 @@ func (c *Client) DeleteBatch(ctx context.Context, targets []string) (deleted []s
 		}
 
 		if c.registry != nil {
+			var regErrs []error
 			for _, item := range items {
 				if delSet[item.key] {
-					_ = c.registry.UpdateStatus(ctx, item.objectID, StateDeleted)
+					if uErr := c.registry.UpdateStatus(ctx, item.objectID, StateDeleted); uErr != nil {
+						regErrs = append(regErrs, fmt.Errorf("registry update failed for %s: %w", item.objectID, uErr))
+					}
 				}
+			}
+			if len(regErrs) > 0 {
+				if err == nil {
+					err = errors.Join(regErrs...)
+				} else {
+					regErrs = append([]error{err}, regErrs...)
+					err = errors.Join(regErrs...)
+				}
+				return deleted, err
 			}
 		}
 
@@ -784,7 +798,9 @@ func (c *Client) Copy(ctx context.Context, srcTarget string, dstOpts PutOptions)
 				UpdatedAt:        time.Now().UTC(),
 			}
 			if err := c.registry.Save(ctx, rec); err != nil {
-				return copiedObj, WrapError("registry_save_copy", copiedObj.Key, copiedObj.Provider, err)
+				_ = dstDriver.Delete(ctx, copiedObj.Key)
+				c.abortRegistry(ctx, copiedObj.ID)
+				return nil, WrapError("registry_save_copy", copiedObj.Key, copiedObj.Provider, err)
 			}
 		}
 		return copiedObj, nil
@@ -809,7 +825,8 @@ func (c *Client) Copy(ctx context.Context, srcTarget string, dstOpts PutOptions)
 	return c.Put(ctx, srcReader, dstOpts)
 }
 
-// Move copies an object to a new destination and deletes the original.
+// Move is a best-effort copy and delete. It is not an atomic rename operation.
+// If the server-side copy succeeds but the deletion fails, the object will exist at both locations.
 func (c *Client) Move(ctx context.Context, srcTarget string, dstOpts PutOptions) (*Object, error) {
 	copied, err := c.Copy(ctx, srcTarget, dstOpts)
 	if err != nil {
@@ -897,7 +914,7 @@ func (c *Client) PresignGet(ctx context.Context, target string, opts PresignOpti
 	}
 
 	driver, err := c.router.Select(ctx, RouteContext{
-		Op:             OpPresign,
+		Op:             OpPresignGet,
 		Key:            key,
 		ForcedProvider: providerName,
 	})
@@ -961,7 +978,7 @@ func (c *Client) PresignPut(ctx context.Context, opts PutOptions, presignOpts Pr
 	}
 
 	driver, err := c.router.Select(ctx, RouteContext{
-		Op:             OpPresign,
+		Op:             OpPresignPut,
 		Key:            storageKey,
 		Namespace:      opts.Namespace,
 		ForcedProvider: opts.Provider,
@@ -1187,6 +1204,20 @@ func (c *Client) Restore(ctx context.Context, target string) error {
 		return nil
 	}
 
+	driver, rErr := c.router.Select(ctx, RouteContext{
+		Op:             OpHead,
+		Key:            rec.Key,
+		ForcedProvider: rec.Provider,
+	})
+	if rErr != nil {
+		err = WrapError("route_driver", rec.Key, rec.Provider, rErr)
+		return err
+	}
+	if _, hErr := driver.Head(ctx, rec.Key); hErr != nil {
+		err = WrapError("restore_physical_check", rec.Key, rec.Provider, hErr)
+		return err
+	}
+
 	if err = c.registry.UpdateStatus(ctx, rec.ObjectID, StateCommitted); err != nil {
 		return WrapError("restore", rec.ObjectID, rec.Provider, err)
 	}
@@ -1213,8 +1244,9 @@ func (c *Client) PermanentDelete(ctx context.Context, target string) error {
 		return err
 	}
 
+	var rec *Record
 	if c.registry != nil {
-		rec, _ := c.registry.GetByID(ctx, target)
+		rec, _ = c.registry.GetByID(ctx, target)
 		if rec == nil {
 			rec, _ = c.registry.GetByKey(ctx, key)
 		}
@@ -1238,7 +1270,6 @@ func (c *Client) PermanentDelete(ctx context.Context, target string) error {
 				err = WrapError("permanent_delete", key, providerName, ErrObjectLocked)
 				return err
 			}
-			_ = c.registry.HardDelete(ctx, rec.ObjectID)
 		}
 	}
 
@@ -1258,6 +1289,10 @@ func (c *Client) PermanentDelete(ctx context.Context, target string) error {
 		return err
 	}
 	c.router.ReportSuccess(driver.Name())
+
+	if c.registry != nil && rec != nil {
+		_ = c.registry.HardDelete(ctx, rec.ObjectID)
+	}
 
 	if c.cache != nil {
 		c.cache.Delete(target)
@@ -1403,12 +1438,13 @@ func (c *Client) InitiateResumableUpload(ctx context.Context, opts PutOptions, p
 		activePolicy = c.policy
 	}
 	if activePolicy != nil {
-		if err = activePolicy.Validate(ctx, ValidationInput{
+		_, err = activePolicy.Validate(ctx, ValidationInput{
 			Namespace:   opts.Namespace,
 			Filename:    opts.Filename,
 			ContentType: opts.ContentType,
 			Size:        opts.Size,
-		}); err != nil {
+		})
+			if err != nil {
 			return nil, WrapError("policy_validation", "", "", err)
 		}
 	}
@@ -1605,6 +1641,10 @@ func (c *Client) UploadPart(ctx context.Context, sessionID string, partNumber in
 	}
 
 	if err = c.saveSession(ctx, session); err != nil {
+		if providerParts, pErr := driver.ListParts(ctx, session.Key, session.UploadID); pErr == nil {
+			session.Parts = providerParts
+			_ = c.saveSession(ctx, session)
+		}
 		return nil, WrapError("save_session_part", sessionID, "", err)
 	}
 
@@ -1617,6 +1657,23 @@ func (c *Client) ListSessionParts(ctx context.Context, sessionID string) ([]Comp
 	if err != nil {
 		return nil, err
 	}
+
+	driver, rErr := c.router.Select(ctx, RouteContext{
+		Op:             OpList,
+		Key:            session.Key,
+		ForcedProvider: session.Provider,
+	})
+	if rErr == nil {
+		providerParts, pErr := driver.ListParts(ctx, session.Key, session.UploadID)
+		if pErr == nil {
+			session.Parts = providerParts
+			_ = c.saveSession(ctx, session)
+			parts := make([]CompletedPart, len(providerParts))
+			copy(parts, providerParts)
+			return parts, nil
+		}
+	}
+
 	parts := make([]CompletedPart, len(session.Parts))
 	copy(parts, session.Parts)
 	return parts, nil
@@ -1703,7 +1760,10 @@ func (c *Client) CommitResumableUpload(ctx context.Context, sessionID string) (*
 			rec.ChecksumSHA256 = completedObj.ChecksumSHA256
 			rec.Status = StateCommitted
 			rec.UpdatedAt = time.Now().UTC()
-			_ = c.registry.Save(ctx, rec)
+			if sErr := c.registry.Save(ctx, rec); sErr != nil {
+				err = fmt.Errorf("storage completed but registry commit failed: %w", sErr)
+				return nil, err
+			}
 		}
 	}
 

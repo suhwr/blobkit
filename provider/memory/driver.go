@@ -70,8 +70,6 @@ func (d *Driver) Name() string {
 
 func (d *Driver) Capabilities() blobkit.Capability {
 	return blobkit.CapDirectPut |
-		blobkit.CapPresignGet |
-		blobkit.CapPresignPut |
 		blobkit.CapBatchDelete |
 		blobkit.CapByteRangeGet |
 		blobkit.CapCopy |
@@ -315,55 +313,11 @@ func (d *Driver) List(ctx context.Context, opts blobkit.ListOptions) (*blobkit.L
 }
 
 func (d *Driver) PresignGet(ctx context.Context, key string, opts blobkit.PresignOptions) (*blobkit.PresignedURL, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, blobkit.WrapError("presign_get", key, d.name, err)
-	}
-	if err := validateKey(key); err != nil {
-		return nil, blobkit.WrapError("presign_get", key, d.name, err)
-	}
-
-	d.mu.RLock()
-	_, ok := d.items[key]
-	d.mu.RUnlock()
-
-	if !ok {
-		return nil, blobkit.WrapError("presign_get", key, d.name, blobkit.ErrObjectNotFound)
-	}
-
-	expiry := opts.Expiry
-	if expiry <= 0 {
-		expiry = blobkit.DefaultPresignExpiry
-	}
-	expTime := time.Now().Add(expiry)
-
-	u := fmt.Sprintf("mem://%s/%s?op=get&expires=%d", d.bucket, key, expTime.Unix())
-	return &blobkit.PresignedURL{
-		URL:       u,
-		Method:    "GET",
-		ExpiresAt: expTime,
-	}, nil
+	return nil, blobkit.ErrNotSupported
 }
 
 func (d *Driver) PresignPut(ctx context.Context, key string, opts blobkit.PresignOptions) (*blobkit.PresignedURL, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, blobkit.WrapError("presign_put", key, d.name, err)
-	}
-	if err := validateKey(key); err != nil {
-		return nil, blobkit.WrapError("presign_put", key, d.name, err)
-	}
-
-	expiry := opts.Expiry
-	if expiry <= 0 {
-		expiry = blobkit.DefaultPresignExpiry
-	}
-	expTime := time.Now().Add(expiry)
-
-	u := fmt.Sprintf("mem://%s/%s?op=put&expires=%d", d.bucket, key, expTime.Unix())
-	return &blobkit.PresignedURL{
-		URL:       u,
-		Method:    "PUT",
-		ExpiresAt: expTime,
-	}, nil
+	return nil, blobkit.ErrNotSupported
 }
 
 func (d *Driver) ResolveURL(key string) (string, error) {

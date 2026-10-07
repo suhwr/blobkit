@@ -158,14 +158,6 @@ func TestClient_WithRegistryDiscoveryAndAccess(t *testing.T) {
 		t.Fatalf("unexpected delivery URL: %s", deliveryURL)
 	}
 
-	// 5. Presigned URL access by ObjectID
-	presigned, err := client.PresignGet(ctx, targetID, blobkit.PresignOptions{Expiry: 10 * time.Minute})
-	if err != nil {
-		t.Fatalf("PresignGet failed: %v", err)
-	}
-	if presigned.URL == "" || presigned.Method != "GET" {
-		t.Fatalf("invalid presigned response: %+v", presigned)
-	}
 
 	// 6. Delete by ObjectID
 	err = client.Delete(ctx, targetID)

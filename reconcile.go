@@ -94,9 +94,6 @@ func (c *Client) Reconcile(ctx context.Context, dryRun bool) (*ReconciliationRep
 				regRec, regErr := c.registry.GetByKey(ctx, cleanKey)
 				if regErr != nil || regRec == nil || regRec.Status != StateCommitted {
 					report.OrphanObjects = append(report.OrphanObjects, obj.Key)
-					if !dryRun {
-						report.Repaired++
-					}
 				}
 			}
 

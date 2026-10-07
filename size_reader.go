@@ -180,8 +180,15 @@ func ResolvePayload(r io.Reader, opts PutOptions) (io.Reader, int64, bool, error
 
 	// For general streams where size is 0 and !ExplicitSize, peek 1 byte to differentiate empty vs stream
 	var peek [1]byte
-	n, err := r.Read(peek[:])
-	if err == io.EOF || n == 0 {
+	var n int
+	var err error
+	for i := 0; i < 100; i++ {
+		n, err = r.Read(peek[:])
+		if n > 0 || err != nil {
+			break
+		}
+	}
+	if err == io.EOF && n == 0 {
 		return bytes.NewReader(nil), 0, true, nil
 	}
 	if err != nil {
