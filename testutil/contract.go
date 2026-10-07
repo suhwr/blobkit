@@ -3,6 +3,8 @@ package testutil
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -77,6 +79,25 @@ func RunDriverContractTests(t *testing.T, factory func(t *testing.T) (blobkit.Dr
 		}
 		if headObj.Size != int64(len(payload)) {
 			t.Errorf("Head Size mismatch: expected %d, got %d", len(payload), headObj.Size)
+		}
+		// Independent oracle verification
+		hasher := sha256.New()
+		hasher.Write(payload)
+		expectedHash := hex.EncodeToString(hasher.Sum(nil))
+
+		if putObj.ChecksumSHA256 != "" && putObj.ChecksumSHA256 != expectedHash {
+			t.Errorf("independent sha256 oracle mismatch: expected %s, got %s", expectedHash, putObj.ChecksumSHA256)
+		}
+		if headObj.ETag == "" {
+			t.Errorf("Head returned empty ETag")
+		}
+		if headObj.ContentType != "" && !strings.Contains(headObj.ContentType, "text/plain") {
+			t.Errorf("Head ContentType mismatch: expected text/plain, got %q", headObj.ContentType)
+		}
+		if len(headObj.Metadata) > 0 {
+			if headObj.Metadata["environment"] != "test" {
+				t.Errorf("Head metadata 'environment' mismatch: %q", headObj.Metadata["environment"])
+			}
 		}
 
 		// 3. Get

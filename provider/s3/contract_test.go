@@ -31,11 +31,11 @@ type mockS3Object struct {
 }
 
 type mockS3Server struct {
-	mu          sync.RWMutex
-	bucket      string
-	objects     map[string]*mockS3Object
-	uploads     map[string]map[int32][]byte // uploadID -> partNumber -> data
-	uploadKeys  map[string]string           // uploadID -> key
+	mu         sync.RWMutex
+	bucket     string
+	objects    map[string]*mockS3Object
+	uploads    map[string]map[int32][]byte // uploadID -> partNumber -> data
+	uploadKeys map[string]string           // uploadID -> key
 }
 
 func newMockS3Server(bucket string) *mockS3Server {

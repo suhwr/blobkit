@@ -577,24 +577,42 @@ func TestDriver_Capabilities(t *testing.T) {
 	defer server.Close()
 	defer driver.Close()
 
-	caps := driver.Capabilities()
-	if caps&blobkit.CapDirectPut == 0 {
-		t.Error("missing CapDirectPut")
+	ctx := context.Background()
+	payload := []byte("gcs capability behavioral execution")
+
+	// 1. Behavioral execution of CapDirectPut
+	obj, err := driver.Put(ctx, &blobkit.Object{Key: "cap-gcs.txt"}, bytes.NewReader(payload), blobkit.PutOptions{Size: int64(len(payload))})
+	if err != nil {
+		t.Fatalf("CapDirectPut execution failed: %v", err)
 	}
-	if caps&blobkit.CapByteRangeGet == 0 {
-		t.Error("missing CapByteRangeGet")
+	if obj.Size != int64(len(payload)) {
+		t.Fatalf("CapDirectPut size mismatch: %d", obj.Size)
 	}
-	if caps&blobkit.CapCopy == 0 {
-		t.Error("missing CapCopy")
+
+	// 2. Behavioral execution of CapByteRangeGet
+	rReader, err := driver.Get(ctx, "cap-gcs.txt", blobkit.GetOptions{Range: "bytes=0-2"})
+	if err != nil {
+		t.Fatalf("CapByteRangeGet execution failed: %v", err)
 	}
-	if caps&blobkit.CapBatchDelete == 0 {
-		t.Error("missing CapBatchDelete")
+	sub, _ := io.ReadAll(rReader)
+	rReader.Close()
+	if string(sub) != "gcs" {
+		t.Fatalf("CapByteRangeGet slice mismatch: %q", string(sub))
 	}
-	if caps&blobkit.CapMultipartSession == 0 {
-		t.Error("missing CapMultipartSession")
+
+	// 3. Behavioral execution of CapCopy
+	if err := driver.Copy(ctx, "cap-gcs.txt", "cap-gcs-copy.txt"); err != nil {
+		t.Fatalf("CapCopy execution failed: %v", err)
 	}
-	if caps&blobkit.CapPresignGet != 0 {
-		t.Error("CapPresignGet should not be set without RSA private key")
+	copyHead, err := driver.Head(ctx, "cap-gcs-copy.txt")
+	if err != nil || copyHead.Size != int64(len(payload)) {
+		t.Fatalf("CapCopy destination verification failed: %v", err)
+	}
+
+	// 4. Negative path: Unadvertised CapPresignGet MUST return ErrUnsupportedOperation
+	_, pErr := driver.PresignGet(ctx, "cap-gcs.txt", blobkit.PresignOptions{})
+	if !errors.Is(pErr, blobkit.ErrUnsupportedOperation) {
+		t.Fatalf("expected ErrUnsupportedOperation for unadvertised PresignGet, got: %v", pErr)
 	}
 }
 

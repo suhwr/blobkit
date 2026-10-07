@@ -258,7 +258,9 @@ func (c *Client) Put(ctx context.Context, r io.Reader, opts PutOptions) (savedOb
 			UpdatedAt:        savedObj.UpdatedAt,
 		}
 		if err = c.registry.Save(ctx, rec); err != nil {
-			return savedObj, WrapError("registry_save_committed", savedObj.Key, savedObj.Provider, err)
+			_ = driver.Delete(ctx, savedObj.Key)
+			c.abortRegistry(ctx, obj.ID)
+			return nil, WrapError("registry_save_committed", savedObj.Key, savedObj.Provider, err)
 		}
 	}
 
@@ -496,10 +498,21 @@ func (c *Client) Delete(ctx context.Context, target string) (err error) {
 	c.router.ReportSuccess(driver.Name())
 
 	if c.registry != nil {
+		var regErr error
 		if recID != "" {
-			_ = c.registry.UpdateStatus(ctx, recID, StateDeleted)
+			regErr = c.registry.UpdateStatus(ctx, recID, StateDeleted)
 		} else {
-			_ = c.registry.UpdateStatus(ctx, target, StateDeleted)
+			regErr = c.registry.UpdateStatus(ctx, target, StateDeleted)
+		}
+		if regErr != nil {
+			if c.cache != nil {
+				c.cache.Delete(target)
+				c.cache.Delete(key)
+				if recID != "" {
+					c.cache.Delete(recID)
+				}
+			}
+			return WrapError("registry_update_status", key, driver.Name(), regErr)
 		}
 	}
 
@@ -579,11 +592,6 @@ func (c *Client) DeleteBatch(ctx context.Context, targets []string) (deleted []s
 		}
 
 		delBatch, dErr := driver.DeleteBatch(ctx, keys)
-		if dErr != nil {
-			c.router.ReportFailure(driver.Name(), dErr)
-			return deleted, dErr
-		}
-		c.router.ReportSuccess(driver.Name())
 		deleted = append(deleted, delBatch...)
 
 		delSet := make(map[string]bool, len(delBatch))
@@ -608,6 +616,12 @@ func (c *Client) DeleteBatch(ctx context.Context, targets []string) (deleted []s
 				}
 			}
 		}
+
+		if dErr != nil {
+			c.router.ReportFailure(driver.Name(), dErr)
+			return deleted, dErr
+		}
+		c.router.ReportSuccess(driver.Name())
 	}
 
 	return deleted, nil

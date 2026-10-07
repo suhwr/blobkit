@@ -81,7 +81,6 @@ func (c *Client) Reconcile(ctx context.Context, dryRun bool) (*ReconciliationRep
 		default:
 		}
 
-
 		var cursor string
 		for {
 			listRes, lErr := d.List(ctx, ListOptions{Cursor: cursor, Limit: 1000})

@@ -397,7 +397,7 @@ failoverRouter := router.NewFailoverRouter(router.FailoverConfig{
 
 #### c. 3-State Circuit Breaker Router
 
-Prevent cascading cloud outages with zero-allocation circuit breaker protection:
+Prevent cascading cloud outages with automatic 3-state circuit breaker protection:
 
 ```go
 cbRouter := router.NewCircuitBreakerRouter(router.CircuitBreakerConfig{

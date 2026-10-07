@@ -404,27 +404,42 @@ func TestDriver_Capabilities(t *testing.T) {
 	defer server.Close()
 	defer driver.Close()
 
-	caps := driver.Capabilities()
-	if caps&blobkit.CapDirectPut == 0 {
-		t.Fatal("expected CapDirectPut")
+	ctx := context.Background()
+	payload := []byte("azure capability behavioral execution")
+
+	// 1. Behavioral execution of CapDirectPut
+	obj, err := driver.Put(ctx, &blobkit.Object{Key: "cap-azure.txt"}, bytes.NewReader(payload), blobkit.PutOptions{Size: int64(len(payload))})
+	if err != nil {
+		t.Fatalf("CapDirectPut execution failed: %v", err)
 	}
-	if caps&blobkit.CapMultipartPut == 0 {
-		t.Fatal("expected CapMultipartPut")
+	if obj.Size != int64(len(payload)) {
+		t.Fatalf("CapDirectPut size mismatch: %d", obj.Size)
 	}
-	if caps&blobkit.CapByteRangeGet == 0 {
-		t.Fatal("expected CapByteRangeGet")
+
+	// 2. Behavioral execution of CapByteRangeGet
+	rReader, err := driver.Get(ctx, "cap-azure.txt", blobkit.GetOptions{Range: "bytes=0-4"})
+	if err != nil {
+		t.Fatalf("CapByteRangeGet execution failed: %v", err)
 	}
-	if caps&blobkit.CapPresignGet == 0 {
-		t.Fatal("expected CapPresignGet")
+	sub, _ := io.ReadAll(rReader)
+	rReader.Close()
+	if string(sub) != "azure" {
+		t.Fatalf("CapByteRangeGet slice mismatch: %q", string(sub))
 	}
-	if caps&blobkit.CapPresignPut == 0 {
-		t.Fatal("expected CapPresignPut")
+
+	// 3. Behavioral execution of CapCopy
+	if err := driver.Copy(ctx, "cap-azure.txt", "cap-azure-copy.txt"); err != nil {
+		t.Fatalf("CapCopy execution failed: %v", err)
 	}
-	if caps&blobkit.CapCopy == 0 {
-		t.Fatal("expected CapCopy")
+	copyHead, err := driver.Head(ctx, "cap-azure-copy.txt")
+	if err != nil || copyHead.Size != int64(len(payload)) {
+		t.Fatalf("CapCopy destination verification failed: %v", err)
 	}
-	if caps&blobkit.CapBatchDelete == 0 {
-		t.Fatal("expected CapBatchDelete")
+
+	// 4. Behavioral execution of CapPresignGet
+	ps, err := driver.PresignGet(ctx, "cap-azure.txt", blobkit.PresignOptions{Expiry: 5 * time.Minute})
+	if err != nil || ps.URL == "" {
+		t.Fatalf("CapPresignGet execution failed: %v", err)
 	}
 }
 
