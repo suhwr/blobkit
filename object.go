@@ -142,8 +142,12 @@ type PutOptions struct {
 	// ContentType is the MIME type. If empty, BlobKit sniffs up to the first 512 bytes.
 	ContentType string
 
-	// Size is the known payload size in bytes. Set to -1 or 0 if unknown or streaming.
+	// Size is the known payload size in bytes. Set to SizeUnknown (-1) if unknown or streaming.
 	Size int64
+
+	// ExplicitSize indicates that Size was intentionally specified (even if 0),
+	// allowing distinction between an unassigned size (streaming) and an explicit 0-byte upload.
+	ExplicitSize bool
 
 	// Visibility controls whether the object is public or private. Defaults to VisibilityPrivate.
 	Visibility Visibility

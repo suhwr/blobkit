@@ -34,15 +34,15 @@ type mockFile struct {
 }
 
 type mockSession struct {
-	ID          string
-	Key         string
-	Name        string
-	MimeType    string
-	TotalSize   int64
-	Buffer      []byte
-	Completed   bool
-	FileID      string
-	IsUpdate    bool
+	ID           string
+	Key          string
+	Name         string
+	MimeType     string
+	TotalSize    int64
+	Buffer       []byte
+	Completed    bool
+	FileID       string
+	IsUpdate     bool
 	TargetFileID string
 }
 
@@ -82,6 +82,45 @@ func (s *mockDriveServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPut {
 			contentRange := r.Header.Get("Content-Range")
 			body, _ := io.ReadAll(r.Body)
+
+			// Finalize 0-byte upload
+			if contentRange == "bytes */0" {
+				session.Completed = true
+				h := md5.Sum(session.Buffer)
+				checksum := hex.EncodeToString(h[:])
+
+				var file *mockFile
+				if session.IsUpdate && session.TargetFileID != "" {
+					file = s.files[session.TargetFileID]
+					if file != nil {
+						file.Data = session.Buffer
+						file.MD5Checksum = checksum
+						file.ModifiedTime = time.Now().UTC()
+					}
+				}
+
+				if file == nil {
+					s.nextID++
+					fileID := fmt.Sprintf("file_%d", s.nextID)
+					file = &mockFile{
+						ID:           fileID,
+						Name:         session.Name,
+						MimeType:     session.MimeType,
+						Data:         session.Buffer,
+						MD5Checksum:  checksum,
+						CreatedTime:  time.Now().UTC(),
+						ModifiedTime: time.Now().UTC(),
+						AppProperties: map[string]string{
+							"blobkit_key": session.Key,
+						},
+					}
+					s.files[fileID] = file
+				}
+
+				session.FileID = file.ID
+				s.writeFileResponse(w, file)
+				return
+			}
 
 			// Status inquiry with 0 bytes
 			if len(body) == 0 && (contentRange == "bytes */*" || strings.HasPrefix(contentRange, "bytes */")) {
@@ -999,4 +1038,3 @@ func TestDriver_IntegrationWithBlobKitClient(t *testing.T) {
 		t.Fatalf("expected ErrObjectNotFound, got: %v", err)
 	}
 }
-

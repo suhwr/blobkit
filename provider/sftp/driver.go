@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -64,9 +65,24 @@ func resolveMetadata(obj *blobkit.Object, opts blobkit.PutOptions) map[string]st
 	return nil
 }
 
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (cr *contextReader) Read(p []byte) (int, error) {
+	if err := cr.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return cr.r.Read(p)
+}
+
 // Put streams an object to the remote SFTP server, writing to a temporary file
 // before atomically renaming to prevent partial reads.
 func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts blobkit.PutOptions) (*blobkit.Object, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, mapSFTPError("put", "", d.cfg.Name, err)
+	}
 	if r == nil {
 		return nil, blobkit.ErrNilReader
 	}
@@ -97,12 +113,23 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 		return nil, mapSFTPError("open_tmp", obj.Key, d.cfg.Name, err)
 	}
 
+	resolvedR, effectiveSize, hasExplicitSize, err := blobkit.ResolvePayload(r, opts)
+	if err != nil {
+		return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
+	}
+
+	sizeReader := blobkit.NewSizeReader(&contextReader{ctx: ctx, r: resolvedR}, effectiveSize, hasExplicitSize)
+
 	// Compute SHA-256 while streaming
 	hasher := sha256.New()
-	tee := io.TeeReader(r, hasher)
+	tee := io.TeeReader(sizeReader, hasher)
 	written, copyErr := io.Copy(f, tee)
 	closeErr := f.Close()
 
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		_ = client.Remove(tmpPath)
+		return nil, mapSFTPError("put", obj.Key, d.cfg.Name, ctxErr)
+	}
 	if copyErr != nil {
 		_ = client.Remove(tmpPath)
 		return nil, mapSFTPError("put_copy", obj.Key, d.cfg.Name, copyErr)
@@ -110,6 +137,11 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 	if closeErr != nil {
 		_ = client.Remove(tmpPath)
 		return nil, mapSFTPError("put_close", obj.Key, d.cfg.Name, closeErr)
+	}
+
+	if err := sizeReader.Verify(); err != nil {
+		_ = client.Remove(tmpPath)
+		return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
 	}
 
 	// Atomically swap temp file to final destination
@@ -164,6 +196,9 @@ type readCloser struct {
 
 // Get opens a remote SFTP file and streams its content, supporting HTTP byte-range seeks.
 func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (*blobkit.ObjectReader, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, mapSFTPError("get", key, d.cfg.Name, err)
+	}
 	client, err := d.getClient()
 	if err != nil {
 		return nil, err
@@ -194,22 +229,28 @@ func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (
 		spec := strings.TrimPrefix(opts.Range, "bytes=")
 		parts := strings.Split(spec, "-")
 		if len(parts) == 2 {
-			start, _ := strconv.ParseInt(parts[0], 10, 64)
+			start, err1 := strconv.ParseInt(parts[0], 10, 64)
 			end := totalSize - 1
+			var err2 error
 			if parts[1] != "" {
-				if parsedEnd, err := strconv.ParseInt(parts[1], 10, 64); err == nil && parsedEnd < totalSize {
-					end = parsedEnd
-				}
+				end, err2 = strconv.ParseInt(parts[1], 10, 64)
 			}
 
-			if start <= end && start < totalSize {
-				if _, err := f.Seek(start, io.SeekStart); err != nil {
-					_ = f.Close()
-					return nil, mapSFTPError("get_seek", key, d.cfg.Name, err)
-				}
-				streamSize = (end - start) + 1
-				stream = io.LimitReader(f, streamSize)
+			if err1 != nil || err2 != nil || start < 0 || start > totalSize || end < start {
+				_ = f.Close()
+				return nil, blobkit.WrapError("get", key, d.cfg.Name, blobkit.ErrPreconditionFailed)
 			}
+
+			if end >= totalSize {
+				end = totalSize - 1
+			}
+
+			if _, err := f.Seek(start, io.SeekStart); err != nil {
+				_ = f.Close()
+				return nil, mapSFTPError("get_seek", key, d.cfg.Name, err)
+			}
+			streamSize = (end - start) + 1
+			stream = io.LimitReader(f, streamSize)
 		}
 	}
 
@@ -227,6 +268,15 @@ func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (
 			etag = meta.ETag
 			objID = meta.ID
 		}
+	}
+
+	if etag == "" {
+		etag = fmt.Sprintf(`"%x-%x"`, fi.ModTime().UnixNano(), totalSize)
+	}
+
+	if err := blobkit.CheckPreconditions(etag, fi.ModTime().UTC(), opts); err != nil {
+		_ = f.Close()
+		return nil, blobkit.WrapError("get", key, d.cfg.Name, err)
 	}
 
 	obj := blobkit.Object{
@@ -249,6 +299,9 @@ func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (
 
 // Head inspects a remote SFTP file and loads metadata without reading the file body.
 func (d *Driver) Head(ctx context.Context, key string) (*blobkit.Object, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, mapSFTPError("head", key, d.cfg.Name, err)
+	}
 	client, err := d.getClient()
 	if err != nil {
 		return nil, err
@@ -298,6 +351,9 @@ func (d *Driver) Head(ctx context.Context, key string) (*blobkit.Object, error) 
 
 // Delete permanently removes a file and its associated .meta.json sidecar from the SFTP server.
 func (d *Driver) Delete(ctx context.Context, key string) error {
+	if err := ctx.Err(); err != nil {
+		return mapSFTPError("delete", key, d.cfg.Name, err)
+	}
 	client, err := d.getClient()
 	if err != nil {
 		return err
@@ -311,7 +367,7 @@ func (d *Driver) Delete(ctx context.Context, key string) error {
 	err = client.Remove(targetPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) || errors.Is(err, sftp.ErrSSHFxNoSuchFile) {
-			return blobkit.WrapError("delete", key, d.cfg.Name, blobkit.ErrObjectNotFound)
+			return nil
 		}
 		return mapSFTPError("delete", key, d.cfg.Name, err)
 	}
@@ -324,8 +380,16 @@ func (d *Driver) Delete(ctx context.Context, key string) error {
 
 // DeleteBatch removes multiple keys concurrently using a bounded worker pool.
 func (d *Driver) DeleteBatch(ctx context.Context, keys []string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, mapSFTPError("delete_batch", "", d.cfg.Name, err)
+	}
 	if len(keys) == 0 {
 		return nil, nil
+	}
+	for _, k := range keys {
+		if err := blobkit.ValidateKey(k); err != nil {
+			return nil, err
+		}
 	}
 
 	type delResult struct {
@@ -381,6 +445,9 @@ func (d *Driver) DeleteBatch(ctx context.Context, keys []string) ([]string, erro
 
 // Copy duplicates an object server-side using streaming across SFTP files.
 func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
+	if err := ctx.Err(); err != nil {
+		return mapSFTPError("copy", srcKey, d.cfg.Name, err)
+	}
 	client, err := d.getClient()
 	if err != nil {
 		return err
@@ -412,9 +479,13 @@ func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
 		return mapSFTPError("copy_open_dst", dstKey, d.cfg.Name, err)
 	}
 
-	_, copyErr := io.Copy(dstFile, srcFile)
+	_, copyErr := io.Copy(dstFile, &contextReader{ctx: ctx, r: srcFile})
 	closeErr := dstFile.Close()
 
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		_ = client.Remove(tmpDst)
+		return mapSFTPError("copy", srcKey, d.cfg.Name, ctxErr)
+	}
 	if copyErr != nil {
 		_ = client.Remove(tmpDst)
 		return mapSFTPError("copy_stream", srcKey, d.cfg.Name, copyErr)
@@ -444,6 +515,9 @@ func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
 
 // List queries objects on the remote SFTP server matching prefix and delimiter filters.
 func (d *Driver) List(ctx context.Context, opts blobkit.ListOptions) (*blobkit.ListResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, mapSFTPError("list", opts.Prefix, d.cfg.Name, err)
+	}
 	client, err := d.getClient()
 	if err != nil {
 		return nil, err
@@ -459,6 +533,9 @@ func (d *Driver) List(ctx context.Context, opts blobkit.ListOptions) (*blobkit.L
 
 	walker := client.Walk(base)
 	for walker.Step() {
+		if err := ctx.Err(); err != nil {
+			return nil, mapSFTPError("list", opts.Prefix, d.cfg.Name, err)
+		}
 		if walker.Err() != nil {
 			continue
 		}
@@ -506,10 +583,15 @@ func (d *Driver) List(ctx context.Context, opts blobkit.ListOptions) (*blobkit.L
 		})
 	}
 
+	sort.Slice(objects, func(i, j int) bool {
+		return objects[i].Key < objects[j].Key
+	})
+
 	var commonPrefixes []string
 	for p := range prefixesMap {
 		commonPrefixes = append(commonPrefixes, p)
 	}
+	sort.Strings(commonPrefixes)
 
 	return &blobkit.ListResult{
 		Objects:        objects,
@@ -519,16 +601,25 @@ func (d *Driver) List(ctx context.Context, opts blobkit.ListOptions) (*blobkit.L
 
 // PresignGet is unsupported on native SFTP.
 func (d *Driver) PresignGet(ctx context.Context, key string, opts blobkit.PresignOptions) (*blobkit.PresignedURL, error) {
+	if err := blobkit.ValidateKey(key); err != nil {
+		return nil, err
+	}
 	return nil, blobkit.WrapError("presign_get", key, d.cfg.Name, blobkit.ErrUnsupportedOperation)
 }
 
 // PresignPut is unsupported on native SFTP.
 func (d *Driver) PresignPut(ctx context.Context, key string, opts blobkit.PresignOptions) (*blobkit.PresignedURL, error) {
+	if err := blobkit.ValidateKey(key); err != nil {
+		return nil, err
+	}
 	return nil, blobkit.WrapError("presign_put", key, d.cfg.Name, blobkit.ErrUnsupportedOperation)
 }
 
 // ResolveURL builds a public access or CDN URL if configured.
 func (d *Driver) ResolveURL(key string) (string, error) {
+	if err := blobkit.ValidateKey(key); err != nil {
+		return "", err
+	}
 	if d.cfg.PublicBaseURL != "" {
 		return fmt.Sprintf("%s/%s", strings.TrimRight(d.cfg.PublicBaseURL, "/"), strings.TrimLeft(key, "/")), nil
 	}
@@ -537,26 +628,47 @@ func (d *Driver) ResolveURL(key string) (string, error) {
 
 // CreateMultipart is unsupported on native SFTP.
 func (d *Driver) CreateMultipart(ctx context.Context, obj *blobkit.Object, opts blobkit.PutOptions) (string, error) {
+	if obj == nil {
+		return "", blobkit.ErrInvalidKey
+	}
+	if err := blobkit.ValidateKey(obj.Key); err != nil {
+		return "", err
+	}
 	return "", blobkit.WrapError("create_multipart", obj.Key, d.cfg.Name, blobkit.ErrUnsupportedOperation)
 }
 
 // UploadPart is unsupported on native SFTP.
 func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, partNumber int32, r io.Reader, size int64) (string, error) {
+	if err := blobkit.ValidateKey(key); err != nil {
+		return "", err
+	}
 	return "", blobkit.WrapError("upload_part", key, d.cfg.Name, blobkit.ErrUnsupportedOperation)
 }
 
 // CompleteMultipart is unsupported on native SFTP.
 func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, uploadID string, parts []blobkit.CompletedPart) (*blobkit.Object, error) {
+	if obj == nil {
+		return nil, blobkit.ErrInvalidKey
+	}
+	if err := blobkit.ValidateKey(obj.Key); err != nil {
+		return nil, err
+	}
 	return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, blobkit.ErrUnsupportedOperation)
 }
 
 // AbortMultipart is unsupported on native SFTP.
 func (d *Driver) AbortMultipart(ctx context.Context, key string, uploadID string) error {
+	if err := blobkit.ValidateKey(key); err != nil {
+		return err
+	}
 	return blobkit.WrapError("abort_multipart", key, d.cfg.Name, blobkit.ErrUnsupportedOperation)
 }
 
 // ListParts is unsupported on native SFTP.
 func (d *Driver) ListParts(ctx context.Context, key string, uploadID string) ([]blobkit.CompletedPart, error) {
+	if err := blobkit.ValidateKey(key); err != nil {
+		return nil, err
+	}
 	return nil, blobkit.WrapError("list_parts", key, d.cfg.Name, blobkit.ErrUnsupportedOperation)
 }
 

@@ -13,10 +13,10 @@ import (
 
 // TierTarget represents a storage provider account within a priority tier.
 type TierTarget struct {
-	Driver       blobkit.Driver
-	Weight       int           // Traffic distribution weight within this tier (default: 1)
-	MaxFailures  int           // Consecutive failures before entering cooldown (default: 3)
-	Cooldown     time.Duration // Duration to back off when circuit is tripped (default: 30s)
+	Driver      blobkit.Driver
+	Weight      int           // Traffic distribution weight within this tier (default: 1)
+	MaxFailures int           // Consecutive failures before entering cooldown (default: 3)
+	Cooldown    time.Duration // Duration to back off when circuit is tripped (default: 30s)
 }
 
 // targetState tracks real-time health and cooldown for an individual driver target.

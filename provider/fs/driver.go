@@ -81,6 +81,13 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 		return nil, err
 	}
 
+	resolvedR, effectiveSize, hasExplicitSize, err := blobkit.ResolvePayload(r, opts)
+	if err != nil {
+		return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
+	}
+
+	sizeReader := blobkit.NewSizeReader(resolvedR, effectiveSize, hasExplicitSize)
+
 	if err := ensureParentDir(targetPath, d.cfg.DirMode); err != nil {
 		return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
 	}
@@ -96,13 +103,14 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 	shaHash := sha256.New()
 	mw := io.MultiWriter(tmpFile, md5Hash, shaHash)
 
-	var reader io.Reader = r
-	if opts.Size > 0 {
-		reader = io.LimitReader(r, opts.Size)
+	written, err := io.Copy(mw, sizeReader)
+	if err != nil {
+		tmpFile.Close()
+		_ = os.Remove(tmpName)
+		return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
 	}
 
-	written, err := io.Copy(mw, reader)
-	if err != nil {
+	if err := sizeReader.Verify(); err != nil {
 		tmpFile.Close()
 		_ = os.Remove(tmpName)
 		return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
@@ -198,6 +206,11 @@ func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (
 	if err != nil {
 		f.Close()
 		return nil, err
+	}
+
+	if err := blobkit.CheckPreconditions(metaObj.ETag, metaObj.UpdatedAt, opts); err != nil {
+		f.Close()
+		return nil, blobkit.WrapError("get", key, d.cfg.Name, err)
 	}
 
 	var reader io.ReadCloser = f
@@ -343,6 +356,11 @@ func (d *Driver) DeleteBatch(ctx context.Context, keys []string) ([]string, erro
 	}
 	if len(keys) == 0 {
 		return nil, nil
+	}
+	for _, k := range keys {
+		if err := blobkit.ValidateKey(k); err != nil {
+			return nil, err
+		}
 	}
 
 	type delResult struct {
@@ -585,11 +603,17 @@ func (d *Driver) List(ctx context.Context, opts blobkit.ListOptions) (*blobkit.L
 
 // PresignGet is unsupported on local disk storage without a proxy HTTP file daemon.
 func (d *Driver) PresignGet(ctx context.Context, key string, opts blobkit.PresignOptions) (*blobkit.PresignedURL, error) {
+	if err := blobkit.ValidateKey(key); err != nil {
+		return nil, err
+	}
 	return nil, blobkit.WrapError("presign_get", key, d.cfg.Name, blobkit.ErrUnsupportedOperation)
 }
 
 // PresignPut is unsupported on local disk storage without a proxy HTTP file daemon.
 func (d *Driver) PresignPut(ctx context.Context, key string, opts blobkit.PresignOptions) (*blobkit.PresignedURL, error) {
+	if err := blobkit.ValidateKey(key); err != nil {
+		return nil, err
+	}
 	return nil, blobkit.WrapError("presign_put", key, d.cfg.Name, blobkit.ErrUnsupportedOperation)
 }
 

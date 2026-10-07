@@ -162,7 +162,7 @@ func TestFleet_NamespaceRouting(t *testing.T) {
 			Strategy:        StrategyNamespace,
 			DefaultProvider: "mem-avatars",
 			Namespaces: map[string]string{
-				"user/avatars": "mem-avatars",
+				"user/avatars":  "mem-avatars",
 				"system/backup": "fs-backups",
 			},
 		},

@@ -111,17 +111,31 @@ func (d *Driver) Capabilities() blobkit.Capability {
 }
 
 func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts blobkit.PutOptions) (*blobkit.Object, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, d.wrapError("put", "", err)
+	}
 	if r == nil {
 		return nil, blobkit.ErrNilReader
 	}
+	if obj == nil {
+		return nil, blobkit.ErrInvalidKey
+	}
+	if err := blobkit.ValidateKey(obj.Key); err != nil {
+		return nil, d.wrapError("put", obj.Key, err)
+	}
 
-	// Use single-part PutObject if content length is known and below the multipart threshold
-	if opts.Size > 0 && opts.Size < d.cfg.MultipartThreshold {
+	payloadReader, payloadSize, isExact, err := blobkit.ResolvePayload(r, opts)
+	if err != nil {
+		return nil, d.wrapError("put", obj.Key, err)
+	}
+
+	// Use single-part PutObject if content length is known and 0 OR below the multipart threshold
+	if (payloadSize == 0 && isExact) || (payloadSize > 0 && payloadSize < d.cfg.MultipartThreshold) {
 		input := &s3client.PutObjectInput{
 			Bucket:        aws.String(d.cfg.Bucket),
 			Key:           aws.String(obj.Key),
-			Body:          r,
-			ContentLength: aws.Int64(opts.Size),
+			Body:          payloadReader,
+			ContentLength: aws.Int64(payloadSize),
 			ContentType:   aws.String(obj.ContentType),
 		}
 		if len(opts.Metadata) > 0 {
@@ -142,7 +156,7 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 		now := time.Now().UTC()
 		stored := *obj
 		stored.Bucket = d.cfg.Bucket
-		stored.Size = opts.Size
+		stored.Size = payloadSize
 		if resp.ETag != nil {
 			stored.ETag = *resp.ETag
 		}
@@ -155,10 +169,16 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 	}
 
 	// Use chunked multipart streaming with bounded memory budget
-	return d.uploadMultipart(ctx, obj, r, opts)
+	return d.uploadMultipart(ctx, obj, payloadReader, opts)
 }
 
 func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (*blobkit.ObjectReader, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, d.wrapError("get", key, err)
+	}
+	if err := blobkit.ValidateKey(key); err != nil {
+		return nil, d.wrapError("get", key, err)
+	}
 	input := &s3client.GetObjectInput{
 		Bucket: aws.String(d.cfg.Bucket),
 		Key:    aws.String(key),
@@ -220,6 +240,12 @@ func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (
 }
 
 func (d *Driver) Head(ctx context.Context, key string) (*blobkit.Object, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, d.wrapError("head", key, err)
+	}
+	if err := blobkit.ValidateKey(key); err != nil {
+		return nil, d.wrapError("head", key, err)
+	}
 	resp, err := d.client.HeadObject(ctx, &s3client.HeadObjectInput{
 		Bucket: aws.String(d.cfg.Bucket),
 		Key:    aws.String(key),
@@ -258,6 +284,12 @@ func (d *Driver) Head(ctx context.Context, key string) (*blobkit.Object, error) 
 }
 
 func (d *Driver) Delete(ctx context.Context, key string) error {
+	if err := ctx.Err(); err != nil {
+		return d.wrapError("delete", key, err)
+	}
+	if err := blobkit.ValidateKey(key); err != nil {
+		return d.wrapError("delete", key, err)
+	}
 	_, err := d.client.DeleteObject(ctx, &s3client.DeleteObjectInput{
 		Bucket: aws.String(d.cfg.Bucket),
 		Key:    aws.String(key),
@@ -269,8 +301,17 @@ func (d *Driver) Delete(ctx context.Context, key string) error {
 }
 
 func (d *Driver) DeleteBatch(ctx context.Context, keys []string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, d.wrapError("delete_batch", "", err)
+	}
 	if len(keys) == 0 {
 		return nil, nil
+	}
+
+	for _, k := range keys {
+		if err := blobkit.ValidateKey(k); err != nil {
+			return nil, d.wrapError("delete_batch", k, err)
+		}
 	}
 
 	const batchLimit = 1000
@@ -394,6 +435,12 @@ func (d *Driver) List(ctx context.Context, opts blobkit.ListOptions) (*blobkit.L
 }
 
 func (d *Driver) PresignGet(ctx context.Context, key string, opts blobkit.PresignOptions) (*blobkit.PresignedURL, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, d.wrapError("presign_get", key, err)
+	}
+	if err := blobkit.ValidateKey(key); err != nil {
+		return nil, d.wrapError("presign_get", key, err)
+	}
 	expiry := opts.Expiry
 	if expiry <= 0 {
 		expiry = blobkit.DefaultPresignExpiry
@@ -423,6 +470,12 @@ func (d *Driver) PresignGet(ctx context.Context, key string, opts blobkit.Presig
 }
 
 func (d *Driver) PresignPut(ctx context.Context, key string, opts blobkit.PresignOptions) (*blobkit.PresignedURL, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, d.wrapError("presign_put", key, err)
+	}
+	if err := blobkit.ValidateKey(key); err != nil {
+		return nil, d.wrapError("presign_put", key, err)
+	}
 	expiry := opts.Expiry
 	if expiry <= 0 {
 		expiry = blobkit.DefaultPresignExpiry
@@ -475,6 +528,15 @@ func (d *Driver) ResolveURL(key string) (string, error) {
 }
 
 func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
+	if err := ctx.Err(); err != nil {
+		return d.wrapError("copy", srcKey, err)
+	}
+	if err := blobkit.ValidateKey(srcKey); err != nil {
+		return d.wrapError("copy", srcKey, err)
+	}
+	if err := blobkit.ValidateKey(dstKey); err != nil {
+		return d.wrapError("copy", dstKey, err)
+	}
 	source := url.PathEscape(d.cfg.Bucket + "/" + strings.TrimLeft(srcKey, "/"))
 	_, err := d.client.CopyObject(ctx, &s3client.CopyObjectInput{
 		Bucket:     aws.String(d.cfg.Bucket),
@@ -488,6 +550,15 @@ func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
 }
 
 func (d *Driver) CreateMultipart(ctx context.Context, obj *blobkit.Object, opts blobkit.PutOptions) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", d.wrapError("create_multipart", "", err)
+	}
+	if obj == nil {
+		return "", blobkit.ErrInvalidKey
+	}
+	if err := blobkit.ValidateKey(obj.Key); err != nil {
+		return "", d.wrapError("create_multipart", obj.Key, err)
+	}
 	input := &s3client.CreateMultipartUploadInput{
 		Bucket:      aws.String(d.cfg.Bucket),
 		Key:         aws.String(obj.Key),
@@ -510,6 +581,12 @@ func (d *Driver) CreateMultipart(ctx context.Context, obj *blobkit.Object, opts 
 }
 
 func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, partNumber int32, r io.Reader, size int64) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", d.wrapError("upload_part", key, err)
+	}
+	if err := blobkit.ValidateKey(key); err != nil {
+		return "", d.wrapError("upload_part", key, err)
+	}
 	resp, err := d.client.UploadPart(ctx, &s3client.UploadPartInput{
 		Bucket:        aws.String(d.cfg.Bucket),
 		Key:           aws.String(key),
@@ -528,6 +605,15 @@ func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, pa
 }
 
 func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, uploadID string, parts []blobkit.CompletedPart) (*blobkit.Object, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, d.wrapError("complete_multipart", "", err)
+	}
+	if obj == nil {
+		return nil, blobkit.ErrInvalidKey
+	}
+	if err := blobkit.ValidateKey(obj.Key); err != nil {
+		return nil, d.wrapError("complete_multipart", obj.Key, err)
+	}
 	completed := make([]types.CompletedPart, len(parts))
 	var totalSize int64
 	for i, p := range parts {
@@ -565,6 +651,12 @@ func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, upl
 }
 
 func (d *Driver) AbortMultipart(ctx context.Context, key string, uploadID string) error {
+	if err := ctx.Err(); err != nil {
+		return d.wrapError("abort_multipart", key, err)
+	}
+	if err := blobkit.ValidateKey(key); err != nil {
+		return d.wrapError("abort_multipart", key, err)
+	}
 	_, err := d.client.AbortMultipartUpload(ctx, &s3client.AbortMultipartUploadInput{
 		Bucket:   aws.String(d.cfg.Bucket),
 		Key:      aws.String(key),
@@ -577,6 +669,12 @@ func (d *Driver) AbortMultipart(ctx context.Context, key string, uploadID string
 }
 
 func (d *Driver) ListParts(ctx context.Context, key string, uploadID string) ([]blobkit.CompletedPart, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, d.wrapError("list_parts", key, err)
+	}
+	if err := blobkit.ValidateKey(key); err != nil {
+		return nil, d.wrapError("list_parts", key, err)
+	}
 	resp, err := d.client.ListParts(ctx, &s3client.ListPartsInput{
 		Bucket:   aws.String(d.cfg.Bucket),
 		Key:      aws.String(key),
@@ -620,6 +718,9 @@ func (d *Driver) wrapError(op, key string, err error) error {
 	if err == nil {
 		return nil
 	}
+	if blobkit.PreserveSentinel(err) {
+		return blobkit.WrapError(op, key, d.cfg.Name, err)
+	}
 
 	// Check for specific AWS S3 error codes
 	var nsk *types.NoSuchKey
@@ -639,7 +740,7 @@ func (d *Driver) wrapError(op, key string, err error) error {
 			return blobkit.WrapError(op, key, d.cfg.Name, blobkit.ErrObjectNotFound)
 		case "NoSuchBucket":
 			return blobkit.WrapError(op, key, d.cfg.Name, blobkit.ErrBucketNotFound)
-		case "PreconditionFailed", "AtLeastOneConditionFailed":
+		case "PreconditionFailed", "AtLeastOneConditionFailed", "304", "NotModified":
 			return blobkit.WrapError(op, key, d.cfg.Name, blobkit.ErrPreconditionFailed)
 		case "SlowDown", "RequestTimeout", "ServiceUnavailable", "503", "500":
 			return blobkit.WrapError(op, key, d.cfg.Name, blobkit.ErrProviderUnavailable)

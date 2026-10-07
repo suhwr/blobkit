@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -75,20 +76,14 @@ func resolveMetadata(obj *blobkit.Object, opts blobkit.PutOptions) map[string]st
 	return nil
 }
 
-func validateKey(key string) error {
-	k := strings.TrimSpace(key)
-	if k == "" {
-		return blobkit.ErrInvalidKey
+const maxErrorBodyBytes = 64 * 1024
+
+func readErrorBody(body io.Reader) []byte {
+	if body == nil {
+		return nil
 	}
-	if strings.ContainsRune(k, '\x00') || strings.ContainsRune(k, '\r') {
-		return blobkit.ErrSecurityViolation
-	}
-	for _, seg := range strings.Split(k, "/") {
-		if seg == ".." {
-			return blobkit.ErrSecurityViolation
-		}
-	}
-	return nil
+	data, _ := io.ReadAll(io.LimitReader(body, maxErrorBodyBytes))
+	return data
 }
 
 // Put uploads an object stream to Google Drive, preserving S3-compatible overwrite semantics.
@@ -99,18 +94,37 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 	if obj == nil {
 		return nil, blobkit.ErrInvalidKey
 	}
-	if err := validateKey(obj.Key); err != nil {
+	if err := blobkit.ValidateKey(obj.Key); err != nil {
+		return nil, err
+	}
+
+	resolvedR, effectiveSize, hasExplicitSize, err := blobkit.ResolvePayload(r, opts)
+	if err != nil {
 		return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
 	}
+
+	sizeReader := blobkit.NewSizeReader(resolvedR, effectiveSize, hasExplicitSize)
 
 	// Check if a file with the same key already exists to perform in-place overwrite
 	existingFileID, _ := d.lookupFileID(ctx, obj.Key)
 
-	return d.uploadStreamResumable(ctx, obj, r, opts, existingFileID)
+	optsCopy := opts
+	if effectiveSize >= 0 {
+		optsCopy.Size = effectiveSize
+		optsCopy.ExplicitSize = true
+	} else {
+		optsCopy.Size = blobkit.SizeUnknown
+	}
+
+	return d.uploadStreamResumable(ctx, obj, sizeReader, optsCopy, existingFileID)
 }
 
 // Get retrieves an object stream and its metadata from Google Drive.
 func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (*blobkit.ObjectReader, error) {
+	if err := blobkit.ValidateKey(key); err != nil {
+		return nil, err
+	}
+
 	fileID, err := d.resolveFileID(ctx, key)
 	if err != nil {
 		return nil, err
@@ -161,7 +175,7 @@ func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes := readErrorBody(resp.Body)
 		resp.Body.Close()
 		return nil, wrapHTTPError("get", key, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
 	}
@@ -184,6 +198,10 @@ func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (
 
 // Head inspects an object and returns its metadata without downloading the body.
 func (d *Driver) Head(ctx context.Context, key string) (*blobkit.Object, error) {
+	if err := blobkit.ValidateKey(key); err != nil {
+		return nil, err
+	}
+
 	fileID, err := d.resolveFileID(ctx, key)
 	if err != nil {
 		return nil, err
@@ -211,14 +229,15 @@ func (d *Driver) Head(ctx context.Context, key string) (*blobkit.Object, error) 
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
+		bodyBytes := readErrorBody(resp.Body)
 		if resp.StatusCode == http.StatusNotFound {
 			d.cache.Delete(key)
 		}
 		return nil, wrapHTTPError("head", key, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
 	}
 
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	var fileResp driveFileResponse
 	if err := json.Unmarshal(bodyBytes, &fileResp); err != nil {
 		return nil, blobkit.WrapError("head", key, d.cfg.Name, err)
@@ -234,6 +253,10 @@ func (d *Driver) Head(ctx context.Context, key string) (*blobkit.Object, error) 
 
 // Delete removes an object from Google Drive permanently.
 func (d *Driver) Delete(ctx context.Context, key string) error {
+	if err := blobkit.ValidateKey(key); err != nil {
+		return err
+	}
+
 	fileID, err := d.resolveFileID(ctx, key)
 	if err != nil {
 		if errors.Is(err, blobkit.ErrObjectNotFound) {
@@ -266,7 +289,7 @@ func (d *Driver) Delete(ctx context.Context, key string) error {
 	d.cache.Delete(key)
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes := readErrorBody(resp.Body)
 		return wrapHTTPError("delete", key, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
 	}
 
@@ -277,6 +300,11 @@ func (d *Driver) Delete(ctx context.Context, key string) error {
 func (d *Driver) DeleteBatch(ctx context.Context, keys []string) ([]string, error) {
 	if len(keys) == 0 {
 		return nil, nil
+	}
+	for _, k := range keys {
+		if err := blobkit.ValidateKey(k); err != nil {
+			return nil, err
+		}
 	}
 
 	type deleteResult struct {
@@ -332,6 +360,13 @@ func (d *Driver) DeleteBatch(ctx context.Context, keys []string) ([]string, erro
 
 // Copy duplicates an object within Google Drive and updates the destination key.
 func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
+	if err := blobkit.ValidateKey(srcKey); err != nil {
+		return err
+	}
+	if err := blobkit.ValidateKey(dstKey); err != nil {
+		return err
+	}
+
 	srcFileID, err := d.resolveFileID(ctx, srcKey)
 	if err != nil {
 		return err
@@ -372,11 +407,12 @@ func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		bodyBytes := readErrorBody(resp.Body)
 		return wrapHTTPError("copy", srcKey, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
 	}
 
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	var fileResp driveFileResponse
 	if err := json.Unmarshal(bodyBytes, &fileResp); err == nil {
 		d.cache.Set(dstKey, fileResp.ID)
@@ -422,10 +458,12 @@ func (d *Driver) List(ctx context.Context, opts blobkit.ListOptions) (*blobkit.L
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
+		bodyBytes := readErrorBody(resp.Body)
 		return nil, wrapHTTPError("list", "", d.cfg.Name, resp.StatusCode, bodyBytes, nil)
 	}
+
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 
 	type listResponse struct {
 		NextPageToken string              `json:"nextPageToken"`
@@ -438,6 +476,9 @@ func (d *Driver) List(ctx context.Context, opts blobkit.ListOptions) (*blobkit.L
 	}
 
 	var objects []blobkit.Object
+	var commonPrefixes []string
+	seenPrefixes := make(map[string]bool)
+
 	for _, f := range lr.Files {
 		key := f.Name
 		if k, ok := f.AppProperties["blobkit_key"]; ok && k != "" {
@@ -448,29 +489,54 @@ func (d *Driver) List(ctx context.Context, opts blobkit.ListOptions) (*blobkit.L
 			continue
 		}
 
+		if opts.Delimiter != "" {
+			sub := strings.TrimPrefix(key, opts.Prefix)
+			idx := strings.Index(sub, opts.Delimiter)
+			if idx >= 0 {
+				p := opts.Prefix + sub[:idx+len(opts.Delimiter)]
+				if !seenPrefixes[p] {
+					seenPrefixes[p] = true
+					commonPrefixes = append(commonPrefixes, p)
+				}
+				continue
+			}
+		}
+
 		d.cache.Set(key, f.ID)
 		objects = append(objects, *d.mapDriveFileToObject(key, &f))
 	}
 
+	sort.Strings(commonPrefixes)
+
 	return &blobkit.ListResult{
-		Objects:     objects,
-		NextCursor:  lr.NextPageToken,
-		IsTruncated: lr.NextPageToken != "",
+		Objects:        objects,
+		CommonPrefixes: commonPrefixes,
+		NextCursor:     lr.NextPageToken,
+		IsTruncated:    lr.NextPageToken != "",
 	}, nil
 }
 
 // PresignGet is not natively supported by Google Drive REST API.
 func (d *Driver) PresignGet(ctx context.Context, key string, opts blobkit.PresignOptions) (*blobkit.PresignedURL, error) {
+	if err := blobkit.ValidateKey(key); err != nil {
+		return nil, err
+	}
 	return nil, blobkit.WrapError("presign_get", key, d.cfg.Name, blobkit.ErrUnsupportedOperation)
 }
 
 // PresignPut is not natively supported by Google Drive REST API.
 func (d *Driver) PresignPut(ctx context.Context, key string, opts blobkit.PresignOptions) (*blobkit.PresignedURL, error) {
+	if err := blobkit.ValidateKey(key); err != nil {
+		return nil, err
+	}
 	return nil, blobkit.WrapError("presign_put", key, d.cfg.Name, blobkit.ErrUnsupportedOperation)
 }
 
 // ResolveURL builds a public access or CDN URL for the given key.
 func (d *Driver) ResolveURL(key string) (string, error) {
+	if err := blobkit.ValidateKey(key); err != nil {
+		return "", err
+	}
 	if d.cfg.PublicBaseURL != "" {
 		return fmt.Sprintf("%s/%s", strings.TrimRight(d.cfg.PublicBaseURL, "/"), strings.TrimLeft(key, "/")), nil
 	}
@@ -533,10 +599,12 @@ func (d *Driver) lookupFileID(ctx context.Context, key string) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
+		bodyBytes := readErrorBody(resp.Body)
 		return "", wrapHTTPError("lookup_file_id", key, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
 	}
+
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 
 	type searchResponse struct {
 		Files []struct {

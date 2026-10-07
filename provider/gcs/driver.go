@@ -75,23 +75,22 @@ func resolveMetadata(obj *blobkit.Object, opts blobkit.PutOptions) map[string]st
 }
 
 func validateKey(key string) error {
-	k := strings.TrimSpace(key)
-	if k == "" {
-		return blobkit.ErrInvalidKey
+	return blobkit.ValidateKey(key)
+}
+
+func readErrorBody(body io.Reader) []byte {
+	if body == nil {
+		return nil
 	}
-	if strings.ContainsRune(k, '\x00') || strings.ContainsRune(k, '\r') {
-		return blobkit.ErrSecurityViolation
-	}
-	for _, seg := range strings.Split(k, "/") {
-		if seg == ".." {
-			return blobkit.ErrSecurityViolation
-		}
-	}
-	return nil
+	b, _ := io.ReadAll(io.LimitReader(body, 64*1024))
+	return b
 }
 
 // Put uploads an object stream directly to Google Cloud Storage.
 func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts blobkit.PutOptions) (*blobkit.Object, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("put", "", d.cfg.Name, err)
+	}
 	if r == nil {
 		return nil, blobkit.ErrNilReader
 	}
@@ -109,13 +108,18 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 	}
 	meta := resolveMetadata(obj, opts)
 
-	// If size is unknown (streaming), exceeds MultipartThreshold, or has custom metadata,
-	// use GCS Resumable Upload protocol to keep memory bounded to ChunkSize.
-	if opts.Size <= 0 || opts.Size > d.cfg.MultipartThreshold || len(meta) > 0 {
-		return d.uploadStreamResumable(ctx, obj, r, contentType, meta, opts)
+	payloadReader, payloadSize, isExact, err := blobkit.ResolvePayload(r, opts)
+	if err != nil {
+		return nil, blobkit.WrapError("put", cleanKey, d.cfg.Name, err)
 	}
 
-	// Single-shot direct streaming upload without full in-memory buffering
+	// If size is unknown (streaming), exceeds MultipartThreshold, or has custom metadata,
+	// use GCS Resumable Upload protocol to keep memory bounded to ChunkSize.
+	if (!isExact && payloadSize <= 0) || (payloadSize > d.cfg.MultipartThreshold) || (len(meta) > 0 && payloadSize > 0) {
+		return d.uploadStreamResumable(ctx, obj, payloadReader, contentType, meta, opts)
+	}
+
+	// Single-shot direct streaming upload without full in-memory buffering (supports 0-byte uploads)
 	endpoint := fmt.Sprintf("%s/b/%s/o?uploadType=media&name=%s",
 		d.cfg.UploadAPIBaseURL,
 		url.PathEscape(d.cfg.Bucket),
@@ -123,7 +127,7 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 	)
 
 	h := sha256.New()
-	var bodyReader io.Reader = io.LimitReader(r, opts.Size)
+	var bodyReader io.Reader = payloadReader
 	tee := io.TeeReader(bodyReader, h)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, tee)
@@ -131,7 +135,7 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 		return nil, blobkit.WrapError("put", cleanKey, d.cfg.Name, err)
 	}
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("Content-Length", strconv.FormatInt(opts.Size, 10))
+	req.Header.Set("Content-Length", strconv.FormatInt(payloadSize, 10))
 
 	if err := d.authorizeRequest(ctx, req); err != nil {
 		return nil, err
@@ -143,7 +147,7 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
+	bodyBytes := readErrorBody(resp.Body)
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		return nil, parseGCSError("put", cleanKey, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
@@ -152,6 +156,12 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 	var res gcsObjectResource
 	if err := json.Unmarshal(bodyBytes, &res); err != nil {
 		return nil, blobkit.WrapError("put", cleanKey, d.cfg.Name, err)
+	}
+
+	if sr, ok := payloadReader.(*blobkit.SizeReader); ok {
+		if err := sr.Verify(); err != nil {
+			return nil, blobkit.WrapError("put", cleanKey, d.cfg.Name, err)
+		}
 	}
 
 	result := d.mapObjectResource(cleanKey, &res)
@@ -230,6 +240,12 @@ func (d *Driver) uploadStreamResumable(ctx context.Context, obj *blobkit.Object,
 
 // Get retrieves an object stream and its metadata from Google Cloud Storage.
 func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (*blobkit.ObjectReader, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("get", key, d.cfg.Name, err)
+	}
+	if err := validateKey(key); err != nil {
+		return nil, blobkit.WrapError("get", key, d.cfg.Name, err)
+	}
 	endpoint := fmt.Sprintf("%s/b/%s/o/%s?alt=media",
 		d.cfg.StorageAPIBaseURL,
 		url.PathEscape(d.cfg.Bucket),
@@ -267,7 +283,7 @@ func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes := readErrorBody(resp.Body)
 		resp.Body.Close()
 		return nil, parseGCSError("get", key, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
 	}
@@ -315,6 +331,12 @@ func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (
 
 // Head inspects a GCS object and returns its metadata without downloading the payload body.
 func (d *Driver) Head(ctx context.Context, key string) (*blobkit.Object, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("head", key, d.cfg.Name, err)
+	}
+	if err := validateKey(key); err != nil {
+		return nil, blobkit.WrapError("head", key, d.cfg.Name, err)
+	}
 	endpoint := fmt.Sprintf("%s/b/%s/o/%s",
 		d.cfg.StorageAPIBaseURL,
 		url.PathEscape(d.cfg.Bucket),
@@ -336,7 +358,7 @@ func (d *Driver) Head(ctx context.Context, key string) (*blobkit.Object, error) 
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
+	bodyBytes := readErrorBody(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, parseGCSError("head", key, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
@@ -353,6 +375,12 @@ func (d *Driver) Head(ctx context.Context, key string) (*blobkit.Object, error) 
 
 // Delete permanently removes an object from Google Cloud Storage.
 func (d *Driver) Delete(ctx context.Context, key string) error {
+	if err := ctx.Err(); err != nil {
+		return blobkit.WrapError("delete", key, d.cfg.Name, err)
+	}
+	if err := validateKey(key); err != nil {
+		return blobkit.WrapError("delete", key, d.cfg.Name, err)
+	}
 	endpoint := fmt.Sprintf("%s/b/%s/o/%s",
 		d.cfg.StorageAPIBaseURL,
 		url.PathEscape(d.cfg.Bucket),
@@ -375,7 +403,7 @@ func (d *Driver) Delete(ctx context.Context, key string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes := readErrorBody(resp.Body)
 		return parseGCSError("delete", key, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
 	}
 
@@ -384,8 +412,16 @@ func (d *Driver) Delete(ctx context.Context, key string) error {
 
 // DeleteBatch removes multiple keys concurrently using a bounded worker pool.
 func (d *Driver) DeleteBatch(ctx context.Context, keys []string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("delete_batch", "", d.cfg.Name, err)
+	}
 	if len(keys) == 0 {
 		return nil, nil
+	}
+	for _, k := range keys {
+		if err := validateKey(k); err != nil {
+			return nil, blobkit.WrapError("delete_batch", k, d.cfg.Name, err)
+		}
 	}
 
 	type delResult struct {
@@ -441,6 +477,15 @@ func (d *Driver) DeleteBatch(ctx context.Context, keys []string) ([]string, erro
 
 // Copy duplicates an object server-side using Google Cloud Storage rewrite API.
 func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
+	if err := ctx.Err(); err != nil {
+		return blobkit.WrapError("copy", srcKey, d.cfg.Name, err)
+	}
+	if err := validateKey(srcKey); err != nil {
+		return blobkit.WrapError("copy", srcKey, d.cfg.Name, err)
+	}
+	if err := validateKey(dstKey); err != nil {
+		return blobkit.WrapError("copy", dstKey, d.cfg.Name, err)
+	}
 	rewriteToken := ""
 
 	for {
@@ -470,7 +515,7 @@ func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
 			return parseGCSError("copy", srcKey, d.cfg.Name, 0, nil, err)
 		}
 
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes := readErrorBody(resp.Body)
 		resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
@@ -496,6 +541,9 @@ func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
 
 // List queries objects in the GCS bucket matching prefix and pagination options.
 func (d *Driver) List(ctx context.Context, opts blobkit.ListOptions) (*blobkit.ListResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("list", "", d.cfg.Name, err)
+	}
 	query := make(url.Values)
 	if opts.Prefix != "" {
 		query.Set("prefix", opts.Prefix)
@@ -531,7 +579,7 @@ func (d *Driver) List(ctx context.Context, opts blobkit.ListOptions) (*blobkit.L
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
+	bodyBytes := readErrorBody(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, parseGCSError("list", "", d.cfg.Name, resp.StatusCode, bodyBytes, nil)
@@ -564,11 +612,23 @@ func (d *Driver) List(ctx context.Context, opts blobkit.ListOptions) (*blobkit.L
 
 // PresignGet creates a temporary V4 Signed URL for downloading an object.
 func (d *Driver) PresignGet(ctx context.Context, key string, opts blobkit.PresignOptions) (*blobkit.PresignedURL, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("presign_get", key, d.cfg.Name, err)
+	}
+	if err := validateKey(key); err != nil {
+		return nil, blobkit.WrapError("presign_get", key, d.cfg.Name, err)
+	}
 	return d.buildV4SignedURL(ctx, http.MethodGet, key, opts)
 }
 
 // PresignPut creates a temporary V4 Signed URL for uploading an object.
 func (d *Driver) PresignPut(ctx context.Context, key string, opts blobkit.PresignOptions) (*blobkit.PresignedURL, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("presign_put", key, d.cfg.Name, err)
+	}
+	if err := validateKey(key); err != nil {
+		return nil, blobkit.WrapError("presign_put", key, d.cfg.Name, err)
+	}
 	return d.buildV4SignedURL(ctx, http.MethodPut, key, opts)
 }
 

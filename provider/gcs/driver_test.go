@@ -39,10 +39,10 @@ type mockGCSObject struct {
 
 // mockGCSServer simulates the Google Cloud Storage JSON API v1 and Resumable Upload protocol.
 type mockGCSServer struct {
-	mu        sync.RWMutex
-	bucket    string
-	objects   map[string]*mockGCSObject
-	sessions  map[string]*mockSession
+	mu         sync.RWMutex
+	bucket     string
+	objects    map[string]*mockGCSObject
+	sessions   map[string]*mockSession
 	sessionSeq int
 }
 
@@ -1166,4 +1166,3 @@ func TestDriver_StreamingPut_AutoResumable_And_Security(t *testing.T) {
 		t.Fatalf("expected ErrSecurityViolation for path traversal, got: %v", err)
 	}
 }
-

@@ -73,14 +73,14 @@ var (
 	ErrSessionExpired = errors.New("blobkit: upload session expired")
 )
 
-// Regex patterns to scrub sensitive data from error messages (tokens, credentials, internal IP/proxy addresses).
 var (
-	reSecretToken = regexp.MustCompile(`(?i)(token|key|secret|password|sig|signature)=([a-zA-Z0-9_\-\.%]+)`)
+	reSecretToken = regexp.MustCompile(`(?i)(token|access_token|refresh_token|api_key|apikey|secret_key|secret|client_secret|password|passwd|sig|signature|x-amz-signature|x-amz-credential|x-goog-signature)=([a-zA-Z0-9_\-\.%]+)`)
+	reJSONSecret  = regexp.MustCompile(`(?i)"(token|access_token|refresh_token|api_key|apikey|secret_key|secret|client_secret|password|passwd|sig|signature)"\s*:\s*"[^"]*"`)
 	reBearerAuth  = regexp.MustCompile(`(?i)(Bearer\s+)[A-Za-z0-9\-\._~+/]+=*`)
 	reBasicAuth   = regexp.MustCompile(`(?i)(Basic\s+)[A-Za-z0-9+/=]+`)
 	rePrivateKey  = regexp.MustCompile(`(?s)-----BEGIN[^\-]+PRIVATE KEY-----.*?-----END[^\-]+PRIVATE KEY-----`)
 	reProxyDial   = regexp.MustCompile(`proxyconnect tcp: dial tcp [0-9\.:]+: `)
-	reInternalIP  = regexp.MustCompile(`(dial tcp (?:127\.0\.0\.1|10\.\d+\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+):\d+)`)
+	reInternalIP  = regexp.MustCompile(`(dial tcp (?:127\.0\.0\.1|10\.\d+\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+|\[::1\]|\[fe80:[0-9a-f:]+\]|\[(?:fc|fd)[0-9a-f:]+\]):\d+)`)
 )
 
 // StorageError represents a standardized, sanitized error returned by BlobKit operations.
@@ -185,6 +185,7 @@ func SanitizeErrorMessage(raw string) string {
 	sanitized = reBasicAuth.ReplaceAllString(sanitized, "$1[redacted]")
 	sanitized = rePrivateKey.ReplaceAllString(sanitized, "[redacted private key]")
 	sanitized = reSecretToken.ReplaceAllString(sanitized, "$1=[redacted]")
+	sanitized = reJSONSecret.ReplaceAllString(sanitized, `"$1":"[redacted]"`)
 	return sanitized
 }
 

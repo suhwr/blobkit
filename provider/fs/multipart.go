@@ -87,7 +87,7 @@ func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, pa
 	session, found := d.sessions[uploadID]
 	d.sessionsMu.RUnlock()
 
-	if !found {
+	if !found || session.key != key {
 		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, blobkit.ErrSessionNotFound)
 	}
 
@@ -109,9 +109,14 @@ func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, pa
 		reader = io.LimitReader(r, size)
 	}
 
-	if _, err := io.Copy(mw, reader); err != nil {
+	written, err := io.Copy(mw, reader)
+	if err != nil {
 		_ = os.Remove(partFile)
 		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, err)
+	}
+	if size > 0 && written != size {
+		_ = os.Remove(partFile)
+		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, blobkit.ErrSizeMismatch)
 	}
 
 	etag := fmt.Sprintf("\"%s\"", hex.EncodeToString(hasher.Sum(nil)))
@@ -123,14 +128,21 @@ func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, upl
 	if err := ctx.Err(); err != nil {
 		return nil, blobkit.WrapError("complete_multipart", "", d.cfg.Name, err)
 	}
+	if obj == nil {
+		return nil, blobkit.ErrInvalidKey
+	}
+	if err := blobkit.ValidateKey(obj.Key); err != nil {
+		return nil, err
+	}
+
 	d.sessionsMu.Lock()
 	session, found := d.sessions[uploadID]
-	if found {
+	if found && session.key == obj.Key {
 		delete(d.sessions, uploadID)
 	}
 	d.sessionsMu.Unlock()
 
-	if !found {
+	if !found || session.key != obj.Key {
 		return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, blobkit.ErrSessionNotFound)
 	}
 
@@ -241,6 +253,12 @@ func (d *Driver) AbortMultipart(ctx context.Context, key string, uploadID string
 	if err := ctx.Err(); err != nil {
 		return blobkit.WrapError("abort_multipart", key, d.cfg.Name, err)
 	}
+	if err := blobkit.ValidateKey(key); err != nil {
+		return err
+	}
+	if uploadID == "" {
+		return nil
+	}
 	d.sessionsMu.Lock()
 	session, found := d.sessions[uploadID]
 	if found {
@@ -267,9 +285,19 @@ func (d *Driver) ListParts(ctx context.Context, key string, uploadID string) ([]
 	if err := ctx.Err(); err != nil {
 		return nil, blobkit.WrapError("list_parts", key, d.cfg.Name, err)
 	}
+	if err := blobkit.ValidateKey(key); err != nil {
+		return nil, err
+	}
+	if uploadID == "" {
+		return nil, blobkit.WrapError("list_parts", key, d.cfg.Name, blobkit.ErrInvalidID)
+	}
 	d.sessionsMu.RLock()
 	session, found := d.sessions[uploadID]
 	d.sessionsMu.RUnlock()
+
+	if found && session.key != key {
+		return nil, blobkit.WrapError("list_parts", key, d.cfg.Name, blobkit.ErrSessionNotFound)
+	}
 
 	var stagingPath string
 	if found {

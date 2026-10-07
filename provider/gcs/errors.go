@@ -11,10 +11,10 @@ import (
 )
 
 var (
-	bearerTokenRegex    = regexp.MustCompile(`(?i)(Bearer\s+)[A-Za-z0-9\-\._~+/]+=*`)
-	googSignatureRegex  = regexp.MustCompile(`(?i)(X-Goog-Signature=)[a-f0-9]+`)
-	genericSigRegex     = regexp.MustCompile(`(?i)(sig=)[^&\s"']+`)
-	privateKeyPemRegex  = regexp.MustCompile(`(?s)-----BEGIN[^\-]+PRIVATE KEY-----.*?-----END[^\-]+PRIVATE KEY-----`)
+	bearerTokenRegex   = regexp.MustCompile(`(?i)(Bearer\s+)[A-Za-z0-9\-\._~+/]+=*`)
+	googSignatureRegex = regexp.MustCompile(`(?i)(X-Goog-Signature=)[a-f0-9]+`)
+	genericSigRegex    = regexp.MustCompile(`(?i)(sig=)[^&\s"']+`)
+	privateKeyPemRegex = regexp.MustCompile(`(?s)-----BEGIN[^\-]+PRIVATE KEY-----.*?-----END[^\-]+PRIVATE KEY-----`)
 )
 
 // gcsErrorResponse represents the standard error format returned by Google Cloud Storage JSON APIs.
@@ -76,7 +76,7 @@ func parseGCSError(op, key, driverName string, statusCode int, body []byte, rawE
 	case statusCode == http.StatusNotFound || reason == "notFound":
 		return blobkit.WrapError(op, key, driverName, blobkit.ErrObjectNotFound)
 
-	case statusCode == http.StatusPreconditionFailed || statusCode == http.StatusRequestedRangeNotSatisfiable || reason == "conditionNotMet":
+	case statusCode == http.StatusPreconditionFailed || statusCode == http.StatusNotModified || statusCode == http.StatusRequestedRangeNotSatisfiable || reason == "conditionNotMet":
 		return blobkit.WrapError(op, key, driverName, blobkit.ErrPreconditionFailed)
 
 	case statusCode == http.StatusConflict:

@@ -79,25 +79,24 @@ func resolveMetadata(obj *blobkit.Object, opts blobkit.PutOptions) map[string]st
 }
 
 func validateKey(key string) error {
-	k := strings.TrimSpace(key)
-	if k == "" {
-		return blobkit.ErrInvalidKey
+	return blobkit.ValidateKey(key)
+}
+
+func readErrorBody(body io.Reader) []byte {
+	if body == nil {
+		return nil
 	}
-	if strings.ContainsRune(k, '\x00') || strings.ContainsRune(k, '\r') {
-		return blobkit.ErrSecurityViolation
-	}
-	for _, seg := range strings.Split(k, "/") {
-		if seg == ".." {
-			return blobkit.ErrSecurityViolation
-		}
-	}
-	return nil
+	b, _ := io.ReadAll(io.LimitReader(body, 64*1024))
+	return b
 }
 
 // Put uploads an object stream as an Azure Block Blob.
-// For objects within MultipartThreshold with known size, it streams directly using single Put Blob.
+// For objects within MultipartThreshold with known size (including 0-byte objects), it streams directly using single Put Blob.
 // For objects exceeding MultipartThreshold or unknown/streaming sizes, it stages chunked blocks and commits them.
 func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts blobkit.PutOptions) (*blobkit.Object, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("put", "", d.cfg.Name, err)
+	}
 	if r == nil {
 		return nil, blobkit.ErrNilReader
 	}
@@ -117,14 +116,19 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 	}
 	meta := resolveMetadata(obj, opts)
 
+	payloadReader, payloadSize, isExact, err := blobkit.ResolvePayload(r, opts)
+	if err != nil {
+		return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
+	}
+
 	// If size is unknown (streaming) or exceeds MultipartThreshold, use chunked block staging
-	if opts.Size <= 0 || opts.Size > d.cfg.MultipartThreshold {
-		return d.uploadStreamMultipart(ctx, obj, r, contentType, meta, opts)
+	if (!isExact && payloadSize <= 0) || (payloadSize > d.cfg.MultipartThreshold) {
+		return d.uploadStreamMultipart(ctx, obj, payloadReader, contentType, meta, opts)
 	}
 
 	// Single-shot direct streaming upload without whole-body buffering
 	urlStr := d.blobURL(obj.Key)
-	var bodyReader io.Reader = io.LimitReader(r, opts.Size)
+	var bodyReader io.Reader = payloadReader
 
 	hMD5 := md5.New()
 	hSHA := sha256.New()
@@ -135,7 +139,7 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 		return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
 	}
 
-	req.ContentLength = opts.Size
+	req.ContentLength = payloadSize
 	req.Header.Set("x-ms-blob-type", "BlockBlob")
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("x-ms-blob-content-type", contentType)
@@ -155,8 +159,14 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes := readErrorBody(resp.Body)
 		return nil, wrapHTTPError("put", obj.Key, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
+	}
+
+	if sr, ok := payloadReader.(*blobkit.SizeReader); ok {
+		if err := sr.Verify(); err != nil {
+			return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
+		}
 	}
 
 	now := time.Now().UTC()
@@ -249,6 +259,12 @@ func (d *Driver) uploadStreamMultipart(ctx context.Context, obj *blobkit.Object,
 
 // Get retrieves an object stream and its metadata from Azure Blob Storage.
 func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (*blobkit.ObjectReader, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("get", key, d.cfg.Name, err)
+	}
+	if err := validateKey(key); err != nil {
+		return nil, blobkit.WrapError("get", key, d.cfg.Name, err)
+	}
 	urlStr := d.blobURL(key)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
 	if err != nil {
@@ -281,7 +297,7 @@ func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes := readErrorBody(resp.Body)
 		resp.Body.Close()
 		return nil, wrapHTTPError("get", key, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
 	}
@@ -329,6 +345,12 @@ func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (
 
 // Head inspects a blob and returns its metadata without downloading the body.
 func (d *Driver) Head(ctx context.Context, key string) (*blobkit.Object, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("head", key, d.cfg.Name, err)
+	}
+	if err := validateKey(key); err != nil {
+		return nil, blobkit.WrapError("head", key, d.cfg.Name, err)
+	}
 	urlStr := d.blobURL(key)
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, urlStr, nil)
 	if err != nil {
@@ -387,6 +409,12 @@ func (d *Driver) Head(ctx context.Context, key string) (*blobkit.Object, error) 
 
 // Delete removes a blob from Azure Blob Storage.
 func (d *Driver) Delete(ctx context.Context, key string) error {
+	if err := ctx.Err(); err != nil {
+		return blobkit.WrapError("delete", key, d.cfg.Name, err)
+	}
+	if err := validateKey(key); err != nil {
+		return blobkit.WrapError("delete", key, d.cfg.Name, err)
+	}
 	urlStr := d.blobURL(key)
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, urlStr, nil)
 	if err != nil {
@@ -404,7 +432,7 @@ func (d *Driver) Delete(ctx context.Context, key string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes := readErrorBody(resp.Body)
 		return wrapHTTPError("delete", key, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
 	}
 
@@ -413,8 +441,16 @@ func (d *Driver) Delete(ctx context.Context, key string) error {
 
 // DeleteBatch removes multiple keys concurrently using a bounded worker pool.
 func (d *Driver) DeleteBatch(ctx context.Context, keys []string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("delete_batch", "", d.cfg.Name, err)
+	}
 	if len(keys) == 0 {
 		return nil, nil
+	}
+	for _, k := range keys {
+		if err := validateKey(k); err != nil {
+			return nil, blobkit.WrapError("delete_batch", k, d.cfg.Name, err)
+		}
 	}
 
 	type delResult struct {
@@ -470,6 +506,15 @@ func (d *Driver) DeleteBatch(ctx context.Context, keys []string) ([]string, erro
 
 // Copy duplicates a blob within Azure Storage via x-ms-copy-source.
 func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
+	if err := ctx.Err(); err != nil {
+		return blobkit.WrapError("copy", srcKey, d.cfg.Name, err)
+	}
+	if err := validateKey(srcKey); err != nil {
+		return blobkit.WrapError("copy", srcKey, d.cfg.Name, err)
+	}
+	if err := validateKey(dstKey); err != nil {
+		return blobkit.WrapError("copy", dstKey, d.cfg.Name, err)
+	}
 	srcURL := d.blobURL(srcKey)
 	dstURL := d.blobURL(dstKey)
 
@@ -491,7 +536,7 @@ func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes := readErrorBody(resp.Body)
 		return wrapHTTPError("copy", srcKey, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
 	}
 
@@ -500,6 +545,9 @@ func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
 
 // List queries blobs in the container matching criteria (GET /container?restype=container&comp=list).
 func (d *Driver) List(ctx context.Context, opts blobkit.ListOptions) (*blobkit.ListResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("list", opts.Prefix, d.cfg.Name, err)
+	}
 	params := url.Values{}
 	params.Set("restype", "container")
 	params.Set("comp", "list")
@@ -536,7 +584,7 @@ func (d *Driver) List(ctx context.Context, opts blobkit.ListOptions) (*blobkit.L
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
+	bodyBytes := readErrorBody(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return nil, wrapHTTPError("list", opts.Prefix, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
 	}
@@ -601,6 +649,12 @@ func (d *Driver) List(ctx context.Context, opts blobkit.ListOptions) (*blobkit.L
 
 // PresignGet generates a time-limited SAS download URL (sp=r).
 func (d *Driver) PresignGet(ctx context.Context, key string, opts blobkit.PresignOptions) (*blobkit.PresignedURL, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("presign_get", key, d.cfg.Name, err)
+	}
+	if err := validateKey(key); err != nil {
+		return nil, blobkit.WrapError("presign_get", key, d.cfg.Name, err)
+	}
 	if d.cfg.AccountKey == "" {
 		return nil, blobkit.WrapError("presign_get", key, d.cfg.Name, fmt.Errorf("AccountKey required for SAS generation"))
 	}
@@ -626,6 +680,12 @@ func (d *Driver) PresignGet(ctx context.Context, key string, opts blobkit.Presig
 
 // PresignPut generates a time-limited SAS upload URL (sp=w) with x-ms-blob-type: BlockBlob.
 func (d *Driver) PresignPut(ctx context.Context, key string, opts blobkit.PresignOptions) (*blobkit.PresignedURL, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("presign_put", key, d.cfg.Name, err)
+	}
+	if err := validateKey(key); err != nil {
+		return nil, blobkit.WrapError("presign_put", key, d.cfg.Name, err)
+	}
 	if d.cfg.AccountKey == "" {
 		return nil, blobkit.WrapError("presign_put", key, d.cfg.Name, fmt.Errorf("AccountKey required for SAS generation"))
 	}

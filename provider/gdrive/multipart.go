@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"sort"
 	"strconv"
 	"sync"
 
@@ -46,8 +47,11 @@ type multipartSessionState struct {
 // CreateMultipart initiates a resumable upload session on Google Drive.
 // Conforms to the Resumable Upload protocol specified in Drive API v3.
 func (d *Driver) CreateMultipart(ctx context.Context, obj *blobkit.Object, opts blobkit.PutOptions) (string, error) {
-	if obj == nil || obj.Key == "" {
+	if obj == nil {
 		return "", blobkit.ErrInvalidKey
+	}
+	if err := blobkit.ValidateKey(obj.Key); err != nil {
+		return "", err
 	}
 
 	meta := resolveMetadata(obj, opts)
@@ -65,16 +69,25 @@ func (d *Driver) CreateMultipart(ctx context.Context, obj *blobkit.Object, opts 
 
 // UploadPart streams an individual chunk of data to the Google Drive resumable session URI.
 func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, partNumber int32, r io.Reader, size int64) (string, error) {
+	if err := blobkit.ValidateKey(key); err != nil {
+		return "", err
+	}
+	if uploadID == "" {
+		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, blobkit.ErrInvalidID)
+	}
 	if r == nil {
 		return "", blobkit.ErrNilReader
+	}
+	if size < 0 {
+		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, blobkit.ErrSizeMismatch)
 	}
 
 	d.sessionsMu.RLock()
 	session, found := d.sessions[uploadID]
 	d.sessionsMu.RUnlock()
 
-	if !found {
-		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, blobkit.ErrInvalidID)
+	if !found || session.key != key {
+		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, blobkit.ErrSessionNotFound)
 	}
 
 	session.mu.Lock()
@@ -90,7 +103,9 @@ func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, pa
 	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, err)
 	}
-	buf = buf[:n]
+	if int64(n) != size {
+		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, blobkit.ErrSizeMismatch)
+	}
 	actualSize := int64(n)
 
 	// Compute MD5 for part verification
@@ -124,8 +139,6 @@ func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, pa
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
-
 	// 308 Resume Incomplete = chunk accepted, awaiting next chunks
 	// 200 OK / 201 Created = upload completed
 	if resp.StatusCode == 308 {
@@ -141,6 +154,7 @@ func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, pa
 		session.uploadedSize += actualSize
 		session.completed = true
 
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		var fileResp driveFileResponse
 		if err := json.Unmarshal(bodyBytes, &fileResp); err == nil {
 			resultObj := d.mapDriveFileToObject(key, &fileResp)
@@ -157,20 +171,31 @@ func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, pa
 		return etag, nil
 	}
 
+	bodyBytes := readErrorBody(resp.Body)
 	return "", wrapHTTPError("upload_part", key, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
 }
 
 // CompleteMultipart finalizes a resumable upload session on Google Drive.
 func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, uploadID string, parts []blobkit.CompletedPart) (*blobkit.Object, error) {
+	if obj == nil {
+		return nil, blobkit.ErrInvalidKey
+	}
+	if err := blobkit.ValidateKey(obj.Key); err != nil {
+		return nil, err
+	}
+	if uploadID == "" {
+		return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, blobkit.ErrInvalidID)
+	}
+
 	d.sessionsMu.Lock()
 	session, found := d.sessions[uploadID]
-	if found {
+	if found && session.key == obj.Key {
 		delete(d.sessions, uploadID)
 	}
 	d.sessionsMu.Unlock()
 
-	if !found {
-		return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, blobkit.ErrInvalidID)
+	if !found || session.key != obj.Key {
+		return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, blobkit.ErrSessionNotFound)
 	}
 
 	session.mu.Lock()
@@ -200,8 +225,8 @@ func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, upl
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		var fileResp driveFileResponse
 		if err := json.Unmarshal(bodyBytes, &fileResp); err != nil {
 			return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, err)
@@ -211,14 +236,29 @@ func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, upl
 		return res, nil
 	}
 
+	bodyBytes := readErrorBody(resp.Body)
 	return nil, wrapHTTPError("complete_multipart", obj.Key, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
 }
 
 // AbortMultipart cancels a resumable upload session on Google Drive.
 func (d *Driver) AbortMultipart(ctx context.Context, key string, uploadID string) error {
+	if err := blobkit.ValidateKey(key); err != nil {
+		return err
+	}
+	if uploadID == "" {
+		return nil
+	}
+
 	d.sessionsMu.Lock()
-	delete(d.sessions, uploadID)
+	session, found := d.sessions[uploadID]
+	if found && session.key == key {
+		delete(d.sessions, uploadID)
+	}
 	d.sessionsMu.Unlock()
+
+	if !found || session.key != key {
+		return nil // Idempotent abort
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, uploadID, nil)
 	if err != nil {
@@ -236,12 +276,19 @@ func (d *Driver) AbortMultipart(ctx context.Context, key string, uploadID string
 
 // ListParts returns the list of parts recorded for an active session.
 func (d *Driver) ListParts(ctx context.Context, key string, uploadID string) ([]blobkit.CompletedPart, error) {
+	if err := blobkit.ValidateKey(key); err != nil {
+		return nil, err
+	}
+	if uploadID == "" {
+		return nil, blobkit.WrapError("list_parts", key, d.cfg.Name, blobkit.ErrInvalidID)
+	}
+
 	d.sessionsMu.RLock()
 	session, found := d.sessions[uploadID]
 	d.sessionsMu.RUnlock()
 
-	if !found {
-		return nil, blobkit.WrapError("list_parts", key, d.cfg.Name, blobkit.ErrInvalidID)
+	if !found || session.key != key {
+		return nil, blobkit.WrapError("list_parts", key, d.cfg.Name, blobkit.ErrSessionNotFound)
 	}
 
 	session.mu.Lock()
@@ -251,6 +298,9 @@ func (d *Driver) ListParts(ctx context.Context, key string, uploadID string) ([]
 	for _, p := range session.parts {
 		parts = append(parts, p)
 	}
+	sort.Slice(parts, func(i, j int) bool {
+		return parts[i].PartNumber < parts[j].PartNumber
+	})
 	return parts, nil
 }
 
@@ -317,7 +367,7 @@ func (d *Driver) initiateResumableSession(ctx context.Context, key, mimeType str
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes := readErrorBody(resp.Body)
 		return nil, wrapHTTPError("initiate_session", key, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
 	}
 
@@ -357,6 +407,10 @@ func (d *Driver) uploadStreamResumable(ctx context.Context, obj *blobkit.Object,
 		}
 
 		n, readErr := io.ReadFull(r, buf)
+		if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+			_ = d.AbortMultipart(context.Background(), obj.Key, session.uploadURI)
+			return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, readErr)
+		}
 		if n > 0 {
 			chunk := buf[:n]
 			isLastChunk := (readErr == io.EOF || readErr == io.ErrUnexpectedEOF)
@@ -393,10 +447,18 @@ func (d *Driver) uploadStreamResumable(ctx context.Context, obj *blobkit.Object,
 				return nil, wrapHTTPError("put", obj.Key, d.cfg.Name, 0, nil, err)
 			}
 
-			bodyBytes, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-
 			if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+				if sr, ok := r.(*blobkit.SizeReader); ok {
+					if err := sr.Verify(); err != nil {
+						resp.Body.Close()
+						_ = d.AbortMultipart(context.Background(), obj.Key, session.uploadURI)
+						_ = d.Delete(context.Background(), obj.Key)
+						return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
+					}
+				}
+				bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+				resp.Body.Close()
+
 				var fileResp driveFileResponse
 				if err := json.Unmarshal(bodyBytes, &fileResp); err != nil {
 					return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
@@ -407,7 +469,10 @@ func (d *Driver) uploadStreamResumable(ctx context.Context, obj *blobkit.Object,
 			} else if resp.StatusCode == 308 {
 				uploaded += chunkLen
 				partNum++
+				resp.Body.Close()
 			} else {
+				bodyBytes := readErrorBody(resp.Body)
+				resp.Body.Close()
 				_ = d.AbortMultipart(context.Background(), obj.Key, session.uploadURI)
 				return nil, wrapHTTPError("put", obj.Key, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
 			}
@@ -424,6 +489,13 @@ func (d *Driver) uploadStreamResumable(ctx context.Context, obj *blobkit.Object,
 
 	// If empty file (0 bytes), finalize upload
 	if uploaded == 0 {
+		if sr, ok := r.(*blobkit.SizeReader); ok {
+			if err := sr.Verify(); err != nil {
+				_ = d.AbortMultipart(context.Background(), obj.Key, session.uploadURI)
+				return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
+			}
+		}
+
 		req, err := http.NewRequestWithContext(ctx, http.MethodPut, session.uploadURI, bytes.NewReader(nil))
 		if err != nil {
 			return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
@@ -435,10 +507,10 @@ func (d *Driver) uploadStreamResumable(ctx context.Context, obj *blobkit.Object,
 		if err != nil {
 			return nil, wrapHTTPError("put", obj.Key, d.cfg.Name, 0, nil, err)
 		}
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		defer resp.Body.Close()
 
 		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+			bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 			var fileResp driveFileResponse
 			if err := json.Unmarshal(bodyBytes, &fileResp); err != nil {
 				return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
@@ -447,6 +519,7 @@ func (d *Driver) uploadStreamResumable(ctx context.Context, obj *blobkit.Object,
 			d.cache.Set(obj.Key, fileResp.ID)
 			return res, nil
 		}
+		bodyBytes := readErrorBody(resp.Body)
 		return nil, wrapHTTPError("put", obj.Key, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
 	}
 

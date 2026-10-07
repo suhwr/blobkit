@@ -14,9 +14,9 @@ import (
 type MemoryLimiter struct {
 	maxBytes  int64
 	allocated atomic.Int64
+	closed    atomic.Bool
 	mu        sync.Mutex
 	cond      *sync.Cond
-	closed    bool
 }
 
 // NewMemoryLimiter creates a limiter with the specified maximum byte ceiling.
@@ -41,12 +41,32 @@ func (l *MemoryLimiter) Acquire(ctx context.Context, bytes int64) error {
 	if bytes > l.maxBytes {
 		return fmt.Errorf("%w: requested %d bytes exceeds max ceiling %d", blobkit.ErrMemoryBudgetExceeded, bytes, l.maxBytes)
 	}
+	if l.closed.Load() {
+		return blobkit.ErrProviderUnavailable
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// Fast path: attempt immediate acquisition without lock or goroutine spawn
+	if l.TryAcquire(bytes) {
+		return nil
+	}
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	if l.closed.Load() {
+		return blobkit.ErrProviderUnavailable
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	stopWatcher := make(chan struct{})
+	watcherDone := make(chan struct{})
 	go func() {
+		defer close(watcherDone)
 		select {
 		case <-ctx.Done():
 			l.mu.Lock()
@@ -55,27 +75,28 @@ func (l *MemoryLimiter) Acquire(ctx context.Context, bytes int64) error {
 		case <-stopWatcher:
 		}
 	}()
-	defer close(stopWatcher)
+	defer func() {
+		close(stopWatcher)
+		<-watcherDone
+	}()
 
 	// Spin-wait with cancellation check
 	for {
-		if l.closed {
+		if l.closed.Load() {
 			return blobkit.ErrProviderUnavailable
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 
 		current := l.allocated.Load()
-		if current+bytes <= l.maxBytes {
-			l.allocated.Add(bytes)
-			return nil
+		if current <= l.maxBytes-bytes {
+			if l.allocated.CompareAndSwap(current, current+bytes) {
+				return nil
+			}
+			continue
 		}
 
-		// Wait for releases. In Go, cond.Wait cannot be interrupted directly by context,
-		// so we wake periodically or on release.
 		l.cond.Wait()
 	}
 }
@@ -85,9 +106,15 @@ func (l *MemoryLimiter) TryAcquire(bytes int64) bool {
 	if bytes <= 0 {
 		return true
 	}
+	if bytes > l.maxBytes {
+		return false
+	}
 	for {
+		if l.closed.Load() {
+			return false
+		}
 		current := l.allocated.Load()
-		if current+bytes > l.maxBytes {
+		if current > l.maxBytes-bytes {
 			return false
 		}
 		if l.allocated.CompareAndSwap(current, current+bytes) {
@@ -97,11 +124,21 @@ func (l *MemoryLimiter) TryAcquire(bytes int64) bool {
 }
 
 // Release returns reserved bytes back to the budget and wakes waiting goroutines.
+// Clamps allocation to zero to prevent negative budget from over-release.
 func (l *MemoryLimiter) Release(bytes int64) {
 	if bytes <= 0 {
 		return
 	}
-	l.allocated.Add(-bytes)
+	for {
+		current := l.allocated.Load()
+		next := current - bytes
+		if next < 0 {
+			next = 0
+		}
+		if l.allocated.CompareAndSwap(current, next) {
+			break
+		}
+	}
 	l.mu.Lock()
 	l.cond.Broadcast()
 	l.mu.Unlock()
@@ -119,8 +156,8 @@ func (l *MemoryLimiter) MaxBytes() int64 {
 
 // Close wakes all waiting goroutines and disallows further acquisitions.
 func (l *MemoryLimiter) Close() {
+	l.closed.Store(true)
 	l.mu.Lock()
-	l.closed = true
 	l.cond.Broadcast()
 	l.mu.Unlock()
 }

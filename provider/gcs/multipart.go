@@ -50,8 +50,11 @@ type multipartSessionState struct {
 // CreateMultipart initiates a resumable upload session on Google Cloud Storage.
 // Implements the official GCS Resumable Upload protocol.
 func (d *Driver) CreateMultipart(ctx context.Context, obj *blobkit.Object, opts blobkit.PutOptions) (string, error) {
-	if obj == nil || obj.Key == "" {
+	if obj == nil {
 		return "", blobkit.ErrInvalidKey
+	}
+	if err := blobkit.ValidateKey(obj.Key); err != nil {
+		return "", err
 	}
 
 	cleanKey := obj.Key
@@ -102,7 +105,7 @@ func (d *Driver) CreateMultipart(ctx context.Context, obj *blobkit.Object, opts 
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes := readErrorBody(resp.Body)
 		return "", parseGCSError("create_multipart", cleanKey, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
 	}
 
@@ -129,16 +132,25 @@ func (d *Driver) CreateMultipart(ctx context.Context, obj *blobkit.Object, opts 
 
 // UploadPart streams an individual chunk of data to the Google Cloud Storage resumable upload session.
 func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, partNumber int32, r io.Reader, size int64) (string, error) {
+	if err := blobkit.ValidateKey(key); err != nil {
+		return "", err
+	}
+	if uploadID == "" {
+		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, blobkit.ErrInvalidID)
+	}
 	if r == nil {
 		return "", blobkit.ErrNilReader
+	}
+	if size < 0 {
+		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, blobkit.ErrSizeMismatch)
 	}
 
 	d.sessionsMu.RLock()
 	session, found := d.sessions[uploadID]
 	d.sessionsMu.RUnlock()
 
-	if !found {
-		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, blobkit.ErrInvalidID)
+	if !found || session.key != key {
+		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, blobkit.ErrSessionNotFound)
 	}
 
 	session.mu.Lock()
@@ -154,7 +166,9 @@ func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, pa
 	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, err)
 	}
-	buf = buf[:n]
+	if int64(n) != size {
+		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, blobkit.ErrSizeMismatch)
+	}
 	actualSize := int64(n)
 
 	// Compute MD5 for part identification
@@ -192,8 +206,6 @@ func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, pa
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
-
 	// 308 Resume Incomplete indicates chunk accepted and upload still incomplete
 	if resp.StatusCode == 308 {
 		session.uploadedSize = rangeEnd + 1
@@ -214,6 +226,7 @@ func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, pa
 			ETag:       etag,
 		}
 
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		var res gcsObjectResource
 		if err := json.Unmarshal(bodyBytes, &res); err == nil {
 			session.resultObj = d.mapObjectResource(key, &res)
@@ -222,17 +235,28 @@ func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, pa
 		return etag, nil
 	}
 
+	bodyBytes := readErrorBody(resp.Body)
 	return "", parseGCSError("upload_part", key, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
 }
 
 // CompleteMultipart finalizes the resumable upload session on Google Cloud Storage.
 func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, uploadID string, parts []blobkit.CompletedPart) (*blobkit.Object, error) {
+	if obj == nil {
+		return nil, blobkit.ErrInvalidKey
+	}
+	if err := blobkit.ValidateKey(obj.Key); err != nil {
+		return nil, err
+	}
+	if uploadID == "" {
+		return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, blobkit.ErrInvalidID)
+	}
+
 	d.sessionsMu.RLock()
 	session, found := d.sessions[uploadID]
 	d.sessionsMu.RUnlock()
 
-	if !found {
-		return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, blobkit.ErrInvalidID)
+	if !found || session.key != obj.Key {
+		return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, blobkit.ErrSessionNotFound)
 	}
 
 	session.mu.Lock()
@@ -264,12 +288,12 @@ func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, upl
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
-
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		bodyBytes := readErrorBody(resp.Body)
 		return nil, parseGCSError("complete_multipart", obj.Key, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
 	}
 
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	var res gcsObjectResource
 	if err := json.Unmarshal(bodyBytes, &res); err != nil {
 		return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, err)
@@ -286,12 +310,21 @@ func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, upl
 
 // AbortMultipart cancels a resumable upload session and cleans up resources on GCS.
 func (d *Driver) AbortMultipart(ctx context.Context, key string, uploadID string) error {
+	if err := blobkit.ValidateKey(key); err != nil {
+		return err
+	}
+	if uploadID == "" {
+		return nil
+	}
+
 	d.sessionsMu.Lock()
 	session, found := d.sessions[uploadID]
-	delete(d.sessions, uploadID)
+	if found && session.key == key {
+		delete(d.sessions, uploadID)
+	}
 	d.sessionsMu.Unlock()
 
-	if !found {
+	if !found || session.key != key {
 		return nil // Idempotent abort
 	}
 
@@ -313,7 +346,7 @@ func (d *Driver) AbortMultipart(ctx context.Context, key string, uploadID string
 
 	// GCS responds with 499 (Client Closed Request) or 200/204 when successfully aborted
 	if resp.StatusCode != 499 && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes := readErrorBody(resp.Body)
 		return parseGCSError("abort_multipart", key, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
 	}
 
@@ -322,12 +355,19 @@ func (d *Driver) AbortMultipart(ctx context.Context, key string, uploadID string
 
 // ListParts returns the list of parts recorded for an active upload session.
 func (d *Driver) ListParts(ctx context.Context, key string, uploadID string) ([]blobkit.CompletedPart, error) {
+	if err := blobkit.ValidateKey(key); err != nil {
+		return nil, err
+	}
+	if uploadID == "" {
+		return nil, blobkit.WrapError("list_parts", key, d.cfg.Name, blobkit.ErrInvalidID)
+	}
+
 	d.sessionsMu.RLock()
 	session, found := d.sessions[uploadID]
 	d.sessionsMu.RUnlock()
 
-	if !found {
-		return nil, blobkit.WrapError("list_parts", key, d.cfg.Name, blobkit.ErrInvalidID)
+	if !found || session.key != key {
+		return nil, blobkit.WrapError("list_parts", key, d.cfg.Name, blobkit.ErrSessionNotFound)
 	}
 
 	session.mu.Lock()

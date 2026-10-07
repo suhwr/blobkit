@@ -76,21 +76,44 @@ func TestMemoryLimiter(t *testing.T) {
 		t.Fatalf("expected ErrMemoryBudgetExceeded, got %v", err)
 	}
 
-	// 6. Concurrency test
+	// 6. Over-release clamp (must never go negative)
+	limiter.Release(1000)
+	if limiter.Allocated() != 0 {
+		t.Fatalf("expected 0 allocated after over-release, got %d", limiter.Allocated())
+	}
+
+	// 7. Concurrent acquisitions and releases
 	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 20; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			subCtx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			subCtx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 			defer cancel()
 			if err := limiter.Acquire(subCtx, 10); err == nil {
-				time.Sleep(5 * time.Millisecond)
+				time.Sleep(2 * time.Millisecond)
 				limiter.Release(10)
 			}
 		}()
 	}
 	wg.Wait()
+
+	// 8. Cancellation while waiting
+	_ = limiter.Acquire(ctx, 100) // allocate full 100 bytes
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancelled
+	if err := limiter.Acquire(cancelCtx, 10); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+
+	// 9. Close wakes waiters and blocks new acquisitions
+	limiter.Close()
+	if ok := limiter.TryAcquire(1); ok {
+		t.Fatal("expected TryAcquire to fail on closed limiter")
+	}
+	if err := limiter.Acquire(ctx, 1); !errors.Is(err, blobkit.ErrProviderUnavailable) {
+		t.Fatalf("expected ErrProviderUnavailable on closed limiter, got %v", err)
+	}
 }
 
 func TestURLResolution(t *testing.T) {

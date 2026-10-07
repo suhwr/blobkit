@@ -11,15 +11,11 @@ import (
 // resolvePath sanitizes the object key and guarantees that the resulting absolute path
 // is strictly contained within rootDir, rejecting any path traversal attempts.
 func resolvePath(rootDir, key, stagingDir string) (string, error) {
-	key = strings.TrimSpace(key)
-	if key == "" {
-		return "", blobkit.ErrInvalidKey
+	if err := blobkit.ValidateKey(key); err != nil {
+		return "", err
 	}
 
-	// Reject null bytes and carriage returns
-	if strings.ContainsRune(key, '\x00') || strings.ContainsRune(key, '\r') {
-		return "", blobkit.WrapError("path", key, "fs", blobkit.ErrSecurityViolation)
-	}
+	key = strings.TrimSpace(key)
 
 	// Normalize path separators to local OS convention
 	cleanKey := filepath.Clean(filepath.FromSlash(key))

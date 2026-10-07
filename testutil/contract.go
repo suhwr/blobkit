@@ -15,11 +15,12 @@ import (
 
 // DriverContractOptions configures the execution of RunDriverContractTests.
 type DriverContractOptions struct {
-	SkipMultipart bool
-	SkipPresign   bool
-	SkipCopy      bool
-	SkipBatch     bool
-	SkipRange     bool
+	SkipMultipart   bool
+	SkipPresign     bool
+	SkipCopy        bool
+	SkipBatch       bool
+	SkipRange       bool
+	SkipConditional bool
 }
 
 // RunDriverContractTests runs a standardized conformance and compliance suite
@@ -435,6 +436,251 @@ func RunDriverContractTests(t *testing.T, factory func(t *testing.T) (blobkit.Dr
 		}
 		if err := driver.AbortMultipart(ctx, "contract-tests/to_abort.bin", abortID); err != nil {
 			t.Fatalf("AbortMultipart failed: %v", err)
+		}
+	})
+
+	t.Run("Contract_EmptyObject", func(t *testing.T) {
+		driver, cleanup := factory(t)
+		defer cleanup()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		key := "contract-tests/empty_object.txt"
+		putObj, err := driver.Put(ctx, &blobkit.Object{Key: key}, strings.NewReader(""), blobkit.PutOptions{
+			Size:         0,
+			ExplicitSize: true,
+		})
+		if err != nil {
+			t.Fatalf("Put empty object failed: %v", err)
+		}
+		if putObj.Size != 0 {
+			t.Errorf("expected Size=0, got %d", putObj.Size)
+		}
+
+		headObj, err := driver.Head(ctx, key)
+		if err != nil {
+			t.Fatalf("Head empty object failed: %v", err)
+		}
+		if headObj.Size != 0 {
+			t.Errorf("Head expected Size=0, got %d", headObj.Size)
+		}
+
+		reader, err := driver.Get(ctx, key, blobkit.GetOptions{})
+		if err != nil {
+			t.Fatalf("Get empty object failed: %v", err)
+		}
+		defer reader.Close()
+
+		data, err := io.ReadAll(reader)
+		if err != nil {
+			t.Fatalf("ReadAll empty object failed: %v", err)
+		}
+		if len(data) != 0 {
+			t.Fatalf("expected 0 bytes, got %d", len(data))
+		}
+
+		if err := driver.Delete(ctx, key); err != nil {
+			t.Fatalf("Delete empty object failed: %v", err)
+		}
+	})
+
+	t.Run("Contract_SizeMismatch", func(t *testing.T) {
+		driver, cleanup := factory(t)
+		defer cleanup()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		// 1. Shorter: declared 10, actual 5
+		keyShorter := "contract-tests/mismatch_shorter.txt"
+		_, err := driver.Put(ctx, &blobkit.Object{Key: keyShorter}, strings.NewReader("12345"), blobkit.PutOptions{
+			Size:         10,
+			ExplicitSize: true,
+		})
+		if err == nil {
+			t.Fatal("expected ErrSizeMismatch when stream is shorter than declared size, got nil")
+		}
+		if !errors.Is(err, blobkit.ErrSizeMismatch) {
+			t.Fatalf("expected ErrSizeMismatch, got %v", err)
+		}
+
+		// 2. Longer: declared 5, actual 10
+		keyLonger := "contract-tests/mismatch_longer.txt"
+		_, err = driver.Put(ctx, &blobkit.Object{Key: keyLonger}, strings.NewReader("0123456789"), blobkit.PutOptions{
+			Size:         5,
+			ExplicitSize: true,
+		})
+		if err == nil {
+			t.Fatal("expected ErrSizeMismatch when stream is longer than declared size, got nil")
+		}
+		if !errors.Is(err, blobkit.ErrSizeMismatch) {
+			t.Fatalf("expected ErrSizeMismatch, got %v", err)
+		}
+	})
+
+	t.Run("Contract_DeleteIdempotent", func(t *testing.T) {
+		driver, cleanup := factory(t)
+		defer cleanup()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		// 1. Delete non-existent key must return nil
+		nonExistentKey := "contract-tests/non_existent_idempotent_delete.txt"
+		if err := driver.Delete(ctx, nonExistentKey); err != nil {
+			t.Fatalf("Delete non-existent key must return nil, got: %v", err)
+		}
+
+		// 2. Put then double-delete must succeed
+		putKey := "contract-tests/idempotent_double_delete.txt"
+		_, err := driver.Put(ctx, &blobkit.Object{Key: putKey}, strings.NewReader("temp"), blobkit.PutOptions{})
+		if err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+		if err := driver.Delete(ctx, putKey); err != nil {
+			t.Fatalf("First delete failed: %v", err)
+		}
+		if err := driver.Delete(ctx, putKey); err != nil {
+			t.Fatalf("Second delete of already-deleted key must return nil, got: %v", err)
+		}
+	})
+
+	t.Run("Contract_ConditionalRequests", func(t *testing.T) {
+		driver, cleanup := factory(t)
+		defer cleanup()
+		if opt.SkipConditional {
+			t.Skip("skipping conditional requests test")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		key := "contract-tests/conditional_object.txt"
+		payload := []byte("conditional payload test")
+		putObj, err := driver.Put(ctx, &blobkit.Object{Key: key}, bytes.NewReader(payload), blobkit.PutOptions{
+			Size: int64(len(payload)),
+		})
+		if err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+
+		headObj, err := driver.Head(ctx, key)
+		if err != nil {
+			t.Fatalf("Head failed: %v", err)
+		}
+		etag := headObj.ETag
+		if etag == "" {
+			etag = putObj.ETag
+		}
+
+		if etag != "" {
+			// IfMatch with matching ETag -> success
+			r, err := driver.Get(ctx, key, blobkit.GetOptions{IfMatch: etag})
+			if err != nil {
+				t.Fatalf("Get with matching IfMatch failed: %v", err)
+			}
+			_ = r.Close()
+
+			// IfMatch with non-matching ETag -> ErrPreconditionFailed
+			_, err = driver.Get(ctx, key, blobkit.GetOptions{IfMatch: "\"non-matching-etag\""})
+			if err == nil {
+				t.Fatal("expected ErrPreconditionFailed for mismatched IfMatch, got nil")
+			}
+			if !errors.Is(err, blobkit.ErrPreconditionFailed) {
+				t.Fatalf("expected ErrPreconditionFailed, got %v", err)
+			}
+
+			// IfNoneMatch with matching ETag -> ErrPreconditionFailed
+			_, err = driver.Get(ctx, key, blobkit.GetOptions{IfNoneMatch: etag})
+			if err == nil {
+				t.Fatal("expected ErrPreconditionFailed for matching IfNoneMatch, got nil")
+			}
+			if !errors.Is(err, blobkit.ErrPreconditionFailed) {
+				t.Fatalf("expected ErrPreconditionFailed, got %v", err)
+			}
+
+			// IfNoneMatch with different ETag -> success
+			r, err = driver.Get(ctx, key, blobkit.GetOptions{IfNoneMatch: "\"different-etag\""})
+			if err != nil {
+				t.Fatalf("Get with different IfNoneMatch failed: %v", err)
+			}
+			_ = r.Close()
+		}
+
+		if !headObj.UpdatedAt.IsZero() {
+			future := headObj.UpdatedAt.Add(1 * time.Hour)
+			// IfModifiedSince in future -> ErrPreconditionFailed (not modified since future)
+			_, err = driver.Get(ctx, key, blobkit.GetOptions{
+				IfModifiedSince: &future,
+			})
+			if err == nil {
+				t.Fatal("expected ErrPreconditionFailed for IfModifiedSince in future, got nil")
+			}
+			if !errors.Is(err, blobkit.ErrPreconditionFailed) {
+				t.Fatalf("expected ErrPreconditionFailed for IfModifiedSince, got %v", err)
+			}
+
+			past := headObj.UpdatedAt.Add(-1 * time.Hour)
+			// IfUnmodifiedSince in past -> ErrPreconditionFailed (modified since past)
+			_, err = driver.Get(ctx, key, blobkit.GetOptions{
+				IfUnmodifiedSince: &past,
+			})
+			if err == nil {
+				t.Fatal("expected ErrPreconditionFailed for IfUnmodifiedSince in past, got nil")
+			}
+			if !errors.Is(err, blobkit.ErrPreconditionFailed) {
+				t.Fatalf("expected ErrPreconditionFailed for IfUnmodifiedSince, got %v", err)
+			}
+		}
+
+		_ = driver.Delete(ctx, key)
+	})
+
+	t.Run("Contract_ListDelimiter", func(t *testing.T) {
+		driver, cleanup := factory(t)
+		defer cleanup()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		prefix := fmt.Sprintf("contract-delim-%d/", time.Now().UnixNano())
+		keys := []string{
+			prefix + "file1.txt",
+			prefix + "file2.txt",
+			prefix + "dirA/file3.txt",
+			prefix + "dirA/file4.txt",
+			prefix + "dirB/file5.txt",
+		}
+		for _, k := range keys {
+			_, err := driver.Put(ctx, &blobkit.Object{Key: k}, strings.NewReader("delim data"), blobkit.PutOptions{})
+			if err != nil {
+				t.Fatalf("Put %s failed: %v", k, err)
+			}
+		}
+
+		res, err := driver.List(ctx, blobkit.ListOptions{
+			Prefix:    prefix,
+			Delimiter: "/",
+		})
+		if err != nil {
+			t.Fatalf("List with delimiter failed: %v", err)
+		}
+
+		if len(res.Objects) != 2 {
+			t.Errorf("expected 2 direct objects, got %d", len(res.Objects))
+		}
+		if len(res.CommonPrefixes) != 2 {
+			t.Errorf("expected 2 common prefixes, got %d (%v)", len(res.CommonPrefixes), res.CommonPrefixes)
+		}
+
+		expectedPrefixes := map[string]bool{
+			prefix + "dirA/": true,
+			prefix + "dirB/": true,
+		}
+		for _, cp := range res.CommonPrefixes {
+			if !expectedPrefixes[cp] {
+				t.Errorf("unexpected common prefix: %s", cp)
+			}
+		}
+
+		for _, k := range keys {
+			_ = driver.Delete(ctx, k)
 		}
 	})
 }

@@ -71,13 +71,12 @@ func (d *Driver) getClient() (*sftp.Client, error) {
 // resolvePath sanitizes the object key and guarantees that the resulting absolute path
 // is strictly contained within BaseDir, rejecting any path traversal attempts.
 func (d *Driver) resolvePath(key string) (string, error) {
-	key = strings.TrimSpace(key)
-	if key == "" {
-		return "", blobkit.ErrInvalidKey
+	if err := blobkit.ValidateKey(key); err != nil {
+		return "", err
 	}
 
-	// Reject null bytes, carriage returns, and backslashes
-	if strings.ContainsRune(key, '\x00') || strings.ContainsRune(key, '\r') || strings.Contains(key, `\`) {
+	key = strings.TrimSpace(key)
+	if strings.Contains(key, `\`) {
 		return "", blobkit.WrapError("path", key, d.cfg.Name, blobkit.ErrSecurityViolation)
 	}
 

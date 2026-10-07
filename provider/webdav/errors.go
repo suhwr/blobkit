@@ -39,7 +39,7 @@ func wrapHTTPError(op, key, driverName string, statusCode int, rawErr error) err
 	case http.StatusNotFound:
 		return blobkit.WrapError(op, key, driverName, blobkit.ErrObjectNotFound)
 
-	case http.StatusPreconditionFailed, http.StatusRequestedRangeNotSatisfiable:
+	case http.StatusPreconditionFailed, http.StatusRequestedRangeNotSatisfiable, http.StatusNotModified:
 		return blobkit.WrapError(op, key, driverName, blobkit.ErrPreconditionFailed)
 
 	case http.StatusTooManyRequests:

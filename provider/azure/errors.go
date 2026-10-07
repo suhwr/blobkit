@@ -58,7 +58,7 @@ func wrapHTTPError(op, key, driverName string, statusCode int, body []byte, rawE
 	case code == "ContainerNotFound" || code == "ContainerBeingDeleted":
 		return blobkit.WrapError(op, key, driverName, blobkit.ErrBucketNotFound)
 
-	case code == "ConditionNotMet" || code == "TargetConditionNotMet" || statusCode == http.StatusPreconditionFailed || statusCode == http.StatusRequestedRangeNotSatisfiable:
+	case code == "ConditionNotMet" || code == "TargetConditionNotMet" || statusCode == http.StatusPreconditionFailed || statusCode == http.StatusNotModified || statusCode == http.StatusRequestedRangeNotSatisfiable:
 		return blobkit.WrapError(op, key, driverName, blobkit.ErrPreconditionFailed)
 
 	case code == "ServerBusy" || statusCode == http.StatusTooManyRequests || statusCode >= 500:

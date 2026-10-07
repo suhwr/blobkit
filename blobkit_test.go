@@ -565,14 +565,17 @@ func TestClient_ObserverAndCache(t *testing.T) {
 }
 
 func TestSanitizeErrorMessage(t *testing.T) {
-	raw := "request failed token=supersecret123 and key=secretkey999 with Bearer ya29.a0AfH6_xyz and Basic dXNlcjpwYXNz proxyconnect tcp: dial tcp 10.0.0.5:8080: timeout"
+	raw := `request failed token=supersecret123 and api_key=secretkey999 and key=avatars/john.png with Bearer ya29.a0AfH6_xyz and Basic dXNlcjpwYXNz proxyconnect tcp: dial tcp 10.0.0.5:8080: timeout and dial tcp [::1]:9000: refused and payload {"client_secret":"my_secret_token"}`
 	sanitized := blobkit.SanitizeErrorMessage(raw)
 
 	if strings.Contains(sanitized, "supersecret123") {
 		t.Fatalf("token secret was not scrubbed: %s", sanitized)
 	}
 	if strings.Contains(sanitized, "secretkey999") {
-		t.Fatalf("key secret was not scrubbed: %s", sanitized)
+		t.Fatalf("api_key secret was not scrubbed: %s", sanitized)
+	}
+	if strings.Contains(sanitized, "my_secret_token") {
+		t.Fatalf("JSON secret was not scrubbed: %s", sanitized)
 	}
 	if strings.Contains(sanitized, "$1=[redacted]") {
 		t.Fatalf("regex group $1 was emitted literally: %s", sanitized)
@@ -580,8 +583,12 @@ func TestSanitizeErrorMessage(t *testing.T) {
 	if !strings.Contains(sanitized, "token=[redacted]") {
 		t.Fatalf("expected token=[redacted], got: %s", sanitized)
 	}
-	if !strings.Contains(sanitized, "key=[redacted]") {
-		t.Fatalf("expected key=[redacted], got: %s", sanitized)
+	if !strings.Contains(sanitized, "api_key=[redacted]") {
+		t.Fatalf("expected api_key=[redacted], got: %s", sanitized)
+	}
+	// Verify normal object key is preserved without over-redaction
+	if !strings.Contains(sanitized, "key=avatars/john.png") {
+		t.Fatalf("harmless object key was incorrectly redacted: %s", sanitized)
 	}
 	if strings.Contains(sanitized, "ya29.a0AfH6_xyz") {
 		t.Fatalf("bearer token not scrubbed: %s", sanitized)
@@ -590,7 +597,10 @@ func TestSanitizeErrorMessage(t *testing.T) {
 		t.Fatalf("basic auth not scrubbed: %s", sanitized)
 	}
 	if strings.Contains(sanitized, "10.0.0.5:8080") {
-		t.Fatalf("internal IP not scrubbed: %s", sanitized)
+		t.Fatalf("internal IPv4 not scrubbed: %s", sanitized)
+	}
+	if strings.Contains(sanitized, "[::1]:9000") {
+		t.Fatalf("internal IPv6 not scrubbed: %s", sanitized)
 	}
 }
 

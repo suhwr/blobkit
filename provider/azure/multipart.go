@@ -24,7 +24,7 @@ type blockListXML struct {
 }
 
 type azureBlockListResponse struct {
-	XMLName           xml.Name `xml:"BlockList"`
+	XMLName           xml.Name         `xml:"BlockList"`
 	CommittedBlocks   []azureBlockItem `xml:"CommittedBlocks>Block"`
 	UncommittedBlocks []azureBlockItem `xml:"UncommittedBlocks>Block"`
 }
@@ -55,8 +55,14 @@ func parseBlockID(blockID string) int32 {
 
 // CreateMultipart initiates a Block Blob multipart session.
 func (d *Driver) CreateMultipart(ctx context.Context, obj *blobkit.Object, opts blobkit.PutOptions) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", blobkit.WrapError("create_multipart", "", d.cfg.Name, err)
+	}
 	if obj == nil || obj.Key == "" {
 		return "", blobkit.ErrInvalidKey
+	}
+	if err := validateKey(obj.Key); err != nil {
+		return "", blobkit.WrapError("create_multipart", obj.Key, d.cfg.Name, err)
 	}
 
 	uploadID := uuid.New().String()
@@ -69,11 +75,24 @@ func (d *Driver) CreateMultipart(ctx context.Context, obj *blobkit.Object, opts 
 
 // UploadPart uploads a single chunk as a staged block (PUT ?comp=block&blockid=...).
 func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, partNumber int32, r io.Reader, size int64) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, err)
+	}
 	if r == nil {
 		return "", blobkit.ErrNilReader
 	}
+	if err := validateKey(key); err != nil {
+		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, err)
+	}
 	if partNumber <= 0 {
 		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, fmt.Errorf("part number must be >= 1"))
+	}
+
+	d.sessionsMu.RLock()
+	expectedKey, ok := d.sessions[uploadID]
+	d.sessionsMu.RUnlock()
+	if !ok || expectedKey != key {
+		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, blobkit.ErrSessionNotFound)
 	}
 
 	blockID := formatBlockID(partNumber)
@@ -88,6 +107,9 @@ func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, pa
 	buf, err := io.ReadAll(bodyReader)
 	if err != nil {
 		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, err)
+	}
+	if size > 0 && int64(len(buf)) != size {
+		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, blobkit.ErrSizeMismatch)
 	}
 
 	h := md5.Sum(buf)
@@ -113,7 +135,7 @@ func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, pa
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes := readErrorBody(resp.Body)
 		return "", wrapHTTPError("upload_part", key, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
 	}
 
@@ -123,9 +145,28 @@ func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, pa
 
 // CompleteMultipart commits the staged blocks into the final Block Blob (PUT ?comp=blocklist).
 func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, uploadID string, parts []blobkit.CompletedPart) (*blobkit.Object, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("complete_multipart", "", d.cfg.Name, err)
+	}
+	if obj == nil || obj.Key == "" {
+		return nil, blobkit.ErrInvalidKey
+	}
+	if err := validateKey(obj.Key); err != nil {
+		return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, err)
+	}
+
 	d.sessionsMu.Lock()
-	delete(d.sessions, uploadID)
+	expectedKey, ok := d.sessions[uploadID]
+	if ok {
+		delete(d.sessions, uploadID)
+	}
 	d.sessionsMu.Unlock()
+	if !ok || expectedKey != obj.Key {
+		return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, blobkit.ErrSessionNotFound)
+	}
+	if len(parts) == 0 {
+		return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, fmt.Errorf("no parts provided"))
+	}
 
 	// Sort parts by PartNumber
 	sort.Slice(parts, func(i, j int) bool {
@@ -174,7 +215,7 @@ func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, upl
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes := readErrorBody(resp.Body)
 		return nil, wrapHTTPError("complete_multipart", obj.Key, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
 	}
 
@@ -197,14 +238,39 @@ func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, upl
 
 // AbortMultipart unregisters the active multipart session.
 func (d *Driver) AbortMultipart(ctx context.Context, key string, uploadID string) error {
+	if err := ctx.Err(); err != nil {
+		return blobkit.WrapError("abort_multipart", key, d.cfg.Name, err)
+	}
+	if err := validateKey(key); err != nil {
+		return blobkit.WrapError("abort_multipart", key, d.cfg.Name, err)
+	}
 	d.sessionsMu.Lock()
-	delete(d.sessions, uploadID)
+	expectedKey, ok := d.sessions[uploadID]
+	if ok {
+		delete(d.sessions, uploadID)
+	}
 	d.sessionsMu.Unlock()
+	if !ok || expectedKey != key {
+		return blobkit.WrapError("abort_multipart", key, d.cfg.Name, blobkit.ErrSessionNotFound)
+	}
 	return nil
 }
 
 // ListParts queries staged uncommitted and committed blocks for the blob (GET ?comp=blocklist&blocklisttype=all).
 func (d *Driver) ListParts(ctx context.Context, key string, uploadID string) ([]blobkit.CompletedPart, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("list_parts", key, d.cfg.Name, err)
+	}
+	if err := validateKey(key); err != nil {
+		return nil, blobkit.WrapError("list_parts", key, d.cfg.Name, err)
+	}
+	d.sessionsMu.RLock()
+	expectedKey, ok := d.sessions[uploadID]
+	d.sessionsMu.RUnlock()
+	if !ok || expectedKey != key {
+		return nil, blobkit.WrapError("list_parts", key, d.cfg.Name, blobkit.ErrSessionNotFound)
+	}
+
 	urlStr := fmt.Sprintf("%s?comp=blocklist&blocklisttype=all", d.blobURL(key))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
 	if err != nil {
@@ -221,7 +287,7 @@ func (d *Driver) ListParts(ctx context.Context, key string, uploadID string) ([]
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
+	bodyBytes := readErrorBody(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return nil, wrapHTTPError("list_parts", key, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
 	}

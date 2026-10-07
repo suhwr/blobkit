@@ -74,20 +74,14 @@ func resolveMetadata(obj *blobkit.Object, opts blobkit.PutOptions) map[string]st
 	return nil
 }
 
-func validateKey(key string) error {
-	k := strings.TrimSpace(key)
-	if k == "" {
-		return blobkit.ErrInvalidKey
+const maxErrorBodyBytes = 64 * 1024
+
+func readErrorBody(body io.Reader) []byte {
+	if body == nil {
+		return nil
 	}
-	if strings.ContainsRune(k, '\x00') || strings.ContainsRune(k, '\r') {
-		return blobkit.ErrSecurityViolation
-	}
-	for _, seg := range strings.Split(k, "/") {
-		if seg == ".." {
-			return blobkit.ErrSecurityViolation
-		}
-	}
-	return nil
+	data, _ := io.ReadAll(io.LimitReader(body, maxErrorBodyBytes))
+	return data
 }
 
 // Put uploads an object stream to the WebDAV server via HTTP PUT.
@@ -98,8 +92,8 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 	if obj == nil {
 		return nil, blobkit.ErrInvalidKey
 	}
-	if err := validateKey(obj.Key); err != nil {
-		return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
+	if err := blobkit.ValidateKey(obj.Key); err != nil {
+		return nil, err
 	}
 
 	// Ensure parent collections (directories) exist on WebDAV
@@ -109,18 +103,20 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 
 	endpoint := d.objectURL(obj.Key)
 
+	resolvedR, effectiveSize, hasExplicitSize, err := blobkit.ResolvePayload(r, opts)
+	if err != nil {
+		return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
+	}
+
+	sizeReader := blobkit.NewSizeReader(resolvedR, effectiveSize, hasExplicitSize)
+
 	// Hash stream and count bytes while reading
 	md5Hash := md5.New()
 	shaHash := sha256.New()
 	cw := &countWriter{w: io.MultiWriter(md5Hash, shaHash)}
-	teeReader := io.TeeReader(r, cw)
+	teeReader := io.TeeReader(sizeReader, cw)
 
-	var bodyReader io.Reader = teeReader
-	if opts.Size > 0 {
-		bodyReader = io.LimitReader(teeReader, opts.Size)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bodyReader)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, teeReader)
 	if err != nil {
 		return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
 	}
@@ -136,8 +132,8 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 	}
 	req.Header.Set("Content-Type", contentType)
 
-	if opts.Size > 0 {
-		req.ContentLength = opts.Size
+	if effectiveSize >= 0 {
+		req.ContentLength = effectiveSize
 	}
 
 	resp, err := d.httpClient.Do(req)
@@ -146,7 +142,13 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 	}
 	defer resp.Body.Close()
 
+	if err := sizeReader.Verify(); err != nil {
+		_ = d.Delete(ctx, obj.Key)
+		return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
+	}
+
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
+		readErrorBody(resp.Body)
 		return nil, wrapHTTPError("put", obj.Key, d.cfg.Name, resp.StatusCode, nil)
 	}
 
@@ -158,9 +160,6 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 	shaHex := hex.EncodeToString(shaHash.Sum(nil))
 
 	size := cw.n
-	if opts.Size > 0 && opts.Size > size {
-		size = opts.Size
-	}
 
 	stored := *obj
 	stored.Bucket = d.cfg.Endpoint
@@ -181,6 +180,10 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 
 // Get retrieves an object stream and its metadata from the WebDAV server.
 func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (*blobkit.ObjectReader, error) {
+	if err := blobkit.ValidateKey(key); err != nil {
+		return nil, err
+	}
+
 	endpoint := d.objectURL(key)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -211,6 +214,7 @@ func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		readErrorBody(resp.Body)
 		resp.Body.Close()
 		return nil, wrapHTTPError("get", key, d.cfg.Name, resp.StatusCode, nil)
 	}
@@ -251,6 +255,10 @@ func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (
 
 // Head inspects an object and returns its metadata using PROPFIND (Depth: 0) or HEAD.
 func (d *Driver) Head(ctx context.Context, key string) (*blobkit.Object, error) {
+	if err := blobkit.ValidateKey(key); err != nil {
+		return nil, err
+	}
+
 	endpoint := d.objectURL(key)
 
 	// First attempt standard HEAD request
@@ -302,6 +310,10 @@ func (d *Driver) Head(ctx context.Context, key string) (*blobkit.Object, error) 
 
 // Delete removes an object from WebDAV permanently.
 func (d *Driver) Delete(ctx context.Context, key string) error {
+	if err := blobkit.ValidateKey(key); err != nil {
+		return err
+	}
+
 	endpoint := d.objectURL(key)
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
 	if err != nil {
@@ -317,6 +329,7 @@ func (d *Driver) Delete(ctx context.Context, key string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+		readErrorBody(resp.Body)
 		return wrapHTTPError("delete", key, d.cfg.Name, resp.StatusCode, nil)
 	}
 
@@ -327,6 +340,11 @@ func (d *Driver) Delete(ctx context.Context, key string) error {
 func (d *Driver) DeleteBatch(ctx context.Context, keys []string) ([]string, error) {
 	if len(keys) == 0 {
 		return nil, nil
+	}
+	for _, k := range keys {
+		if err := blobkit.ValidateKey(k); err != nil {
+			return nil, err
+		}
 	}
 
 	type delResult struct {
@@ -382,6 +400,13 @@ func (d *Driver) DeleteBatch(ctx context.Context, keys []string) ([]string, erro
 
 // Copy duplicates an object using WebDAV standard RFC 4918 COPY method.
 func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
+	if err := blobkit.ValidateKey(srcKey); err != nil {
+		return err
+	}
+	if err := blobkit.ValidateKey(dstKey); err != nil {
+		return err
+	}
+
 	if err := d.ensureParentCollections(ctx, dstKey); err != nil {
 		return err
 	}
@@ -405,6 +430,7 @@ func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
+		readErrorBody(resp.Body)
 		return wrapHTTPError("copy", srcKey, d.cfg.Name, resp.StatusCode, nil)
 	}
 
@@ -446,6 +472,7 @@ func (d *Driver) List(ctx context.Context, opts blobkit.ListOptions) (*blobkit.L
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 207 && resp.StatusCode != http.StatusOK {
+		readErrorBody(resp.Body)
 		return nil, wrapHTTPError("list", opts.Prefix, d.cfg.Name, resp.StatusCode, nil)
 	}
 
@@ -572,16 +599,25 @@ func (d *Driver) List(ctx context.Context, opts blobkit.ListOptions) (*blobkit.L
 
 // PresignGet is unsupported directly by WebDAV protocol.
 func (d *Driver) PresignGet(ctx context.Context, key string, opts blobkit.PresignOptions) (*blobkit.PresignedURL, error) {
+	if err := blobkit.ValidateKey(key); err != nil {
+		return nil, err
+	}
 	return nil, blobkit.WrapError("presign_get", key, d.cfg.Name, blobkit.ErrUnsupportedOperation)
 }
 
 // PresignPut is unsupported directly by WebDAV protocol.
 func (d *Driver) PresignPut(ctx context.Context, key string, opts blobkit.PresignOptions) (*blobkit.PresignedURL, error) {
+	if err := blobkit.ValidateKey(key); err != nil {
+		return nil, err
+	}
 	return nil, blobkit.WrapError("presign_put", key, d.cfg.Name, blobkit.ErrUnsupportedOperation)
 }
 
 // ResolveURL builds a public access or endpoint URL for the given key.
 func (d *Driver) ResolveURL(key string) (string, error) {
+	if err := blobkit.ValidateKey(key); err != nil {
+		return "", err
+	}
 	if d.cfg.PublicBaseURL != "" {
 		return fmt.Sprintf("%s/%s", strings.TrimRight(d.cfg.PublicBaseURL, "/"), strings.TrimLeft(key, "/")), nil
 	}
@@ -684,6 +720,7 @@ func (d *Driver) propfindResource(ctx context.Context, key string, depth int) (*
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 207 && resp.StatusCode != http.StatusOK {
+		readErrorBody(resp.Body)
 		return nil, wrapHTTPError("head", key, d.cfg.Name, resp.StatusCode, nil)
 	}
 
@@ -751,22 +788,43 @@ func (d *Driver) authorize(req *http.Request) {
 // CreateMultipart, UploadPart, CompleteMultipart, AbortMultipart, ListParts
 // WebDAV doesn't support S3 multipart natively; stub to return unsupported operation.
 func (d *Driver) CreateMultipart(ctx context.Context, obj *blobkit.Object, opts blobkit.PutOptions) (string, error) {
+	if obj == nil {
+		return "", blobkit.ErrInvalidKey
+	}
+	if err := blobkit.ValidateKey(obj.Key); err != nil {
+		return "", err
+	}
 	return "", blobkit.WrapError("create_multipart", obj.Key, d.cfg.Name, blobkit.ErrUnsupportedOperation)
 }
 
 func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, partNumber int32, r io.Reader, size int64) (string, error) {
+	if err := blobkit.ValidateKey(key); err != nil {
+		return "", err
+	}
 	return "", blobkit.WrapError("upload_part", key, d.cfg.Name, blobkit.ErrUnsupportedOperation)
 }
 
 func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, uploadID string, parts []blobkit.CompletedPart) (*blobkit.Object, error) {
+	if obj == nil {
+		return nil, blobkit.ErrInvalidKey
+	}
+	if err := blobkit.ValidateKey(obj.Key); err != nil {
+		return nil, err
+	}
 	return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, blobkit.ErrUnsupportedOperation)
 }
 
 func (d *Driver) AbortMultipart(ctx context.Context, key string, uploadID string) error {
+	if err := blobkit.ValidateKey(key); err != nil {
+		return err
+	}
 	return blobkit.WrapError("abort_multipart", key, d.cfg.Name, blobkit.ErrUnsupportedOperation)
 }
 
 func (d *Driver) ListParts(ctx context.Context, key string, uploadID string) ([]blobkit.CompletedPart, error) {
+	if err := blobkit.ValidateKey(key); err != nil {
+		return nil, err
+	}
 	return nil, blobkit.WrapError("list_parts", key, d.cfg.Name, blobkit.ErrUnsupportedOperation)
 }
 
@@ -781,4 +839,3 @@ func (c *countWriter) Write(p []byte) (int, error) {
 	c.n += int64(n)
 	return n, err
 }
-
