@@ -28,6 +28,7 @@ BlobKit is intentionally designed as an **infrastructure orchestration layer**, 
     - [WebDAV Protocol Driver (Nextcloud, ownCloud, TrueNAS, NAS)](#g-webdav-protocol-driver-nextcloud-owncloud-truenas-nas)
     - [Azure Blob Storage Driver (Native Block Blobs & SAS Presigning)](#h-azure-blob-storage-driver-native-block-blobs--sas-presigning)
     - [Google Cloud Storage Driver (Native JSON API & V4 Signed URLs)](#i-google-cloud-storage-driver-native-json-api--v4-signed-urls)
+    - [SFTP / SSH Storage Driver (Enterprise Remote Linux/Unix Storage)](#j-sftp--ssh-storage-driver-enterprise-remote-linuxunix-storage)
   - [2. Advanced Multi-Provider Routing](#2-advanced-multi-provider-routing)
     - [Namespace Tiered Routing](#a-namespace-tiered-routing)
     - [Active-Passive Failover](#b-active-passive-failover)
@@ -315,6 +316,25 @@ gcsDriver, err := gcs.NewDriver(gcs.Config{
     PrivateKeyPEM:       rsaPrivateKeyPEMBytes,
     ChunkSize:           8 * 1024 * 1024, // 8 MiB chunks (multiple of 256 KiB)
     PublicBaseURL:       "https://cdn.example.com", // Optional public CDN prefix
+})
+```
+
+#### j. SFTP / SSH Storage Driver (Enterprise Remote Linux/Unix Storage)
+
+Native SFTP / SSH storage driver connecting BlobKit to remote Linux/Unix file servers, private NAS appliances, and enterprise secure file transfer clusters. Supports SSH password or private key authentication (with optional passphrase), atomic temporary file staging, byte-range seeks, sidecar metadata persistence, chroot containment defenses, and multiplexed SSH sessions:
+
+```go
+import "github.com/suhwr/blobkit/provider/sftp"
+
+sftpDriver, err := sftp.NewDriver(sftp.Config{
+    Name:              "sftp-archive",
+    Host:              "storage.internal.corp",
+    Port:              22,
+    User:              "blobkit-service",
+    PrivateKeyPEM:     sshPrivateKeyPEMBytes,
+    BaseDir:           "/var/data/blobs",
+    EnableSidecarMeta: true,                     // Persist .meta.json sidecars for custom metadata
+    PublicBaseURL:     "https://cdn.example.com", // Optional public HTTP gateway prefix
 })
 ```
 
