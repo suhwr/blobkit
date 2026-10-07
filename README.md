@@ -23,6 +23,7 @@ BlobKit is intentionally designed as an **infrastructure orchestration layer**, 
     - [AWS S3 (Standard / Multi-Region)](#b-aws-s3-standard--multi-region)
     - [MinIO & Self-Hosted S3](#c-minio--self-hosted-s3)
     - [In-Memory Driver (Offline Testing & CI/CD)](#d-in-memory-driver-offline-testing--cicd)
+    - [Google Drive Driver (Cloud & Shared Drives)](#e-google-drive-driver-cloud--shared-drives)
   - [2. Advanced Multi-Provider Routing](#2-advanced-multi-provider-routing)
     - [Namespace Tiered Routing](#a-namespace-tiered-routing)
     - [Active-Passive Failover](#b-active-passive-failover)
@@ -216,6 +217,26 @@ memDriver := memory.NewDriver(memory.Config{
     Name:          "in-memory",
     Bucket:        "test-bucket",
     PublicBaseURL: "https://test.example.com",
+})
+```
+
+#### e. Google Drive Driver (Cloud & Shared Drives)
+
+Native Google Drive REST API v3 implementation adhering to pure object storage semantics with resumable chunked uploads, byte-range streaming, in-memory key indexing, and Shared Drive support:
+
+```go
+import "github.com/suhwr/blobkit/provider/gdrive"
+
+gdriveDriver, err := gdrive.NewDriver(gdrive.Config{
+    Name:              "gdrive-primary",
+    FolderID:          "1A2B3C4D5E6F7G8H9I0J", // Target Google Drive folder or Shared Drive ID
+    SupportsAllDrives: true,                   // Enable Google Workspace Shared Drives
+    TokenFunc: func(ctx context.Context) (string, error) {
+        // Return fresh OAuth2 token or use Service Account JWT
+        return oauthTokenSource.Token(ctx)
+    },
+    ChunkSize:        8 * 1024 * 1024, // 8 MiB chunks (must be multiple of 256 KiB)
+    KeyCacheCapacity: 10000,           // Concurrency-safe LRU key -> fileID cache
 })
 ```
 
