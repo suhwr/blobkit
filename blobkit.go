@@ -501,7 +501,6 @@ func (c *Client) DeleteBatch(ctx context.Context, targets []string) (deleted []s
 	return deleted, nil
 }
 
-
 // Exists reports whether an object exists in storage without downloading its body.
 func (c *Client) Exists(ctx context.Context, target string) (bool, error) {
 	_, err := c.Head(ctx, target)

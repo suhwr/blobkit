@@ -34,8 +34,8 @@ type CircuitBreakerConfig struct {
 
 // CircuitBreakerRouter wraps primary and fallback drivers in an automated 3-state circuit breaker.
 type CircuitBreakerRouter struct {
-	primary   blobkit.Driver
-	fallback  blobkit.Driver
+	primary  blobkit.Driver
+	fallback blobkit.Driver
 
 	failureThreshold int
 	successThreshold int

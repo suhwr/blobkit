@@ -372,4 +372,3 @@ func (s *MemoryStore) Close() error {
 	s.mu.Unlock()
 	return nil
 }
-

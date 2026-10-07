@@ -137,9 +137,9 @@ type mockAPIError struct {
 	message string
 }
 
-func (m mockAPIError) Error() string { return m.message }
-func (m mockAPIError) ErrorCode() string { return m.code }
-func (m mockAPIError) ErrorMessage() string { return m.message }
+func (m mockAPIError) Error() string                 { return m.message }
+func (m mockAPIError) ErrorCode() string             { return m.code }
+func (m mockAPIError) ErrorMessage() string          { return m.message }
 func (m mockAPIError) ErrorFault() smithy.ErrorFault { return smithy.FaultClient }
 
 func TestErrorScrubbing(t *testing.T) {

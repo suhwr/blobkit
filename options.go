@@ -69,4 +69,3 @@ func WithCache(cache Cache) Option {
 		c.cache = cache
 	}
 }
-

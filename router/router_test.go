@@ -239,4 +239,3 @@ func TestCapabilityRouter(t *testing.T) {
 		t.Fatalf("failed to select driver with capability: %v", err)
 	}
 }
-

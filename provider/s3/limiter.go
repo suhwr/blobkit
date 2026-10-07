@@ -12,11 +12,11 @@ import (
 // MemoryLimiter enforces bounded memory allocation across streaming uploads
 // to safeguard against process Out-Of-Memory (OOM) failures under heavy concurrency.
 type MemoryLimiter struct {
-	maxBytes   int64
-	allocated  atomic.Int64
-	mu         sync.Mutex
-	cond       *sync.Cond
-	closed     bool
+	maxBytes  int64
+	allocated atomic.Int64
+	mu        sync.Mutex
+	cond      *sync.Cond
+	closed    bool
 }
 
 // NewMemoryLimiter creates a limiter with the specified maximum byte ceiling.

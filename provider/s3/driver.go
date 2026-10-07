@@ -42,8 +42,8 @@ func NewDriver(cfg Config) (*Driver, error) {
 	}
 
 	awsCfg := aws.Config{
-		Region:       cfg.Region,
-		HTTPClient:   httpClient,
+		Region:           cfg.Region,
+		HTTPClient:       httpClient,
 		RetryMaxAttempts: cfg.MaxRetries,
 	}
 
