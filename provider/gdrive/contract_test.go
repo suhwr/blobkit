@@ -8,13 +8,13 @@ import (
 )
 
 func TestGDriveDriver_Contract(t *testing.T) {
-	srv := newMockDriveServer()
-	driver, server := setupTestDriver(t, srv)
-	defer server.Close()
-	defer driver.Close()
-
 	testutil.RunDriverContractTests(t, func(t *testing.T) (blobkit.Driver, func()) {
-		return driver, func() {}
+		srv := newMockDriveServer()
+		driver, server := setupTestDriver(t, srv)
+		return driver, func() {
+			_ = driver.Close()
+			server.Close()
+		}
 	}, testutil.DriverContractOptions{
 		SkipCopy:        true,
 		SkipBatch:       true,

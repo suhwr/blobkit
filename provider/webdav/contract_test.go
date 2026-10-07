@@ -8,13 +8,13 @@ import (
 )
 
 func TestWebDAVDriver_Contract(t *testing.T) {
-	srv := newMockWebDAVServer()
-	driver, server := setupTestDriver(t, srv)
-	defer server.Close()
-	defer driver.Close()
-
 	testutil.RunDriverContractTests(t, func(t *testing.T) (blobkit.Driver, func()) {
-		return driver, func() {}
+		srv := newMockWebDAVServer()
+		driver, server := setupTestDriver(t, srv)
+		return driver, func() {
+			_ = driver.Close()
+			server.Close()
+		}
 	}, testutil.DriverContractOptions{
 		SkipMultipart:   true,
 		SkipConditional: true,

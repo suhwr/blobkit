@@ -2,7 +2,9 @@ package blobkit
 
 import (
 	"bytes"
+	"errors"
 	"io"
+	"sync"
 )
 
 // SizeUnknown represents an unknown or unbounded streaming payload size.
@@ -12,11 +14,13 @@ const SizeUnknown int64 = -1
 // If exact is true (or expectedSize >= 0), it returns ErrSizeMismatch if the stream
 // yields fewer bytes than expected or has surplus bytes beyond expectedSize.
 type SizeReader struct {
+	mu           sync.Mutex
 	r            io.Reader
 	expectedSize int64
 	exact        bool
 	readCount    int64
 	eofChecked   bool
+	mismatchErr  error
 }
 
 // NewSizeReader constructs a SizeReader.
@@ -25,6 +29,11 @@ type SizeReader struct {
 func NewSizeReader(r io.Reader, expectedSize int64, exact bool) *SizeReader {
 	if expectedSize < 0 {
 		exact = false
+	}
+	if existing, ok := r.(*SizeReader); ok {
+		if existing.expectedSize == expectedSize && existing.exact == exact {
+			return existing
+		}
 	}
 	return &SizeReader{
 		r:            r,
@@ -35,6 +44,13 @@ func NewSizeReader(r io.Reader, expectedSize int64, exact bool) *SizeReader {
 
 // Read implements io.Reader with strict boundary checking.
 func (sr *SizeReader) Read(p []byte) (n int, err error) {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+
+	if sr.mismatchErr != nil {
+		return 0, sr.mismatchErr
+	}
+
 	if !sr.exact {
 		return sr.r.Read(p)
 	}
@@ -47,8 +63,16 @@ func (sr *SizeReader) Read(p []byte) (n int, err error) {
 		}
 		n, err = sr.r.Read(toRead)
 		sr.readCount += int64(n)
-		if err == io.EOF && sr.readCount < sr.expectedSize {
-			return n, ErrSizeMismatch
+		if err == io.EOF {
+			if sr.readCount < sr.expectedSize {
+				sr.mismatchErr = ErrSizeMismatch
+				return n, ErrSizeMismatch
+			}
+			sr.eofChecked = true
+			if n > 0 {
+				return n, nil
+			}
+			return 0, io.EOF
 		}
 		if err != nil {
 			return n, err
@@ -62,11 +86,21 @@ func (sr *SizeReader) Read(p []byte) (n int, err error) {
 		nExtra, extraErr := sr.r.Read(extra[:])
 		sr.eofChecked = true
 		if nExtra > 0 {
+			sr.mismatchErr = ErrSizeMismatch
+			return 0, ErrSizeMismatch
+		}
+		if errors.Is(extraErr, ErrSizeMismatch) {
+			sr.mismatchErr = ErrSizeMismatch
 			return 0, ErrSizeMismatch
 		}
 		if extraErr != nil && extraErr != io.EOF {
+			sr.mismatchErr = extraErr
 			return 0, extraErr
 		}
+	}
+
+	if sr.mismatchErr != nil {
+		return 0, sr.mismatchErr
 	}
 
 	return 0, io.EOF
@@ -74,15 +108,24 @@ func (sr *SizeReader) Read(p []byte) (n int, err error) {
 
 // TotalRead returns the total number of bytes read so far.
 func (sr *SizeReader) TotalRead() int64 {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
 	return sr.readCount
 }
 
 // Verify checks whether the reader was read to completion and matched expectedSize.
 func (sr *SizeReader) Verify() error {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+
 	if !sr.exact {
 		return nil
 	}
+	if sr.mismatchErr != nil {
+		return sr.mismatchErr
+	}
 	if sr.readCount != sr.expectedSize {
+		sr.mismatchErr = ErrSizeMismatch
 		return ErrSizeMismatch
 	}
 	if !sr.eofChecked {
@@ -90,13 +133,19 @@ func (sr *SizeReader) Verify() error {
 		nExtra, err := sr.r.Read(extra[:])
 		sr.eofChecked = true
 		if nExtra > 0 {
+			sr.mismatchErr = ErrSizeMismatch
+			return ErrSizeMismatch
+		}
+		if errors.Is(err, ErrSizeMismatch) {
+			sr.mismatchErr = ErrSizeMismatch
 			return ErrSizeMismatch
 		}
 		if err != nil && err != io.EOF {
+			sr.mismatchErr = err
 			return err
 		}
 	}
-	return nil
+	return sr.mismatchErr
 }
 
 // ResolvePayload inspects the reader and PutOptions to determine exact size semantics.
