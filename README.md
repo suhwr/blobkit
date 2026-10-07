@@ -27,6 +27,7 @@ BlobKit is intentionally designed as an **infrastructure orchestration layer**, 
     - [Local POSIX Filesystem Driver (Zero Cost & Edge Storage)](#f-local-posix-filesystem-driver-zero-cost--edge-storage)
     - [WebDAV Protocol Driver (Nextcloud, ownCloud, TrueNAS, NAS)](#g-webdav-protocol-driver-nextcloud-owncloud-truenas-nas)
     - [Azure Blob Storage Driver (Native Block Blobs & SAS Presigning)](#h-azure-blob-storage-driver-native-block-blobs--sas-presigning)
+    - [Google Cloud Storage Driver (Native JSON API & V4 Signed URLs)](#i-google-cloud-storage-driver-native-json-api--v4-signed-urls)
   - [2. Advanced Multi-Provider Routing](#2-advanced-multi-provider-routing)
     - [Namespace Tiered Routing](#a-namespace-tiered-routing)
     - [Active-Passive Failover](#b-active-passive-failover)
@@ -292,6 +293,28 @@ azureDriver, err := azure.NewDriver(azure.Config{
     // Optional: custom endpoint for Azurite emulator or sovereign clouds
     // CustomEndpoint: "http://127.0.0.1:10000/mystorageaccount",
     PublicBaseURL:  "https://cdn.example.com", // Optional public CDN prefix
+})
+```
+
+#### i. Google Cloud Storage Driver (Native JSON API & V4 Signed URLs)
+
+Native Google Cloud Storage driver interfacing directly with the GCS JSON API v1 and Resumable Upload protocol. Supports single-shot media uploads, multipart/related uploads with custom metadata, 256 KiB-aligned chunked resumable sessions, byte-range streaming, server-side rewrite/copy, concurrent batch deletion, and client-side Google Cloud V4 Signed URLs (`GOOG4-RSA-SHA256`) with zero external Google Cloud SDK dependencies:
+
+```go
+import "github.com/suhwr/blobkit/provider/gcs"
+
+gcsDriver, err := gcs.NewDriver(gcs.Config{
+    Name:                "gcs-primary",
+    Bucket:              "my-cloud-bucket",
+    TokenFunc: func(ctx context.Context) (string, error) {
+        // Return fresh OAuth2 token or use Compute Engine / Workload Identity token source
+        return tokenSource.Token(ctx)
+    },
+    // Optional: for Google Cloud V4 Signed URLs (PresignGet & PresignPut)
+    ServiceAccountEmail: "service-account@project.iam.gserviceaccount.com",
+    PrivateKeyPEM:       rsaPrivateKeyPEMBytes,
+    ChunkSize:           8 * 1024 * 1024, // 8 MiB chunks (multiple of 256 KiB)
+    PublicBaseURL:       "https://cdn.example.com", // Optional public CDN prefix
 })
 ```
 
