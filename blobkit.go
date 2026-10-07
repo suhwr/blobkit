@@ -1140,6 +1140,113 @@ func (c *Client) PermanentDelete(ctx context.Context, target string) error {
 	return nil
 }
 
+// PermanentDeleteBatch removes multiple objects in bulk by grouping them by provider
+// and invoking Driver.DeleteBatch, with automatic metadata cleanup and cache eviction.
+func (c *Client) PermanentDeleteBatch(ctx context.Context, targets []string) ([]string, error) {
+	if len(targets) == 0 {
+		return nil, nil
+	}
+
+	start := time.Now()
+	ctx = c.observer.OnOperationStart(ctx, OpPermanentDelete, fmt.Sprintf("batch(%d)", len(targets)))
+	var totalErr error
+	var allDeleted []string
+	defer func() {
+		c.observer.OnOperationEnd(ctx, OpPermanentDelete, fmt.Sprintf("batch(%d)", len(targets)), time.Since(start), totalErr)
+	}()
+
+	type itemMeta struct {
+		target   string
+		key      string
+		objectID string
+	}
+
+	// Group valid targets by provider
+	byProvider := make(map[string][]itemMeta)
+	var errs []error
+
+	for _, target := range targets {
+		key, providerName, resErr := c.resolveTargetWithDeleted(ctx, target, true)
+		if resErr != nil {
+			errs = append(errs, resErr)
+			continue
+		}
+
+		objID := target
+		if c.registry != nil {
+			rec, _ := c.registry.GetByID(ctx, target)
+			if rec == nil {
+				rec, _ = c.registry.GetByKey(ctx, key)
+			}
+			if rec != nil {
+				objID = rec.ObjectID
+				if rec.LegalHold {
+					errs = append(errs, WrapError("permanent_delete_batch", key, providerName, ErrObjectLocked))
+					continue
+				}
+				if rec.RetentionUntil != nil && rec.RetentionUntil.After(time.Now().UTC()) {
+					errs = append(errs, WrapError("permanent_delete_batch", key, providerName, ErrObjectLocked))
+					continue
+				}
+			}
+		}
+
+		byProvider[providerName] = append(byProvider[providerName], itemMeta{
+			target:   target,
+			key:      key,
+			objectID: objID,
+		})
+	}
+
+	for provName, items := range byProvider {
+		if len(items) == 0 {
+			continue
+		}
+
+		driver, rErr := c.router.Select(ctx, RouteContext{
+			Op:             OpDelete,
+			Key:            items[0].key,
+			ForcedProvider: provName,
+		})
+		if rErr != nil {
+			errs = append(errs, WrapError("route_driver", items[0].key, provName, rErr))
+			continue
+		}
+
+		keys := make([]string, len(items))
+		itemByKey := make(map[string]itemMeta, len(items))
+		for i, it := range items {
+			keys[i] = it.key
+			itemByKey[it.key] = it
+		}
+
+		deletedKeys, delErr := driver.DeleteBatch(ctx, keys)
+		if delErr != nil {
+			c.router.ReportFailure(driver.Name(), delErr)
+			errs = append(errs, delErr)
+		} else {
+			c.router.ReportSuccess(driver.Name())
+		}
+
+		for _, delKey := range deletedKeys {
+			it := itemByKey[delKey]
+			allDeleted = append(allDeleted, it.target)
+			if c.registry != nil && it.objectID != "" {
+				_ = c.registry.HardDelete(ctx, it.objectID)
+			}
+			if c.cache != nil {
+				c.cache.Delete(it.target)
+				c.cache.Delete(delKey)
+			}
+		}
+	}
+
+	if len(errs) > 0 {
+		totalErr = errors.Join(errs...)
+	}
+	return allDeleted, totalErr
+}
+
 // InitiateResumableUpload initializes a multipart upload session for large files or unstable networks.
 // It assigns an ObjectID, physical storage key, creates a multipart session on the storage driver,
 // and returns an UploadSession handle.

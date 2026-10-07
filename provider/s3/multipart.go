@@ -18,6 +18,7 @@ import (
 type partTask struct {
 	number int32
 	data   []byte
+	bufPtr *[]byte
 }
 
 type partResult struct {
@@ -81,7 +82,8 @@ func (d *Driver) uploadMultipart(ctx context.Context, obj *blobkit.Object, r io.
 					Body:       bytes.NewReader(task.data),
 				})
 
-				// Return memory budget immediately after part upload finishes
+				// Return buffer to pool and release memory budget immediately after part upload finishes
+				d.putChunkBuffer(task.bufPtr)
 				d.cfg.GlobalMemoryLimiter.Release(int64(len(task.data)))
 
 				if partErr != nil {
@@ -136,7 +138,8 @@ func (d *Driver) uploadMultipart(ctx context.Context, obj *blobkit.Object, r io.
 			break
 		}
 
-		buf := make([]byte, chunkSize)
+		bufPtr := d.getChunkBuffer()
+		buf := *bufPtr
 		n, readErr := io.ReadFull(r, buf)
 		if n > 0 {
 			// If we read less than chunkSize, adjust the limiter allocation
@@ -147,15 +150,17 @@ func (d *Driver) uploadMultipart(ctx context.Context, obj *blobkit.Object, r io.
 			totalBytes += int64(n)
 
 			select {
-			case tasks <- partTask{number: partNum, data: data}:
+			case tasks <- partTask{number: partNum, data: data, bufPtr: bufPtr}:
 				partNum++
 			case <-ctx.Done():
+				d.putChunkBuffer(bufPtr)
 				d.cfg.GlobalMemoryLimiter.Release(int64(n))
 				collectErr = ctx.Err()
 				break
 			}
 		} else {
-			// No bytes read, release full budget
+			// No bytes read, return buffer and release full budget
+			d.putChunkBuffer(bufPtr)
 			d.cfg.GlobalMemoryLimiter.Release(chunkSize)
 		}
 

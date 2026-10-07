@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -25,6 +26,7 @@ type Driver struct {
 	cfg           Config
 	client        *s3client.Client
 	presignClient *s3client.PresignClient
+	chunkPool     sync.Pool
 }
 
 // NewDriver initializes a high-performance S3 driver with persistent connection pooling.
@@ -64,11 +66,33 @@ func NewDriver(cfg Config) (*Driver, error) {
 
 	presignClient := s3client.NewPresignClient(client)
 
-	return &Driver{
+	d := &Driver{
 		cfg:           cfg,
 		client:        client,
 		presignClient: presignClient,
-	}, nil
+	}
+	d.chunkPool.New = func() any {
+		b := make([]byte, cfg.MultipartPartSize)
+		return &b
+	}
+
+	return d, nil
+}
+
+func (d *Driver) getChunkBuffer() *[]byte {
+	bufPtr, ok := d.chunkPool.Get().(*[]byte)
+	if !ok || bufPtr == nil || int64(cap(*bufPtr)) < d.cfg.MultipartPartSize {
+		b := make([]byte, d.cfg.MultipartPartSize)
+		return &b
+	}
+	*bufPtr = (*bufPtr)[:d.cfg.MultipartPartSize]
+	return bufPtr
+}
+
+func (d *Driver) putChunkBuffer(bufPtr *[]byte) {
+	if bufPtr != nil && int64(cap(*bufPtr)) >= d.cfg.MultipartPartSize {
+		d.chunkPool.Put(bufPtr)
+	}
 }
 
 func (d *Driver) Name() string {
@@ -268,7 +292,7 @@ func (d *Driver) DeleteBatch(ctx context.Context, keys []string) ([]string, erro
 			Bucket: aws.String(d.cfg.Bucket),
 			Delete: &types.Delete{
 				Objects: objIDs,
-				Quiet:   aws.Bool(true),
+				Quiet:   aws.Bool(false),
 			},
 		})
 		if err != nil {
@@ -279,6 +303,22 @@ func (d *Driver) DeleteBatch(ctx context.Context, keys []string) ([]string, erro
 			if dObj.Key != nil {
 				deletedKeys = append(deletedKeys, *dObj.Key)
 			}
+		}
+
+		if len(resp.Errors) > 0 {
+			var errMsgs []string
+			for _, e := range resp.Errors {
+				keyName := ""
+				if e.Key != nil {
+					keyName = *e.Key
+				}
+				msg := ""
+				if e.Message != nil {
+					msg = *e.Message
+				}
+				errMsgs = append(errMsgs, fmt.Sprintf("%s: %s", keyName, msg))
+			}
+			return deletedKeys, d.wrapError("delete_batch", "", fmt.Errorf("partial deletion failure (%d errors): %s", len(resp.Errors), strings.Join(errMsgs, "; ")))
 		}
 	}
 

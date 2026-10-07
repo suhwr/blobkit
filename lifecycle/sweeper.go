@@ -11,6 +11,12 @@ import (
 	"github.com/suhwr/blobkit"
 )
 
+// DistributedLocker provides mutual exclusion for background maintenance workers.
+type DistributedLocker interface {
+	// TryLock attempts to acquire the lock. Returns unlock func, acquired flag, and error.
+	TryLock(ctx context.Context) (unlock func(), acquired bool, err error)
+}
+
 // SweeperConfig tunes the automated lifecycle sweeper worker.
 type SweeperConfig struct {
 	// Interval is the frequency of periodic background sweeps. Default is 1 hour.
@@ -27,6 +33,10 @@ type SweeperConfig struct {
 	// BatchSize bounds the number of records inspected or purged per sweep iteration.
 	// Default is 100.
 	BatchSize int
+
+	// Locker is an optional distributed locker preventing concurrent sweeper executions
+	// across multi-node or multi-pod deployments.
+	Locker DistributedLocker
 }
 
 // SweepResult provides telemetry and diagnostics about a completed sweep iteration.
@@ -74,32 +84,51 @@ func NewSweeper(client *blobkit.Client, cfg SweeperConfig) (*Sweeper, error) {
 func (s *Sweeper) RunOnce(ctx context.Context) (*SweepResult, error) {
 	start := time.Now()
 	res := &SweepResult{}
+
+	// 0. Mutual exclusion via distributed locker (if configured)
+	if s.cfg.Locker != nil {
+		unlock, acquired, err := s.cfg.Locker.TryLock(ctx)
+		if err != nil {
+			return res, fmt.Errorf("sweeper distributed lock failed: %w", err)
+		}
+		if !acquired {
+			// Another worker instance holds the lock. Exit gracefully.
+			return res, nil
+		}
+		defer unlock()
+	}
+
 	now := time.Now().UTC()
 
-	// 1. Purge expired objects
+	// 1. Purge expired objects in bulk batches
 	expiredRecords, err := s.client.FindExpiredObjects(ctx, now, s.cfg.BatchSize)
 	if err != nil {
 		res.Errors = append(res.Errors, fmt.Errorf("find expired: %w", err))
-	} else {
+	} else if len(expiredRecords) > 0 {
+		var candidateIDs []string
 		for _, rec := range expiredRecords {
 			if rec.LegalHold {
 				continue
 			}
-			if delErr := s.client.PermanentDelete(ctx, rec.ObjectID); delErr != nil {
-				res.Errors = append(res.Errors, fmt.Errorf("purge expired %s: %w", rec.ObjectID, delErr))
-			} else {
-				res.ExpiredPurged++
+			candidateIDs = append(candidateIDs, rec.ObjectID)
+		}
+		if len(candidateIDs) > 0 {
+			deleted, delErr := s.client.PermanentDeleteBatch(ctx, candidateIDs)
+			res.ExpiredPurged += len(deleted)
+			if delErr != nil {
+				res.Errors = append(res.Errors, fmt.Errorf("purge expired batch: %w", delErr))
 			}
 		}
 	}
 
-	// 2. Purge soft-deleted objects older than SoftDeleteTTL
+	// 2. Purge soft-deleted objects older than SoftDeleteTTL in bulk batches
 	if s.cfg.SoftDeleteTTL > 0 {
 		cutoff := now.Add(-s.cfg.SoftDeleteTTL)
 		softDeleted, err := s.client.FindSoftDeletedObjects(ctx, cutoff, s.cfg.BatchSize)
 		if err != nil {
 			res.Errors = append(res.Errors, fmt.Errorf("find soft deleted: %w", err))
-		} else {
+		} else if len(softDeleted) > 0 {
+			var candidateIDs []string
 			for _, rec := range softDeleted {
 				if rec.LegalHold {
 					continue
@@ -107,10 +136,13 @@ func (s *Sweeper) RunOnce(ctx context.Context) (*SweepResult, error) {
 				if rec.RetentionUntil != nil && rec.RetentionUntil.After(now) {
 					continue
 				}
-				if delErr := s.client.PermanentDelete(ctx, rec.ObjectID); delErr != nil {
-					res.Errors = append(res.Errors, fmt.Errorf("purge soft deleted %s: %w", rec.ObjectID, delErr))
-				} else {
-					res.SoftDeletePurged++
+				candidateIDs = append(candidateIDs, rec.ObjectID)
+			}
+			if len(candidateIDs) > 0 {
+				deleted, delErr := s.client.PermanentDeleteBatch(ctx, candidateIDs)
+				res.SoftDeletePurged += len(deleted)
+				if delErr != nil {
+					res.Errors = append(res.Errors, fmt.Errorf("purge soft deleted batch: %w", delErr))
 				}
 			}
 		}
