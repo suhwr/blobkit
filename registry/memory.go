@@ -1,8 +1,8 @@
 package registry
 
 import (
-	"fmt"
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"

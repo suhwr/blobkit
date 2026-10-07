@@ -225,8 +225,8 @@ func (c *Client) Put(ctx context.Context, r io.Reader, opts PutOptions) (savedOb
 	// Verify client-declared checksum if specified
 	if opts.ClientChecksum != "" && !strings.EqualFold(calculatedHash, opts.ClientChecksum) {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-			defer cancel()
-			_ = driver.Delete(cleanupCtx, savedObj.Key)
+		defer cancel()
+		_ = driver.Delete(cleanupCtx, savedObj.Key)
 		c.abortRegistry(ctx, obj.ID)
 		return nil, WrapError("checksum_verify", savedObj.Key, driver.Name(), ErrChecksumMismatch)
 	}
@@ -1452,7 +1452,7 @@ func (c *Client) InitiateResumableUpload(ctx context.Context, opts PutOptions, p
 			ContentType: opts.ContentType,
 			Size:        opts.Size,
 		})
-			if err != nil {
+		if err != nil {
 			return nil, WrapError("policy_validation", "", "", err)
 		}
 	}

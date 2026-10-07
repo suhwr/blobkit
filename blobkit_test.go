@@ -158,7 +158,6 @@ func TestClient_WithRegistryDiscoveryAndAccess(t *testing.T) {
 		t.Fatalf("unexpected delivery URL: %s", deliveryURL)
 	}
 
-
 	// 6. Delete by ObjectID
 	err = client.Delete(ctx, targetID)
 	if err != nil {
