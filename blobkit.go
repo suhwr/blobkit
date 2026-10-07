@@ -224,7 +224,9 @@ func (c *Client) Put(ctx context.Context, r io.Reader, opts PutOptions) (savedOb
 
 	// Verify client-declared checksum if specified
 	if opts.ClientChecksum != "" && !strings.EqualFold(calculatedHash, opts.ClientChecksum) {
-		_ = driver.Delete(ctx, savedObj.Key)
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			_ = driver.Delete(cleanupCtx, savedObj.Key)
 		c.abortRegistry(ctx, obj.ID)
 		return nil, WrapError("checksum_verify", savedObj.Key, driver.Name(), ErrChecksumMismatch)
 	}
@@ -260,7 +262,9 @@ func (c *Client) Put(ctx context.Context, r io.Reader, opts PutOptions) (savedOb
 			UpdatedAt:        savedObj.UpdatedAt,
 		}
 		if err = c.registry.Save(ctx, rec); err != nil {
-			_ = driver.Delete(ctx, savedObj.Key)
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			_ = driver.Delete(cleanupCtx, savedObj.Key)
 			c.abortRegistry(ctx, obj.ID)
 			return nil, WrapError("registry_save_committed", savedObj.Key, savedObj.Provider, err)
 		}
@@ -603,9 +607,11 @@ func (c *Client) DeleteBatch(ctx context.Context, targets []string) (deleted []s
 
 		if c.registry != nil {
 			var regErrs []error
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			defer cancel()
 			for _, item := range items {
 				if delSet[item.key] {
-					if uErr := c.registry.UpdateStatus(ctx, item.objectID, StateDeleted); uErr != nil {
+					if uErr := c.registry.UpdateStatus(cleanupCtx, item.objectID, StateDeleted); uErr != nil {
 						regErrs = append(regErrs, fmt.Errorf("registry update failed for %s: %w", item.objectID, uErr))
 					}
 				}
@@ -1120,7 +1126,9 @@ func (c *Client) resolveTargetWithDeleted(ctx context.Context, target string, al
 
 func (c *Client) abortRegistry(ctx context.Context, objectID string) {
 	if c.registry != nil && objectID != "" {
-		_ = c.registry.UpdateStatus(ctx, objectID, StateAborted)
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_ = c.registry.UpdateStatus(cleanupCtx, objectID, StateAborted)
 	}
 }
 
