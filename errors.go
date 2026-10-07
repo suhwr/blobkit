@@ -71,16 +71,30 @@ var (
 
 	// ErrSessionExpired indicates that the resumable multipart upload session has expired.
 	ErrSessionExpired = errors.New("blobkit: upload session expired")
+
+	// ErrRateLimited indicates that the storage backend rate limit or throttling threshold was exceeded.
+	ErrRateLimited = errors.New("blobkit: rate limit exceeded / throttled")
+
+	// ErrPermissionDenied indicates that access to the bucket or object was forbidden.
+	ErrPermissionDenied = errors.New("blobkit: permission denied")
+
+	// ErrInvalidCredentials indicates that authentication credentials were missing, expired, or invalid.
+	ErrInvalidCredentials = errors.New("blobkit: invalid credentials")
+
+	// ErrMultipartInvalidState indicates an illegal state transition in a multipart upload session.
+	ErrMultipartInvalidState = errors.New("blobkit: multipart invalid state transition")
 )
 
 var (
-	reSecretToken = regexp.MustCompile(`(?i)(token|access_token|refresh_token|api_key|apikey|secret_key|secret|client_secret|password|passwd|sig|signature|x-amz-signature|x-amz-credential|x-goog-signature)=([a-zA-Z0-9_\-\.%]+)`)
-	reJSONSecret  = regexp.MustCompile(`(?i)"(token|access_token|refresh_token|api_key|apikey|secret_key|secret|client_secret|password|passwd|sig|signature)"\s*:\s*"[^"]*"`)
+	reSecretToken = regexp.MustCompile(`(?i)(token|access_token|refresh_token|api_key|apikey|secret_key|secret|client_secret|password|passwd|sig|signature|x-amz-signature|x-amz-credential|x-amz-security-token|awsaccesskeyid|x-goog-signature)=([a-zA-Z0-9_\-\.%]+)`)
+	reJSONSecret  = regexp.MustCompile(`(?i)"(token|access_token|refresh_token|api_key|apikey|secret_key|secret|client_secret|password|passwd|sig|signature|accessKeyId|secretAccessKey)"\s*:\s*"[^"]*"`)
 	reBearerAuth  = regexp.MustCompile(`(?i)(Bearer\s+)[A-Za-z0-9\-\._~+/]+=*`)
 	reBasicAuth   = regexp.MustCompile(`(?i)(Basic\s+)[A-Za-z0-9+/=]+`)
-	rePrivateKey  = regexp.MustCompile(`(?s)-----BEGIN[^\-]+PRIVATE KEY-----.*?-----END[^\-]+PRIVATE KEY-----`)
+	reAuthHeader  = regexp.MustCompile(`(?i)(Authorization:\s*)[^\r\n]+`)
+	rePrivateKey  = regexp.MustCompile(`(?s)-----BEGIN.*?PRIVATE KEY-----.*?(?:-----END.*?PRIVATE KEY-----|$)`)
 	reProxyDial   = regexp.MustCompile(`proxyconnect tcp: dial tcp [0-9\.:]+: `)
-	reInternalIP  = regexp.MustCompile(`(dial tcp (?:127\.0\.0\.1|10\.\d+\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+|\[::1\]|\[fe80:[0-9a-f:]+\]|\[(?:fc|fd)[0-9a-f:]+\]):\d+)`)
+	reInternalIP  = regexp.MustCompile(`(?:dial tcp\s+)?(?:127\.0\.0\.1|10\.\d+\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+|\[::1\]|\[fe80:[0-9a-f:]+\]|\[(?:fc|fd)[0-9a-f:]+\])(?::\d+)?`)
+	reURLSecret   = regexp.MustCompile(`(?i)([?&](?:sig|signature|token|key|api_key|apikey|x-amz-signature|x-goog-signature)=)[^&\s"']+`)
 )
 
 // StorageError represents a standardized, sanitized error returned by BlobKit operations.
@@ -170,7 +184,11 @@ func PreserveSentinel(err error) bool {
 		errors.Is(err, ErrSizeMismatch) ||
 		errors.Is(err, ErrObjectLocked) ||
 		errors.Is(err, ErrSessionNotFound) ||
-		errors.Is(err, ErrSessionExpired)
+		errors.Is(err, ErrSessionExpired) ||
+		errors.Is(err, ErrRateLimited) ||
+		errors.Is(err, ErrPermissionDenied) ||
+		errors.Is(err, ErrInvalidCredentials) ||
+		errors.Is(err, ErrMultipartInvalidState)
 }
 
 // SanitizeErrorMessage strips internal proxy dials, local IPs, authorization headers, private keys,
@@ -180,12 +198,14 @@ func SanitizeErrorMessage(raw string) string {
 		return ""
 	}
 	sanitized := reProxyDial.ReplaceAllString(raw, "")
-	sanitized = reInternalIP.ReplaceAllString(sanitized, "dial tcp [scrubbed]")
+	sanitized = reInternalIP.ReplaceAllString(sanitized, "[scrubbed-address]")
 	sanitized = reBearerAuth.ReplaceAllString(sanitized, "$1[redacted]")
 	sanitized = reBasicAuth.ReplaceAllString(sanitized, "$1[redacted]")
+	sanitized = reAuthHeader.ReplaceAllString(sanitized, "$1[redacted]")
 	sanitized = rePrivateKey.ReplaceAllString(sanitized, "[redacted private key]")
 	sanitized = reSecretToken.ReplaceAllString(sanitized, "$1=[redacted]")
 	sanitized = reJSONSecret.ReplaceAllString(sanitized, `"$1":"[redacted]"`)
+	sanitized = reURLSecret.ReplaceAllString(sanitized, "$1[redacted]")
 	return sanitized
 }
 
@@ -241,4 +261,90 @@ func IsSecurityViolation(err error) bool {
 // IsObjectLocked reports whether err represents a retention lock or legal hold block.
 func IsObjectLocked(err error) bool {
 	return errors.Is(err, ErrObjectLocked)
+}
+
+// IsRateLimited reports whether err represents backend rate limiting or throttling.
+func IsRateLimited(err error) bool {
+	return errors.Is(err, ErrRateLimited)
+}
+
+// IsPermissionDenied reports whether err represents authentication or authorization failure.
+func IsPermissionDenied(err error) bool {
+	return errors.Is(err, ErrPermissionDenied) || errors.Is(err, ErrInvalidCredentials)
+}
+
+// IsPermanent reports whether err represents a definitive, non-recoverable client error
+// that should not be retried and should not trigger failover circuits.
+func IsPermanent(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrObjectNotFound) ||
+		errors.Is(err, ErrBucketNotFound) ||
+		errors.Is(err, ErrInvalidKey) ||
+		errors.Is(err, ErrInvalidID) ||
+		errors.Is(err, ErrInvalidFilename) ||
+		errors.Is(err, ErrPreconditionFailed) ||
+		errors.Is(err, ErrPermissionDenied) ||
+		errors.Is(err, ErrInvalidCredentials) ||
+		errors.Is(err, ErrChecksumMismatch) ||
+		errors.Is(err, ErrSizeMismatch) ||
+		errors.Is(err, ErrUploadTooLarge) ||
+		errors.Is(err, ErrSecurityViolation) ||
+		errors.Is(err, ErrMIMEMismatch) ||
+		errors.Is(err, ErrNilReader) ||
+		errors.Is(err, ErrObjectLocked) ||
+		errors.Is(err, ErrUnsupportedOperation) ||
+		errors.Is(err, ErrMultipartInvalidState) {
+		return true
+	}
+	return false
+}
+
+// IsTransient reports whether err represents a transient failure eligible for retry or failover.
+// Permanent client errors (such as not found, invalid key, precondition failed, permission denied,
+// checksum mismatch, size mismatch, security violation) are NOT transient.
+func IsTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	if IsPermanent(err) || errors.Is(err, context.Canceled) {
+		return false
+	}
+
+	// Explicit transient errors
+	if errors.Is(err, ErrProviderUnavailable) ||
+		errors.Is(err, ErrRateLimited) ||
+		errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
+	// Unwrap StorageError if present
+	var se *StorageError
+	if errors.As(err, &se) {
+		return IsTransient(se.Err)
+	}
+
+	// General network and server errors
+	errMsg := strings.ToLower(err.Error())
+	if strings.Contains(errMsg, "connection refused") ||
+		strings.Contains(errMsg, "connection reset") ||
+		strings.Contains(errMsg, "broken pipe") ||
+		strings.Contains(errMsg, "timeout") ||
+		strings.Contains(errMsg, "temporary failure") ||
+		strings.Contains(errMsg, "service unavailable") ||
+		strings.Contains(errMsg, "bad gateway") ||
+		strings.Contains(errMsg, "gateway timeout") ||
+		strings.Contains(errMsg, "rate limit") ||
+		strings.Contains(errMsg, "too many requests") ||
+		strings.Contains(errMsg, "429") ||
+		strings.Contains(errMsg, "500") ||
+		strings.Contains(errMsg, "502") ||
+		strings.Contains(errMsg, "503") ||
+		strings.Contains(errMsg, "504") ||
+		strings.Contains(errMsg, "quota exceeded") {
+		return true
+	}
+
+	return false
 }

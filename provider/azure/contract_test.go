@@ -15,7 +15,5 @@ func TestAzureDriver_Contract(t *testing.T) {
 			_ = driver.Close()
 			server.Close()
 		}
-	}, testutil.DriverContractOptions{
-		SkipConditional: true,
-	})
+	}, testutil.DriverContractOptions{})
 }

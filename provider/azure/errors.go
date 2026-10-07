@@ -61,11 +61,17 @@ func wrapHTTPError(op, key, driverName string, statusCode int, body []byte, rawE
 	case code == "ConditionNotMet" || code == "TargetConditionNotMet" || statusCode == http.StatusPreconditionFailed || statusCode == http.StatusNotModified || statusCode == http.StatusRequestedRangeNotSatisfiable:
 		return blobkit.WrapError(op, key, driverName, blobkit.ErrPreconditionFailed)
 
-	case code == "ServerBusy" || statusCode == http.StatusTooManyRequests || statusCode >= 500:
-		return blobkit.WrapError(op, key, driverName, blobkit.ErrProviderUnavailable)
+	case code == "ServerBusy" || statusCode == http.StatusTooManyRequests:
+		return blobkit.WrapError(op, key, driverName, blobkit.ErrRateLimited)
 
-	case statusCode == http.StatusForbidden || statusCode == http.StatusUnauthorized:
-		return blobkit.WrapError(op, key, driverName, fmt.Errorf("azure auth error (%d): %s", statusCode, msg))
+	case statusCode == http.StatusUnauthorized:
+		return blobkit.WrapError(op, key, driverName, blobkit.ErrInvalidCredentials)
+
+	case statusCode == http.StatusForbidden:
+		return blobkit.WrapError(op, key, driverName, blobkit.ErrPermissionDenied)
+
+	case statusCode >= 500:
+		return blobkit.WrapError(op, key, driverName, blobkit.ErrProviderUnavailable)
 
 	default:
 		if statusCode >= 400 && statusCode < 500 {

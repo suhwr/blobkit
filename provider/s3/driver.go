@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	s3client "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -62,6 +63,7 @@ func NewDriver(cfg Config) (*Driver, error) {
 			o.BaseEndpoint = aws.String(cfg.Endpoint)
 		}
 		o.UsePathStyle = cfg.UsePathStyle
+		o.APIOptions = append(o.APIOptions, v4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware)
 	})
 
 	presignClient := s3client.NewPresignClient(client)
@@ -150,7 +152,30 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 
 		resp, err := d.client.PutObject(ctx, input)
 		if err != nil {
+			if sr, ok := payloadReader.(*blobkit.SizeReader); ok && sr != nil {
+				if sr.Verify() != nil || sr.TotalRead() != payloadSize {
+					cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					_, _ = d.client.DeleteObject(cleanupCtx, &s3client.DeleteObjectInput{
+						Bucket: aws.String(d.cfg.Bucket),
+						Key:    aws.String(obj.Key),
+					})
+					cancel()
+					return nil, d.wrapError("put", obj.Key, blobkit.ErrSizeMismatch)
+				}
+			}
 			return nil, d.wrapError("put", obj.Key, err)
+		}
+
+		if sr, ok := payloadReader.(*blobkit.SizeReader); ok {
+			if verifyErr := sr.Verify(); verifyErr != nil {
+				cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				_, _ = d.client.DeleteObject(cleanupCtx, &s3client.DeleteObjectInput{
+					Bucket: aws.String(d.cfg.Bucket),
+					Key:    aws.String(obj.Key),
+				})
+				cancel()
+				return nil, d.wrapError("put", obj.Key, verifyErr)
+			}
 		}
 
 		now := time.Now().UTC()
@@ -537,7 +562,7 @@ func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
 	if err := blobkit.ValidateKey(dstKey); err != nil {
 		return d.wrapError("copy", dstKey, err)
 	}
-	source := url.PathEscape(d.cfg.Bucket + "/" + strings.TrimLeft(srcKey, "/"))
+	source := d.cfg.Bucket + "/" + (&url.URL{Path: strings.TrimLeft(srcKey, "/")}).EscapedPath()
 	_, err := d.client.CopyObject(ctx, &s3client.CopyObjectInput{
 		Bucket:     aws.String(d.cfg.Bucket),
 		Key:        aws.String(strings.TrimLeft(dstKey, "/")),
@@ -587,16 +612,34 @@ func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, pa
 	if err := blobkit.ValidateKey(key); err != nil {
 		return "", d.wrapError("upload_part", key, err)
 	}
+	if uploadID == "" {
+		return "", d.wrapError("upload_part", key, blobkit.ErrInvalidID)
+	}
+	if r == nil {
+		return "", blobkit.ErrNilReader
+	}
+	if partNumber <= 0 {
+		return "", d.wrapError("upload_part", key, fmt.Errorf("%w: part number %d must be >= 1", blobkit.ErrMultipartInvalidState, partNumber))
+	}
+	if size < 0 {
+		return "", d.wrapError("upload_part", key, blobkit.ErrSizeMismatch)
+	}
+
+	sr := blobkit.NewSizeReader(r, size, true)
+
 	resp, err := d.client.UploadPart(ctx, &s3client.UploadPartInput{
 		Bucket:        aws.String(d.cfg.Bucket),
 		Key:           aws.String(key),
 		UploadId:      aws.String(uploadID),
 		PartNumber:    aws.Int32(partNumber),
-		Body:          r,
+		Body:          sr,
 		ContentLength: aws.Int64(size),
 	})
 	if err != nil {
 		return "", d.wrapError("upload_part", key, err)
+	}
+	if verifyErr := sr.Verify(); verifyErr != nil {
+		return "", d.wrapError("upload_part", key, verifyErr)
 	}
 	if resp.ETag != nil {
 		return *resp.ETag, nil
@@ -614,9 +657,25 @@ func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, upl
 	if err := blobkit.ValidateKey(obj.Key); err != nil {
 		return nil, d.wrapError("complete_multipart", obj.Key, err)
 	}
+	if uploadID == "" {
+		return nil, d.wrapError("complete_multipart", obj.Key, blobkit.ErrInvalidID)
+	}
+	if len(parts) == 0 {
+		return nil, d.wrapError("complete_multipart", obj.Key, fmt.Errorf("%w: at least one part is required", blobkit.ErrMultipartInvalidState))
+	}
+
+	seen := make(map[int32]bool, len(parts))
 	completed := make([]types.CompletedPart, len(parts))
 	var totalSize int64
 	for i, p := range parts {
+		if p.PartNumber <= 0 {
+			return nil, d.wrapError("complete_multipart", obj.Key, fmt.Errorf("%w: invalid part number %d", blobkit.ErrMultipartInvalidState, p.PartNumber))
+		}
+		if seen[p.PartNumber] {
+			return nil, d.wrapError("complete_multipart", obj.Key, fmt.Errorf("%w: duplicate part number %d", blobkit.ErrMultipartInvalidState, p.PartNumber))
+		}
+		seen[p.PartNumber] = true
+
 		completed[i] = types.CompletedPart{
 			PartNumber: aws.Int32(p.PartNumber),
 			ETag:       aws.String(p.ETag),
@@ -740,9 +799,21 @@ func (d *Driver) wrapError(op, key string, err error) error {
 			return blobkit.WrapError(op, key, d.cfg.Name, blobkit.ErrObjectNotFound)
 		case "NoSuchBucket":
 			return blobkit.WrapError(op, key, d.cfg.Name, blobkit.ErrBucketNotFound)
+		case "NoSuchUpload":
+			return blobkit.WrapError(op, key, d.cfg.Name, blobkit.ErrSessionNotFound)
+		case "EntityTooLarge":
+			return blobkit.WrapError(op, key, d.cfg.Name, blobkit.ErrUploadTooLarge)
+		case "BadDigest", "InvalidDigest":
+			return blobkit.WrapError(op, key, d.cfg.Name, blobkit.ErrChecksumMismatch)
 		case "PreconditionFailed", "AtLeastOneConditionFailed", "304", "NotModified":
 			return blobkit.WrapError(op, key, d.cfg.Name, blobkit.ErrPreconditionFailed)
-		case "SlowDown", "RequestTimeout", "ServiceUnavailable", "503", "500":
+		case "AccessDenied", "403":
+			return blobkit.WrapError(op, key, d.cfg.Name, blobkit.ErrPermissionDenied)
+		case "InvalidAccessKeyId", "SignatureDoesNotMatch", "InvalidToken", "401":
+			return blobkit.WrapError(op, key, d.cfg.Name, blobkit.ErrInvalidCredentials)
+		case "SlowDown", "Throttling", "ThrottlingException", "429":
+			return blobkit.WrapError(op, key, d.cfg.Name, blobkit.ErrRateLimited)
+		case "RequestTimeout", "ServiceUnavailable", "503", "500":
 			return blobkit.WrapError(op, key, d.cfg.Name, blobkit.ErrProviderUnavailable)
 		}
 	}

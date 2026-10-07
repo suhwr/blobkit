@@ -16,7 +16,6 @@ func TestWebDAVDriver_Contract(t *testing.T) {
 			server.Close()
 		}
 	}, testutil.DriverContractOptions{
-		SkipMultipart:   true,
-		SkipConditional: true,
+		SkipMultipart: true,
 	})
 }

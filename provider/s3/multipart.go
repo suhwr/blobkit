@@ -184,6 +184,13 @@ uploadLoop:
 		return nil, d.wrapError("upload_multipart", obj.Key, collectErr)
 	}
 
+	if sr, ok := r.(*blobkit.SizeReader); ok {
+		if verifyErr := sr.Verify(); verifyErr != nil {
+			abortUpload()
+			return nil, d.wrapError("upload_multipart", obj.Key, verifyErr)
+		}
+	}
+
 	if len(completedParts) == 0 {
 		abortUpload()
 		return nil, d.wrapError("upload_multipart", obj.Key, fmt.Errorf("no parts uploaded"))

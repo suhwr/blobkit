@@ -43,13 +43,13 @@ func wrapHTTPError(op, key, driverName string, statusCode int, rawErr error) err
 		return blobkit.WrapError(op, key, driverName, blobkit.ErrPreconditionFailed)
 
 	case http.StatusTooManyRequests:
-		return blobkit.WrapError(op, key, driverName, blobkit.ErrProviderUnavailable)
+		return blobkit.WrapError(op, key, driverName, blobkit.ErrRateLimited)
 
 	case http.StatusUnauthorized:
-		return blobkit.WrapError(op, key, driverName, fmt.Errorf("webdav unauthorized: invalid username or password"))
+		return blobkit.WrapError(op, key, driverName, fmt.Errorf("%w: webdav unauthorized: invalid username or password", blobkit.ErrInvalidCredentials))
 
 	case http.StatusForbidden:
-		return blobkit.WrapError(op, key, driverName, fmt.Errorf("webdav forbidden: access denied"))
+		return blobkit.WrapError(op, key, driverName, fmt.Errorf("%w: webdav forbidden: access denied", blobkit.ErrPermissionDenied))
 
 	case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 		return blobkit.WrapError(op, key, driverName, blobkit.ErrProviderUnavailable)

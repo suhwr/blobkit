@@ -82,11 +82,17 @@ func parseGCSError(op, key, driverName string, statusCode int, body []byte, rawE
 	case statusCode == http.StatusConflict:
 		return blobkit.WrapError(op, key, driverName, blobkit.ErrObjectLocked)
 
-	case statusCode == http.StatusTooManyRequests || statusCode >= 500 || reason == "rateLimitExceeded":
-		return blobkit.WrapError(op, key, driverName, fmt.Errorf("%w: %s (status %d)", blobkit.ErrProviderUnavailable, errMsg, statusCode))
+	case statusCode == http.StatusTooManyRequests || reason == "rateLimitExceeded":
+		return blobkit.WrapError(op, key, driverName, blobkit.ErrRateLimited)
 
-	case statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden:
-		return blobkit.WrapError(op, key, driverName, fmt.Errorf("authentication error: %s (status %d)", errMsg, statusCode))
+	case statusCode == http.StatusUnauthorized:
+		return blobkit.WrapError(op, key, driverName, blobkit.ErrInvalidCredentials)
+
+	case statusCode == http.StatusForbidden:
+		return blobkit.WrapError(op, key, driverName, blobkit.ErrPermissionDenied)
+
+	case statusCode >= 500:
+		return blobkit.WrapError(op, key, driverName, fmt.Errorf("%w: %s", blobkit.ErrProviderUnavailable, errMsg))
 
 	default:
 		return blobkit.WrapError(op, key, driverName, fmt.Errorf("gcs api error: %s (status %d)", errMsg, statusCode))

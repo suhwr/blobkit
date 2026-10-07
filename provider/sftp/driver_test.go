@@ -31,18 +31,30 @@ type mockSSHServer struct {
 	stopChan chan struct{}
 }
 
+var (
+	testHostSigner ssh.Signer
+	testSignerOnce sync.Once
+)
+
+func getTestHostSigner(t *testing.T) ssh.Signer {
+	testSignerOnce.Do(func() {
+		key, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			panic(err)
+		}
+		signer, err := ssh.NewSignerFromKey(key)
+		if err != nil {
+			panic(err)
+		}
+		testHostSigner = signer
+	})
+	return testHostSigner
+}
+
 func startMockSSHServer(t *testing.T, user, password string) *mockSSHServer {
 	t.Helper()
 
-	// Ephemeral RSA host key
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatalf("failed to generate RSA key: %v", err)
-	}
-	signer, err := ssh.NewSignerFromKey(key)
-	if err != nil {
-		t.Fatalf("failed to create signer: %v", err)
-	}
+	signer := getTestHostSigner(t)
 
 	sshConfig := &ssh.ServerConfig{
 		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {

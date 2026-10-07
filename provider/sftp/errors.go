@@ -46,7 +46,7 @@ func mapSFTPError(op, key, driverName string, err error) error {
 
 	// Permission checks
 	if errors.Is(err, os.ErrPermission) || errors.Is(err, sftp.ErrSSHFxPermissionDenied) {
-		return blobkit.WrapError(op, key, driverName, fmt.Errorf("permission denied: %s", scrubbedMsg))
+		return blobkit.WrapError(op, key, driverName, fmt.Errorf("%w: %s", blobkit.ErrPermissionDenied, scrubbedMsg))
 	}
 
 	// Connection drop / network failures

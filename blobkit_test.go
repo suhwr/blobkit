@@ -6,6 +6,8 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -618,3 +620,134 @@ func TestPreserveSentinel(t *testing.T) {
 		t.Fatal("expected arbitrary error NOT to be preserved")
 	}
 }
+
+type headCountingDriver struct {
+	blobkit.Driver
+	headCalls int64
+}
+
+func (d *headCountingDriver) Head(ctx context.Context, key string) (*blobkit.Object, error) {
+	atomic.AddInt64(&d.headCalls, 1)
+	time.Sleep(50 * time.Millisecond) // ensure concurrent callers overlap in singleflight window
+	return d.Driver.Head(ctx, key)
+}
+
+func TestClient_CacheStampedeSingleflight(t *testing.T) {
+	ctx := context.Background()
+	baseDriver := memory.NewDriver(memory.Config{
+		Bucket: "stampede-bucket",
+	})
+	driver := &headCountingDriver{Driver: baseDriver}
+	lru := cache.NewLRUCache(10)
+
+	client, err := blobkit.New(
+		blobkit.WithDriver(driver),
+		blobkit.WithCache(lru),
+	)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	// 1. Put an object directly
+	data := []byte("stampede-data")
+	_, err = client.Put(ctx, bytes.NewReader(data), blobkit.PutOptions{
+		Key: "stampede.txt",
+	})
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	// Evict from cache to simulate cold cache / cache expiration
+	lru.Delete("stampede.txt")
+	atomic.StoreInt64(&driver.headCalls, 0)
+
+	// 2. Launch 20 concurrent goroutines calling Head
+	const concurrency = 20
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+	errCh := make(chan error, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		go func() {
+			defer wg.Done()
+			obj, err := client.Head(ctx, "stampede.txt")
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if obj.Size != int64(len(data)) {
+				errCh <- errors.New("size mismatch")
+				return
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Fatalf("concurrent Head failed: %v", err)
+	}
+
+	// 3. Assert that singleflight collapsed all 20 calls into exactly 1 driver Head call
+	calls := atomic.LoadInt64(&driver.headCalls)
+	if calls != 1 {
+		t.Fatalf("expected exactly 1 driver Head invocation, got %d", calls)
+	}
+
+	// 4. Subsequent Head should hit cache directly (0 additional driver calls)
+	_, err = client.Head(ctx, "stampede.txt")
+	if err != nil {
+		t.Fatalf("subsequent Head failed: %v", err)
+	}
+	if atomic.LoadInt64(&driver.headCalls) != 1 {
+		t.Fatalf("subsequent Head hit driver instead of cache")
+	}
+}
+
+func TestErrorClassification_PermanentVsTransient(t *testing.T) {
+	permanentErrors := []error{
+		blobkit.ErrObjectNotFound,
+		blobkit.ErrBucketNotFound,
+		blobkit.ErrInvalidKey,
+		blobkit.ErrInvalidID,
+		blobkit.ErrInvalidFilename,
+		blobkit.ErrPreconditionFailed,
+		blobkit.ErrPermissionDenied,
+		blobkit.ErrInvalidCredentials,
+		blobkit.ErrUploadTooLarge,
+		blobkit.ErrChecksumMismatch,
+		blobkit.ErrSizeMismatch,
+		blobkit.ErrSecurityViolation,
+		blobkit.ErrMIMEMismatch,
+		blobkit.ErrNilReader,
+		blobkit.ErrObjectLocked,
+		blobkit.ErrMultipartInvalidState,
+		blobkit.ErrUnsupportedOperation,
+	}
+
+	for _, err := range permanentErrors {
+		if !blobkit.IsPermanent(err) {
+			t.Errorf("expected %v to be classified as permanent", err)
+		}
+		if blobkit.IsTransient(err) {
+			t.Errorf("expected %v NOT to be classified as transient", err)
+		}
+	}
+
+	transientErrors := []error{
+		blobkit.ErrRateLimited,
+		context.DeadlineExceeded,
+	}
+
+	for _, err := range transientErrors {
+		if !blobkit.IsTransient(err) {
+			t.Errorf("expected %v to be classified as transient", err)
+		}
+		if blobkit.IsPermanent(err) {
+			t.Errorf("expected %v NOT to be classified as permanent", err)
+		}
+	}
+}
+

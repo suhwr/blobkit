@@ -54,6 +54,17 @@ type mockSession struct {
 	TotalSize   int64
 }
 
+func parseHTTPTime(s string) *time.Time {
+	if s == "" {
+		return nil
+	}
+	t, err := time.Parse(http.TimeFormat, s)
+	if err != nil {
+		return nil
+	}
+	return &t
+}
+
 func newMockGCSServer(bucket string) *mockGCSServer {
 	return &mockGCSServer{
 		bucket:   bucket,
@@ -407,6 +418,21 @@ func (m *mockGCSServer) handleStorageAPI(w http.ResponseWriter, r *http.Request)
 	case http.MethodGet:
 		// Download with alt=media
 		if r.URL.Query().Get("alt") == "media" {
+			if err := blobkit.CheckPreconditions(obj.ETag, obj.Updated, blobkit.GetOptions{
+				IfMatch:           r.Header.Get("If-Match"),
+				IfNoneMatch:       r.Header.Get("If-None-Match"),
+				IfModifiedSince:   parseHTTPTime(r.Header.Get("If-Modified-Since")),
+				IfUnmodifiedSince: parseHTTPTime(r.Header.Get("If-Unmodified-Since")),
+			}); err != nil {
+				if r.Header.Get("If-None-Match") != "" || r.Header.Get("If-Modified-Since") != "" {
+					w.WriteHeader(http.StatusNotModified)
+				} else {
+					w.WriteHeader(http.StatusPreconditionFailed)
+					_, _ = w.Write([]byte(`{"error":{"code":412,"message":"Precondition Failed","errors":[{"reason":"conditionNotMet"}]}}`))
+				}
+				return
+			}
+
 			data := obj.Data
 			rangeHeader := r.Header.Get("Range")
 

@@ -78,6 +78,9 @@ func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, pa
 	if r == nil {
 		return "", blobkit.ErrNilReader
 	}
+	if partNumber <= 0 {
+		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, fmt.Errorf("part number must be >= 1"))
+	}
 	if size < 0 {
 		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, blobkit.ErrSizeMismatch)
 	}
@@ -97,16 +100,15 @@ func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, pa
 		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, fmt.Errorf("session already completed"))
 	}
 
-	// Buffer part data
-	buf := make([]byte, size)
-	n, err := io.ReadFull(r, buf)
-	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+	sr := blobkit.NewSizeReader(r, size, true)
+	buf, err := io.ReadAll(sr)
+	if err != nil {
 		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, err)
 	}
-	if int64(n) != size {
-		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, blobkit.ErrSizeMismatch)
+	if err := sr.Verify(); err != nil {
+		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, err)
 	}
-	actualSize := int64(n)
+	actualSize := int64(len(buf))
 
 	// Compute MD5 for part verification
 	h := md5.Sum(buf)
@@ -185,6 +187,14 @@ func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, upl
 	}
 	if uploadID == "" {
 		return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, blobkit.ErrInvalidID)
+	}
+
+	seenParts := make(map[int32]bool, len(parts))
+	for _, p := range parts {
+		if p.PartNumber <= 0 || seenParts[p.PartNumber] {
+			return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, blobkit.ErrMultipartInvalidState)
+		}
+		seenParts[p.PartNumber] = true
 	}
 
 	d.sessionsMu.Lock()

@@ -447,6 +447,9 @@ func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, pa
 	if r == nil {
 		return "", blobkit.ErrNilReader
 	}
+	if partNumber <= 0 {
+		return "", blobkit.WrapError("upload_part", key, d.name, fmt.Errorf("part number must be >= 1"))
+	}
 	if size < 0 {
 		return "", blobkit.WrapError("upload_part", key, d.name, blobkit.ErrSizeMismatch)
 	}
@@ -455,7 +458,7 @@ func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, pa
 	if err != nil {
 		return "", blobkit.WrapError("upload_part", key, d.name, err)
 	}
-	if size > 0 && int64(len(data)) != size {
+	if int64(len(data)) != size {
 		return "", blobkit.WrapError("upload_part", key, d.name, blobkit.ErrSizeMismatch)
 	}
 
@@ -485,6 +488,17 @@ func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, upl
 	}
 	if uploadID == "" {
 		return nil, blobkit.WrapError("complete_multipart", obj.Key, d.name, blobkit.ErrInvalidID)
+	}
+	if len(parts) == 0 {
+		return nil, blobkit.WrapError("complete_multipart", obj.Key, d.name, blobkit.ErrMultipartInvalidState)
+	}
+
+	seenParts := make(map[int32]bool, len(parts))
+	for _, p := range parts {
+		if p.PartNumber <= 0 || seenParts[p.PartNumber] {
+			return nil, blobkit.WrapError("complete_multipart", obj.Key, d.name, blobkit.ErrMultipartInvalidState)
+		}
+		seenParts[p.PartNumber] = true
 	}
 
 	d.mu.Lock()

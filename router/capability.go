@@ -47,12 +47,11 @@ func (r *CapabilityRouter) Select(ctx context.Context, rc RouteContext) (blobkit
 		}
 	}
 
-	// Fallback to first driver if none explicitly match non-critical flags
-	if len(r.drivers) > 0 {
-		return r.drivers[0], nil
+	if len(r.drivers) == 0 {
+		return nil, fmt.Errorf("%w: no driver registered", blobkit.ErrProviderUnavailable)
 	}
 
-	return nil, fmt.Errorf("%w: no driver registered", blobkit.ErrProviderUnavailable)
+	return nil, fmt.Errorf("%w: operation %s requires capability %v", blobkit.ErrUnsupportedOperation, rc.Op, required)
 }
 
 // AllDrivers returns all registered drivers.

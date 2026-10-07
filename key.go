@@ -9,7 +9,7 @@ import (
 const MaxKeyLength = 1024
 
 // ValidateKey validates an object key against directory traversal, path escape, injection attacks,
-// and malformed formatting across all operations and storage engines.
+// double/multi-encoding tricks, control characters, and malformed formatting across all operations and storage engines.
 func ValidateKey(key string) error {
 	trimmed := strings.TrimSpace(key)
 	if trimmed == "" {
@@ -19,9 +19,22 @@ func ValidateKey(key string) error {
 		return ErrInvalidKey
 	}
 
-	// Reject null bytes, carriage returns, and newlines
-	if strings.ContainsAny(key, "\x00\r\n") {
-		return ErrSecurityViolation
+	// Reject ASCII control characters (0x00 - 0x1F, 0x7F) including null, CRLF, tabs
+	for i := 0; i < len(key); i++ {
+		b := key[i]
+		if b < 0x20 || b == 0x7F {
+			return ErrSecurityViolation
+		}
+	}
+
+	// Reject Unicode bidi overrides, zero-width chars, and fullwidth dots/slashes
+	for _, r := range key {
+		switch r {
+		case '\u200E', '\u200F', '\u202A', '\u202B', '\u202C', '\u202D', '\u202E', '\u2066', '\u2067', '\u2068', '\u2069':
+			return ErrSecurityViolation
+		case '\uff0e', '\uff0f', '\u3002', '\uff3c': // fullwidth dot, slash, ideographic stop, fullwidth backslash
+			return ErrSecurityViolation
+		}
 	}
 
 	// Reject root escapes / absolute path indicators
@@ -34,17 +47,30 @@ func ValidateKey(key string) error {
 		return err
 	}
 
-	// Check URL-decoded path segments to prevent encoded traversal escapes (e.g. %2e%2e, %2e%2f)
-	if strings.Contains(key, "%") {
-		unescaped, err := url.PathUnescape(key)
-		if err == nil && unescaped != key {
-			if strings.ContainsAny(unescaped, "\x00\r\n") || strings.HasPrefix(unescaped, "/") || strings.HasPrefix(unescaped, "\\") {
+	// Check URL-decoded path segments iteratively (up to 3 layers) to prevent double/multi-encoded traversal (e.g. %252e%252e)
+	current := key
+	for depth := 0; depth < 3 && strings.Contains(current, "%"); depth++ {
+		unescaped, err := url.PathUnescape(current)
+		if err != nil {
+			return ErrSecurityViolation
+		}
+		if unescaped == current {
+			break
+		}
+		// Validate unescaped form for control chars, root escapes, and traversal
+		for i := 0; i < len(unescaped); i++ {
+			b := unescaped[i]
+			if b < 0x20 || b == 0x7F {
 				return ErrSecurityViolation
 			}
-			if err := checkPathSegments(unescaped); err != nil {
-				return err
-			}
 		}
+		if strings.HasPrefix(unescaped, "/") || strings.HasPrefix(unescaped, "\\") {
+			return ErrSecurityViolation
+		}
+		if err := checkPathSegments(unescaped); err != nil {
+			return err
+		}
+		current = unescaped
 	}
 
 	return nil
@@ -55,7 +81,8 @@ func checkPathSegments(k string) error {
 	normalized := strings.ReplaceAll(k, "\\", "/")
 	segs := strings.Split(normalized, "/")
 	for _, seg := range segs {
-		if seg == ".." || seg == "." {
+		cleanSeg := strings.TrimSpace(seg)
+		if cleanSeg == ".." || cleanSeg == "." {
 			return ErrSecurityViolation
 		}
 	}

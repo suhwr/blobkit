@@ -98,8 +98,12 @@ func (r *FailoverRouter) AllDrivers() []blobkit.Driver {
 	return list
 }
 
-// ReportFailure records a failure against the driver.
+// ReportFailure records a failure against the driver only for transient/provider errors.
+// Permanent client errors (e.g., ErrObjectNotFound, ErrInvalidKey) do not trigger failover.
 func (r *FailoverRouter) ReportFailure(driverName string, err error) {
+	if err != nil && blobkit.IsPermanent(err) {
+		return
+	}
 	if r.primary != nil && driverName == r.primary.Name() {
 		r.mu.Lock()
 		r.failures++

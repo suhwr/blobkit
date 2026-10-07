@@ -177,7 +177,11 @@ func (r *TieredRouter) AllDrivers() []blobkit.Driver {
 }
 
 // ReportFailure records a failure for a specific driver and trips its circuit if threshold is reached.
+// Permanent client errors (e.g. 404, bad keys) do not trip the target circuit.
 func (r *TieredRouter) ReportFailure(driverName string, err error) {
+	if err != nil && blobkit.IsPermanent(err) {
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 

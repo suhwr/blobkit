@@ -104,9 +104,11 @@ func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, pa
 	hasher := md5.New()
 	mw := io.MultiWriter(f, hasher)
 
+	var sr *blobkit.SizeReader
 	var reader io.Reader = r
-	if size > 0 {
-		reader = io.LimitReader(r, size)
+	if size >= 0 {
+		sr = blobkit.NewSizeReader(r, size, true)
+		reader = sr
 	}
 
 	written, err := io.Copy(mw, reader)
@@ -114,7 +116,12 @@ func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, pa
 		_ = os.Remove(partFile)
 		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, err)
 	}
-	if size > 0 && written != size {
+	if sr != nil {
+		if verifyErr := sr.Verify(); verifyErr != nil {
+			_ = os.Remove(partFile)
+			return "", blobkit.WrapError("upload_part", key, d.cfg.Name, verifyErr)
+		}
+	} else if size > 0 && written != size {
 		_ = os.Remove(partFile)
 		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, blobkit.ErrSizeMismatch)
 	}
@@ -133,6 +140,18 @@ func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, upl
 	}
 	if err := blobkit.ValidateKey(obj.Key); err != nil {
 		return nil, err
+	}
+	if len(parts) == 0 {
+		return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, blobkit.ErrMultipartInvalidState)
+	}
+
+	// Validate part numbers: positive and non-duplicate
+	seenParts := make(map[int32]bool, len(parts))
+	for _, p := range parts {
+		if p.PartNumber <= 0 || seenParts[p.PartNumber] {
+			return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, blobkit.ErrMultipartInvalidState)
+		}
+		seenParts[p.PartNumber] = true
 	}
 
 	d.sessionsMu.Lock()

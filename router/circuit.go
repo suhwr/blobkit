@@ -133,8 +133,12 @@ func (r *CircuitBreakerRouter) AllDrivers() []blobkit.Driver {
 	return list
 }
 
-// ReportFailure updates the breaker on execution failure.
+// ReportFailure updates the breaker on execution failure for transient errors.
+// Permanent client errors (e.g. 404, bad keys) do not trip the circuit breaker.
 func (r *CircuitBreakerRouter) ReportFailure(driver string, err error) {
+	if err != nil && blobkit.IsPermanent(err) {
+		return
+	}
 	if r.primary == nil || driver != r.primary.Name() {
 		return
 	}

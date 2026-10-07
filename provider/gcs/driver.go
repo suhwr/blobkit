@@ -143,6 +143,14 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 
 	resp, err := d.httpClient.Do(req)
 	if err != nil {
+		if sr, ok := payloadReader.(*blobkit.SizeReader); ok && sr != nil {
+			if sr.Verify() != nil || sr.TotalRead() != payloadSize {
+				delCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				_ = d.Delete(delCtx, cleanKey)
+				cancel()
+				return nil, blobkit.WrapError("put", cleanKey, d.cfg.Name, blobkit.ErrSizeMismatch)
+			}
+		}
 		return nil, parseGCSError("put", cleanKey, d.cfg.Name, 0, nil, err)
 	}
 	defer resp.Body.Close()
@@ -159,8 +167,11 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 	}
 
 	if sr, ok := payloadReader.(*blobkit.SizeReader); ok {
-		if err := sr.Verify(); err != nil {
-			return nil, blobkit.WrapError("put", cleanKey, d.cfg.Name, err)
+		if verifyErr := sr.Verify(); verifyErr != nil {
+			delCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = d.Delete(delCtx, cleanKey)
+			cancel()
+			return nil, blobkit.WrapError("put", cleanKey, d.cfg.Name, verifyErr)
 		}
 	}
 

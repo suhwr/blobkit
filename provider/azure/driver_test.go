@@ -38,6 +38,17 @@ type mockAzureServer struct {
 	stagedParts map[string]map[string][]byte // blobKey -> blockID -> data
 }
 
+func parseHTTPTime(s string) *time.Time {
+	if s == "" {
+		return nil
+	}
+	t, err := time.Parse(http.TimeFormat, s)
+	if err != nil {
+		return nil
+	}
+	return &t
+}
+
 func newMockAzureServer(container string) *mockAzureServer {
 	return &mockAzureServer{
 		container:   container,
@@ -240,6 +251,21 @@ func (s *mockAzureServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if err := blobkit.CheckPreconditions(b.etag, b.modTime, blobkit.GetOptions{
+			IfMatch:           r.Header.Get("If-Match"),
+			IfNoneMatch:       r.Header.Get("If-None-Match"),
+			IfModifiedSince:   parseHTTPTime(r.Header.Get("If-Modified-Since")),
+			IfUnmodifiedSince: parseHTTPTime(r.Header.Get("If-Unmodified-Since")),
+		}); err != nil {
+			if r.Header.Get("If-None-Match") != "" || r.Header.Get("If-Modified-Since") != "" {
+				w.WriteHeader(http.StatusNotModified)
+			} else {
+				w.WriteHeader(http.StatusPreconditionFailed)
+				_, _ = w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?><Error><Code>ConditionNotMet</Code></Error>`))
+			}
+			return
+		}
+
 		w.Header().Set("Content-Type", b.contentType)
 		w.Header().Set("ETag", b.etag)
 		w.Header().Set("Last-Modified", b.modTime.Format(http.TimeFormat))
@@ -281,6 +307,20 @@ func (s *mockAzureServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		b, ok := s.blobs[blobKey]
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		if err := blobkit.CheckPreconditions(b.etag, b.modTime, blobkit.GetOptions{
+			IfMatch:           r.Header.Get("If-Match"),
+			IfNoneMatch:       r.Header.Get("If-None-Match"),
+			IfModifiedSince:   parseHTTPTime(r.Header.Get("If-Modified-Since")),
+			IfUnmodifiedSince: parseHTTPTime(r.Header.Get("If-Unmodified-Since")),
+		}); err != nil {
+			if r.Header.Get("If-None-Match") != "" || r.Header.Get("If-Modified-Since") != "" {
+				w.WriteHeader(http.StatusNotModified)
+			} else {
+				w.WriteHeader(http.StatusPreconditionFailed)
+			}
 			return
 		}
 

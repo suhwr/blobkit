@@ -98,18 +98,17 @@ func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, pa
 	blockID := formatBlockID(partNumber)
 	urlStr := fmt.Sprintf("%s?comp=block&blockid=%s", d.blobURL(key), blockID)
 
-	// Buffer or limit read
-	var bodyReader io.Reader = r
-	if size > 0 {
-		bodyReader = io.LimitReader(r, size)
+	if size < 0 {
+		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, blobkit.ErrSizeMismatch)
 	}
 
-	buf, err := io.ReadAll(bodyReader)
+	sr := blobkit.NewSizeReader(r, size, true)
+	buf, err := io.ReadAll(sr)
 	if err != nil {
 		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, err)
 	}
-	if size > 0 && int64(len(buf)) != size {
-		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, blobkit.ErrSizeMismatch)
+	if err := sr.Verify(); err != nil {
+		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, err)
 	}
 
 	h := md5.Sum(buf)
@@ -154,6 +153,18 @@ func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, upl
 	if err := validateKey(obj.Key); err != nil {
 		return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, err)
 	}
+	if len(parts) == 0 {
+		return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, blobkit.ErrMultipartInvalidState)
+	}
+
+	// Validate parts: positive and no duplicates
+	seenParts := make(map[int32]bool, len(parts))
+	for _, p := range parts {
+		if p.PartNumber <= 0 || seenParts[p.PartNumber] {
+			return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, blobkit.ErrMultipartInvalidState)
+		}
+		seenParts[p.PartNumber] = true
+	}
 
 	d.sessionsMu.Lock()
 	expectedKey, ok := d.sessions[uploadID]
@@ -163,9 +174,6 @@ func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, upl
 	d.sessionsMu.Unlock()
 	if !ok || expectedKey != obj.Key {
 		return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, blobkit.ErrSessionNotFound)
-	}
-	if len(parts) == 0 {
-		return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, fmt.Errorf("no parts provided"))
 	}
 
 	// Sort parts by PartNumber

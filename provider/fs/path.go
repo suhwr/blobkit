@@ -39,6 +39,25 @@ func resolvePath(rootDir, key, stagingDir string) (string, error) {
 		return "", blobkit.WrapError("path", key, "fs", blobkit.ErrSecurityViolation)
 	}
 
+	// Symlink escape check: evaluate symlinks on existing ancestors
+	if realRoot, err := filepath.EvalSymlinks(rootDir); err == nil {
+		checkPath := fullPath
+		for {
+			if target, err := filepath.EvalSymlinks(checkPath); err == nil {
+				rel, err := filepath.Rel(realRoot, target)
+				if err != nil || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
+					return "", blobkit.WrapError("path", key, "fs", blobkit.ErrSecurityViolation)
+				}
+				break
+			}
+			parent := filepath.Dir(checkPath)
+			if parent == checkPath || parent == rootDir {
+				break
+			}
+			checkPath = parent
+		}
+	}
+
 	return fullPath, nil
 }
 

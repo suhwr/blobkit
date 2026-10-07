@@ -138,12 +138,20 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 
 	resp, err := d.httpClient.Do(req)
 	if err != nil {
+		if sizeReader.Verify() != nil || (effectiveSize >= 0 && sizeReader.TotalRead() != effectiveSize) {
+			delCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = d.Delete(delCtx, obj.Key)
+			cancel()
+			return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, blobkit.ErrSizeMismatch)
+		}
 		return nil, wrapHTTPError("put", obj.Key, d.cfg.Name, 0, err)
 	}
 	defer resp.Body.Close()
 
 	if err := sizeReader.Verify(); err != nil {
-		_ = d.Delete(ctx, obj.Key)
+		delCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_ = d.Delete(delCtx, obj.Key)
+		cancel()
 		return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
 	}
 

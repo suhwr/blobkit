@@ -67,7 +67,10 @@ func wrapHTTPError(op, key, driverName string, statusCode int, body []byte, rawE
 		return blobkit.WrapError(op, key, driverName, blobkit.ErrPreconditionFailed)
 
 	case http.StatusTooManyRequests:
-		return blobkit.WrapError(op, key, driverName, blobkit.ErrProviderUnavailable)
+		return blobkit.WrapError(op, key, driverName, blobkit.ErrRateLimited)
+
+	case http.StatusUnauthorized:
+		return blobkit.WrapError(op, key, driverName, blobkit.ErrInvalidCredentials)
 
 	case http.StatusForbidden:
 		for _, e := range apiErr.Error.Errors {
@@ -75,10 +78,10 @@ func wrapHTTPError(op, key, driverName string, statusCode int, body []byte, rawE
 			case "storageQuotaExceeded":
 				return blobkit.WrapError(op, key, driverName, blobkit.ErrQuotaExceeded)
 			case "rateLimitExceeded", "userRateLimitExceeded", "dailyLimitExceeded":
-				return blobkit.WrapError(op, key, driverName, blobkit.ErrProviderUnavailable)
+				return blobkit.WrapError(op, key, driverName, blobkit.ErrRateLimited)
 			}
 		}
-		return blobkit.WrapError(op, key, driverName, fmt.Errorf("forbidden: %s", errMsg))
+		return blobkit.WrapError(op, key, driverName, fmt.Errorf("%w: %s", blobkit.ErrPermissionDenied, errMsg))
 
 	case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 		return blobkit.WrapError(op, key, driverName, blobkit.ErrProviderUnavailable)

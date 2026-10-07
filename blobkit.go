@@ -27,6 +27,7 @@ type Client struct {
 	policy            *Policy
 	observer          Observer
 	cache             Cache
+	sf                singleflightGroup
 
 	sessionsMu sync.RWMutex
 	sessions   map[string]*UploadSession
@@ -327,14 +328,78 @@ func (c *Client) Head(ctx context.Context, target string) (obj *Object, err erro
 		if cached, ok := c.cache.Get(target); ok {
 			return cached, nil
 		}
+
+		val, sfErr := c.sf.Do(target, func() (any, error) {
+			if cached, ok := c.cache.Get(target); ok {
+				return cached, nil
+			}
+
+			key, providerName, resErr := c.resolveTarget(ctx, target)
+			if resErr != nil {
+				if errors.Is(resErr, ErrObjectNotFound) {
+					c.cache.SetNegative(target, 30*time.Second)
+				}
+				return nil, resErr
+			}
+
+			driver, rErr := c.router.Select(ctx, RouteContext{
+				Op:             OpHead,
+				Key:            key,
+				ForcedProvider: providerName,
+			})
+			if rErr != nil {
+				return nil, WrapError("route_driver", key, "", rErr)
+			}
+
+			obj, headErr := driver.Head(ctx, key)
+			if headErr != nil {
+				c.router.ReportFailure(driver.Name(), headErr)
+				if errors.Is(headErr, ErrObjectNotFound) {
+					c.cache.SetNegative(target, 30*time.Second)
+					c.cache.SetNegative(key, 30*time.Second)
+				}
+				return nil, headErr
+			}
+			c.router.ReportSuccess(driver.Name())
+
+			if target != key {
+				obj.ID = target
+			}
+
+			if c.registry != nil {
+				rec, _ := c.registry.GetByID(ctx, target)
+				if rec == nil {
+					rec, _ = c.registry.GetByKey(ctx, key)
+				}
+				if rec != nil {
+					obj.Status = rec.Status
+					obj.Visibility = rec.Visibility
+					obj.OriginalFilename = rec.OriginalFilename
+					obj.RetentionUntil = rec.RetentionUntil
+					obj.ExpiresAt = rec.ExpiresAt
+					obj.LegalHold = rec.LegalHold
+					obj.Metadata = rec.Metadata
+					obj.DeletedAt = rec.DeletedAt
+				}
+			}
+
+			c.cache.Set(target, obj, 5*time.Minute)
+			if target != key {
+				c.cache.Set(key, obj, 5*time.Minute)
+			}
+
+			return obj, nil
+		})
+		if sfErr != nil {
+			err = sfErr
+			return nil, err
+		}
+		return val.(*Object), nil
 	}
 
 	key, providerName, resErr := c.resolveTarget(ctx, target)
 	if resErr != nil {
 		err = resErr
-		if c.cache != nil && errors.Is(err, ErrObjectNotFound) {
-			c.cache.SetNegative(target, 30*time.Second)
-		}
 		return nil, err
 	}
 
@@ -352,10 +417,6 @@ func (c *Client) Head(ctx context.Context, target string) (obj *Object, err erro
 	if headErr != nil {
 		c.router.ReportFailure(driver.Name(), headErr)
 		err = headErr
-		if c.cache != nil && errors.Is(err, ErrObjectNotFound) {
-			c.cache.SetNegative(target, 30*time.Second)
-			c.cache.SetNegative(key, 30*time.Second)
-		}
 		return nil, err
 	}
 	c.router.ReportSuccess(driver.Name())
@@ -381,13 +442,6 @@ func (c *Client) Head(ctx context.Context, target string) (obj *Object, err erro
 		}
 	}
 
-	if c.cache != nil {
-		c.cache.Set(target, obj, 5*time.Minute)
-		if target != key {
-			c.cache.Set(key, obj, 5*time.Minute)
-		}
-	}
-
 	return obj, nil
 }
 
@@ -405,12 +459,14 @@ func (c *Client) Delete(ctx context.Context, target string) (err error) {
 		return err
 	}
 
+	var recID string
 	if c.registry != nil {
 		rec, _ := c.registry.GetByID(ctx, target)
 		if rec == nil {
 			rec, _ = c.registry.GetByKey(ctx, key)
 		}
 		if rec != nil {
+			recID = rec.ObjectID
 			if rec.LegalHold {
 				err = WrapError("delete", key, providerName, ErrObjectLocked)
 				return err
@@ -440,18 +496,25 @@ func (c *Client) Delete(ctx context.Context, target string) (err error) {
 	c.router.ReportSuccess(driver.Name())
 
 	if c.registry != nil {
-		_ = c.registry.UpdateStatus(ctx, target, StateDeleted)
+		if recID != "" {
+			_ = c.registry.UpdateStatus(ctx, recID, StateDeleted)
+		} else {
+			_ = c.registry.UpdateStatus(ctx, target, StateDeleted)
+		}
 	}
 
 	if c.cache != nil {
 		c.cache.Delete(target)
 		c.cache.Delete(key)
+		if recID != "" {
+			c.cache.Delete(recID)
+		}
 	}
 
 	return nil
 }
 
-// DeleteBatch removes multiple objects in a single batch operation.
+// DeleteBatch removes multiple objects in a single batch operation across their respective storage providers.
 func (c *Client) DeleteBatch(ctx context.Context, targets []string) (deleted []string, err error) {
 	if len(targets) == 0 {
 		return nil, nil
@@ -463,38 +526,87 @@ func (c *Client) DeleteBatch(ctx context.Context, targets []string) (deleted []s
 		c.observer.OnOperationEnd(ctx, OpDelete, fmt.Sprintf("batch:%d", len(targets)), time.Since(start), err)
 	}()
 
-	driver, rErr := c.router.Select(ctx, RouteContext{Op: OpDelete})
-	if rErr != nil {
-		err = WrapError("route_driver", "", "", rErr)
-		return nil, err
+	type targetItem struct {
+		target   string
+		key      string
+		objectID string
+		provider string
 	}
 
-	// Resolve any ObjectIDs to physical keys
-	resolvedKeys := make([]string, len(targets))
-	for i, t := range targets {
-		k, _, _ := c.resolveTarget(ctx, t)
-		resolvedKeys[i] = k
-	}
-
-	deleted, err = driver.DeleteBatch(ctx, resolvedKeys)
-	if err != nil {
-		c.router.ReportFailure(driver.Name(), err)
-		return deleted, err
-	}
-	c.router.ReportSuccess(driver.Name())
-
-	if c.registry != nil {
-		for _, t := range targets {
-			_ = c.registry.UpdateStatus(ctx, t, StateDeleted)
+	byProvider := make(map[string][]targetItem)
+	for _, t := range targets {
+		key, providerName, resErr := c.resolveTarget(ctx, t)
+		if resErr != nil {
+			key = strings.TrimLeft(t, "/")
 		}
+		objID := t
+		if c.registry != nil {
+			rec, _ := c.registry.GetByID(ctx, t)
+			if rec == nil {
+				rec, _ = c.registry.GetByKey(ctx, key)
+			}
+			if rec != nil {
+				objID = rec.ObjectID
+				if providerName == "" {
+					providerName = rec.Provider
+				}
+				if rec.LegalHold || (rec.RetentionUntil != nil && rec.RetentionUntil.After(time.Now().UTC())) {
+					continue
+				}
+			}
+		}
+		byProvider[providerName] = append(byProvider[providerName], targetItem{
+			target:   t,
+			key:      key,
+			objectID: objID,
+			provider: providerName,
+		})
 	}
 
-	if c.cache != nil {
-		for _, t := range targets {
-			c.cache.Delete(t)
+	for prov, items := range byProvider {
+		keys := make([]string, len(items))
+		for i, item := range items {
+			keys[i] = item.key
 		}
-		for _, k := range resolvedKeys {
-			c.cache.Delete(k)
+
+		driver, rErr := c.router.Select(ctx, RouteContext{
+			Op:             OpDelete,
+			ForcedProvider: prov,
+		})
+		if rErr != nil {
+			err = WrapError("route_driver", "", prov, rErr)
+			return deleted, err
+		}
+
+		delBatch, dErr := driver.DeleteBatch(ctx, keys)
+		if dErr != nil {
+			c.router.ReportFailure(driver.Name(), dErr)
+			return deleted, dErr
+		}
+		c.router.ReportSuccess(driver.Name())
+		deleted = append(deleted, delBatch...)
+
+		delSet := make(map[string]bool, len(delBatch))
+		for _, k := range delBatch {
+			delSet[k] = true
+		}
+
+		if c.registry != nil {
+			for _, item := range items {
+				if delSet[item.key] {
+					_ = c.registry.UpdateStatus(ctx, item.objectID, StateDeleted)
+				}
+			}
+		}
+
+		if c.cache != nil {
+			for _, item := range items {
+				if delSet[item.key] {
+					c.cache.Delete(item.target)
+					c.cache.Delete(item.key)
+					c.cache.Delete(item.objectID)
+				}
+			}
 		}
 	}
 
@@ -943,19 +1055,19 @@ func (c *Client) resolveTargetWithDeleted(ctx context.Context, target string, al
 	if c.registry != nil {
 		rec, err := c.registry.GetByID(ctx, target)
 		if err == nil && rec != nil {
-			if !allowDeleted && rec.Status == StateDeleted {
-				return "", "", WrapError("resolve_target", target, rec.Provider, ErrObjectNotFound)
+			if rec.Status == StateCommitted || (allowDeleted && rec.Status == StateDeleted) {
+				return rec.Key, rec.Provider, nil
 			}
-			return rec.Key, rec.Provider, nil
+			return "", "", WrapError("resolve_target", target, rec.Provider, ErrObjectNotFound)
 		}
 
 		cleanKey := strings.TrimLeft(target, "/")
 		recByKey, errByKey := c.registry.GetByKey(ctx, cleanKey)
 		if errByKey == nil && recByKey != nil {
-			if !allowDeleted && recByKey.Status == StateDeleted {
-				return "", "", WrapError("resolve_target", cleanKey, recByKey.Provider, ErrObjectNotFound)
+			if recByKey.Status == StateCommitted || (allowDeleted && recByKey.Status == StateDeleted) {
+				return recByKey.Key, recByKey.Provider, nil
 			}
-			return recByKey.Key, recByKey.Provider, nil
+			return "", "", WrapError("resolve_target", cleanKey, recByKey.Provider, ErrObjectNotFound)
 		}
 
 		if allowDeleted {

@@ -34,6 +34,17 @@ type mockWebDAVServer struct {
 	resources map[string]*mockResource
 }
 
+func parseHTTPTime(s string) *time.Time {
+	if s == "" {
+		return nil
+	}
+	t, err := time.Parse(http.TimeFormat, s)
+	if err != nil {
+		return nil
+	}
+	return &t
+}
+
 func newMockWebDAVServer() *mockWebDAVServer {
 	return &mockWebDAVServer{
 		resources: map[string]*mockResource{
@@ -92,6 +103,20 @@ func (s *mockWebDAVServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if err := blobkit.CheckPreconditions(res.etag, res.modTime, blobkit.GetOptions{
+			IfMatch:           r.Header.Get("If-Match"),
+			IfNoneMatch:       r.Header.Get("If-None-Match"),
+			IfModifiedSince:   parseHTTPTime(r.Header.Get("If-Modified-Since")),
+			IfUnmodifiedSince: parseHTTPTime(r.Header.Get("If-Unmodified-Since")),
+		}); err != nil {
+			if r.Header.Get("If-None-Match") != "" || r.Header.Get("If-Modified-Since") != "" {
+				w.WriteHeader(http.StatusNotModified)
+			} else {
+				w.WriteHeader(http.StatusPreconditionFailed)
+			}
+			return
+		}
+
 		w.Header().Set("Content-Type", res.contentType)
 		w.Header().Set("ETag", res.etag)
 		w.Header().Set("Last-Modified", res.modTime.Format(http.TimeFormat))
@@ -130,6 +155,20 @@ func (s *mockWebDAVServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		res, exists := s.resources[reqPath]
 		if !exists || res.isDir {
 			http.NotFound(w, r)
+			return
+		}
+
+		if err := blobkit.CheckPreconditions(res.etag, res.modTime, blobkit.GetOptions{
+			IfMatch:           r.Header.Get("If-Match"),
+			IfNoneMatch:       r.Header.Get("If-None-Match"),
+			IfModifiedSince:   parseHTTPTime(r.Header.Get("If-Modified-Since")),
+			IfUnmodifiedSince: parseHTTPTime(r.Header.Get("If-Unmodified-Since")),
+		}); err != nil {
+			if r.Header.Get("If-None-Match") != "" || r.Header.Get("If-Modified-Since") != "" {
+				w.WriteHeader(http.StatusNotModified)
+			} else {
+				w.WriteHeader(http.StatusPreconditionFailed)
+			}
 			return
 		}
 
