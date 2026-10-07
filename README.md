@@ -24,6 +24,7 @@ BlobKit is intentionally designed as an **infrastructure orchestration layer**, 
     - [MinIO & Self-Hosted S3](#c-minio--self-hosted-s3)
     - [In-Memory Driver (Offline Testing & CI/CD)](#d-in-memory-driver-offline-testing--cicd)
     - [Google Drive Driver (Cloud & Shared Drives)](#e-google-drive-driver-cloud--shared-drives)
+    - [Local POSIX Filesystem Driver (Zero Cost & Edge Storage)](#f-local-posix-filesystem-driver-zero-cost--edge-storage)
   - [2. Advanced Multi-Provider Routing](#2-advanced-multi-provider-routing)
     - [Namespace Tiered Routing](#a-namespace-tiered-routing)
     - [Active-Passive Failover](#b-active-passive-failover)
@@ -237,6 +238,24 @@ gdriveDriver, err := gdrive.NewDriver(gdrive.Config{
     },
     ChunkSize:        8 * 1024 * 1024, // 8 MiB chunks (must be multiple of 256 KiB)
     KeyCacheCapacity: 10000,           // Concurrency-safe LRU key -> fileID cache
+})
+```
+
+#### f. Local POSIX Filesystem Driver (Zero Cost & Edge Storage)
+
+Microsecond-latency, zero-cost persistent disk storage with atomic temporary file commits, byte-range seeking (`os.File.Seek`), sidecar metadata persistence, and strict path traversal protection:
+
+```go
+import "github.com/suhwr/blobkit/provider/fs"
+
+fsDriver, err := fs.NewDriver(fs.Config{
+    Name:              "fs-local",
+    RootDir:           "/var/data/blobs",               // Dedicated directory path
+    PublicBaseURL:     "https://cdn.example.com/blobs", // Optional public URL prefix
+    DirMode:           0755,
+    FileMode:          0644,
+    EnableSidecarMeta: true,                            // Atomically persist .meta.json sidecars
+    StagingDir:        ".staging",                      // Chunk staging directory for multipart
 })
 ```
 
