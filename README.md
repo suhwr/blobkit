@@ -35,6 +35,7 @@ BlobKit is intentionally designed as an **infrastructure orchestration layer**, 
     - [3-State Circuit Breaker Router](#c-3-state-circuit-breaker-router)
     - [Weighted Traffic Splitting](#d-weighted-traffic-splitting)
     - [Capability-Aware Dispatch](#e-capability-aware-dispatch)
+    - [Declarative Multi-Account Fleet Loader (`router/fleet`)](#f-declarative-multi-account-fleet-loader-routerfleet)
   - [3. Object Key Partitioning Strategies](#3-object-key-partitioning-strategies)
   - [4. Security Policy & Sanitization Engine](#4-security-policy--sanitization-engine)
   - [5. Streaming Uploads & Integrity Verification](#5-streaming-uploads--integrity-verification)
@@ -413,6 +414,63 @@ capRouter := router.NewCapabilityRouter(
     allDrivers,
     blobkit.CapCopy | blobkit.CapMultipartSession,
 )
+```
+
+#### f. Declarative Multi-Account Fleet Loader (`router/fleet`)
+
+Orchestrate complete multi-provider fleets and routing topologies declaratively from JSON, YAML, config files, or Go structs without manual wiring. Automatically initializes and wires any combination of all 8 storage drivers (`s3`, `r2`, `azure`, `gcs`, `webdav`, `gdrive`, `fs`, `sftp`, `memory`) with namespace, failover, circuit breaker, or weighted routing:
+
+```go
+import "github.com/suhwr/blobkit/router/fleet"
+
+fleetConfigJSON := []byte(`{
+  "providers": [
+    {
+      "type": "s3",
+      "name": "r2-public",
+      "s3": {
+        "endpoint": "https://<account>.r2.cloudflarestorage.com",
+        "bucket": "public-media",
+        "access_key_id": "...",
+        "secret_access_key": "..."
+      }
+    },
+    {
+      "type": "azure",
+      "name": "azure-archive",
+      "azure": {
+        "account_name": "prodarchive",
+        "account_key": "...",
+        "container_name": "archives"
+      }
+    },
+    {
+      "type": "fs",
+      "name": "local-cache",
+      "fs": {
+        "root_dir": "/var/data/blobs"
+      }
+    }
+  ],
+  "routing": {
+    "strategy": "namespace",
+    "default_provider": "local-cache",
+    "namespaces": {
+      "public/media": "r2-public",
+      "secure/archive": "azure-archive"
+    }
+  }
+}`)
+
+// Load fleet from JSON or Go struct
+storageFleet, err := fleet.LoadFromJSON(fleetConfigJSON)
+if err != nil {
+    log.Fatalf("failed to initialize storage fleet: %v", err)
+}
+defer storageFleet.Close()
+
+// Create fully wired BlobKit client directly
+client, err := storageFleet.NewClient()
 ```
 
 ---
