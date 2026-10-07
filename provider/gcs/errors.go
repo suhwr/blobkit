@@ -45,6 +45,9 @@ func scrubCredentials(msg string) string {
 // parseGCSError parses the HTTP status code and response body from GCS and maps it to a canonical blobkit error.
 func parseGCSError(op, key, driverName string, statusCode int, body []byte, rawErr error) error {
 	if rawErr != nil {
+		if blobkit.PreserveSentinel(rawErr) {
+			return blobkit.WrapError(op, key, driverName, rawErr)
+		}
 		scrubbed := scrubCredentials(rawErr.Error())
 		return blobkit.WrapError(op, key, driverName, errors.New(scrubbed))
 	}

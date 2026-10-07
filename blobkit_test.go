@@ -563,3 +563,48 @@ func TestClient_ObserverAndCache(t *testing.T) {
 		t.Fatal("expected item to be evicted from cache on Delete")
 	}
 }
+
+func TestSanitizeErrorMessage(t *testing.T) {
+	raw := "request failed token=supersecret123 and key=secretkey999 with Bearer ya29.a0AfH6_xyz and Basic dXNlcjpwYXNz proxyconnect tcp: dial tcp 10.0.0.5:8080: timeout"
+	sanitized := blobkit.SanitizeErrorMessage(raw)
+
+	if strings.Contains(sanitized, "supersecret123") {
+		t.Fatalf("token secret was not scrubbed: %s", sanitized)
+	}
+	if strings.Contains(sanitized, "secretkey999") {
+		t.Fatalf("key secret was not scrubbed: %s", sanitized)
+	}
+	if strings.Contains(sanitized, "$1=[redacted]") {
+		t.Fatalf("regex group $1 was emitted literally: %s", sanitized)
+	}
+	if !strings.Contains(sanitized, "token=[redacted]") {
+		t.Fatalf("expected token=[redacted], got: %s", sanitized)
+	}
+	if !strings.Contains(sanitized, "key=[redacted]") {
+		t.Fatalf("expected key=[redacted], got: %s", sanitized)
+	}
+	if strings.Contains(sanitized, "ya29.a0AfH6_xyz") {
+		t.Fatalf("bearer token not scrubbed: %s", sanitized)
+	}
+	if strings.Contains(sanitized, "dXNlcjpwYXNz") {
+		t.Fatalf("basic auth not scrubbed: %s", sanitized)
+	}
+	if strings.Contains(sanitized, "10.0.0.5:8080") {
+		t.Fatalf("internal IP not scrubbed: %s", sanitized)
+	}
+}
+
+func TestPreserveSentinel(t *testing.T) {
+	if !blobkit.PreserveSentinel(blobkit.ErrObjectNotFound) {
+		t.Fatal("expected ErrObjectNotFound to be preserved")
+	}
+	if !blobkit.PreserveSentinel(context.Canceled) {
+		t.Fatal("expected context.Canceled to be preserved")
+	}
+	if !blobkit.PreserveSentinel(context.DeadlineExceeded) {
+		t.Fatal("expected context.DeadlineExceeded to be preserved")
+	}
+	if blobkit.PreserveSentinel(errors.New("random error")) {
+		t.Fatal("expected arbitrary error NOT to be preserved")
+	}
+}

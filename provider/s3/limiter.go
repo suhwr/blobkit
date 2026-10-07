@@ -45,6 +45,18 @@ func (l *MemoryLimiter) Acquire(ctx context.Context, bytes int64) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	stopWatcher := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			l.mu.Lock()
+			l.cond.Broadcast()
+			l.mu.Unlock()
+		case <-stopWatcher:
+		}
+	}()
+	defer close(stopWatcher)
+
 	// Spin-wait with cancellation check
 	for {
 		if l.closed {

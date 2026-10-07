@@ -54,6 +54,16 @@ func (d *Driver) Capabilities() blobkit.Capability {
 		blobkit.CapCopy
 }
 
+func resolveMetadata(obj *blobkit.Object, opts blobkit.PutOptions) map[string]string {
+	if len(opts.Metadata) > 0 {
+		return opts.Metadata
+	}
+	if obj != nil && len(obj.Metadata) > 0 {
+		return obj.Metadata
+	}
+	return nil
+}
+
 // Put streams an object to the remote SFTP server, writing to a temporary file
 // before atomically renaming to prevent partial reads.
 func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts blobkit.PutOptions) (*blobkit.Object, error) {
@@ -118,7 +128,7 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 		contentType = "application/octet-stream"
 	}
 
-	// Persist sidecar metadata if enabled
+	resolvedMeta := resolveMetadata(obj, opts)
 	if d.cfg.EnableSidecarMeta {
 		meta := &sidecarMetadata{
 			ID:          obj.ID,
@@ -127,7 +137,7 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 			ContentType: contentType,
 			ETag:        fmt.Sprintf(`"%s"`, shaHex),
 			SHA256:      shaHex,
-			Metadata:    opts.Metadata,
+			Metadata:    resolvedMeta,
 			UpdatedAt:   now,
 		}
 		_ = d.writeSidecar(client, targetPath, meta)
@@ -141,9 +151,7 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 	resObj.Provider = d.cfg.Name
 	resObj.UpdatedAt = now
 	resObj.Status = blobkit.StateCommitted
-	if len(opts.Metadata) > 0 {
-		resObj.Metadata = opts.Metadata
-	}
+	resObj.Metadata = resolvedMeta
 
 	return &resObj, nil
 }

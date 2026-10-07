@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
 	"fmt"
@@ -13,6 +12,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -68,43 +68,45 @@ func (d *Driver) Capabilities() blobkit.Capability {
 		blobkit.CapBatchDelete
 }
 
+func resolveMetadata(obj *blobkit.Object, opts blobkit.PutOptions) map[string]string {
+	if len(opts.Metadata) > 0 {
+		return opts.Metadata
+	}
+	if obj != nil && len(obj.Metadata) > 0 {
+		return obj.Metadata
+	}
+	return nil
+}
+
+func validateKey(key string) error {
+	k := strings.TrimSpace(key)
+	if k == "" {
+		return blobkit.ErrInvalidKey
+	}
+	if strings.ContainsRune(k, '\x00') || strings.ContainsRune(k, '\r') {
+		return blobkit.ErrSecurityViolation
+	}
+	for _, seg := range strings.Split(k, "/") {
+		if seg == ".." {
+			return blobkit.ErrSecurityViolation
+		}
+	}
+	return nil
+}
+
 // Put uploads an object stream as an Azure Block Blob.
+// For objects within MultipartThreshold with known size, it streams directly using single Put Blob.
+// For objects exceeding MultipartThreshold or unknown/streaming sizes, it stages chunked blocks and commits them.
 func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts blobkit.PutOptions) (*blobkit.Object, error) {
 	if r == nil {
 		return nil, blobkit.ErrNilReader
 	}
-	if obj == nil || strings.TrimSpace(obj.Key) == "" {
+	if obj == nil {
 		return nil, blobkit.ErrInvalidKey
 	}
-
-	urlStr := d.blobURL(obj.Key)
-
-	// Buffer or read payload
-	var bodyReader io.Reader = r
-	if opts.Size > 0 {
-		bodyReader = io.LimitReader(r, opts.Size)
-	}
-
-	buf, err := io.ReadAll(bodyReader)
-	if err != nil {
+	if err := validateKey(obj.Key); err != nil {
 		return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
 	}
-
-	h := md5.Sum(buf)
-	etag := fmt.Sprintf("\"%s\"", hex.EncodeToString(h[:]))
-	md5B64 := base64.StdEncoding.EncodeToString(h[:])
-
-	sha := sha256.Sum256(buf)
-	shaHex := hex.EncodeToString(sha[:])
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, urlStr, bytes.NewReader(buf))
-	if err != nil {
-		return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
-	}
-
-	req.ContentLength = int64(len(buf))
-	req.Header.Set("x-ms-blob-type", "BlockBlob")
-	req.Header.Set("Content-MD5", md5B64)
 
 	contentType := obj.ContentType
 	if contentType == "" {
@@ -113,11 +115,32 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 			contentType = "application/octet-stream"
 		}
 	}
+	meta := resolveMetadata(obj, opts)
+
+	// If size is unknown (streaming) or exceeds MultipartThreshold, use chunked block staging
+	if opts.Size <= 0 || opts.Size > d.cfg.MultipartThreshold {
+		return d.uploadStreamMultipart(ctx, obj, r, contentType, meta, opts)
+	}
+
+	// Single-shot direct streaming upload without whole-body buffering
+	urlStr := d.blobURL(obj.Key)
+	var bodyReader io.Reader = io.LimitReader(r, opts.Size)
+
+	hMD5 := md5.New()
+	hSHA := sha256.New()
+	tee := io.TeeReader(bodyReader, io.MultiWriter(hMD5, hSHA))
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, urlStr, tee)
+	if err != nil {
+		return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
+	}
+
+	req.ContentLength = opts.Size
+	req.Header.Set("x-ms-blob-type", "BlockBlob")
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("x-ms-blob-content-type", contentType)
 
-	// Set custom user metadata headers
-	for k, v := range obj.Metadata {
+	for k, v := range meta {
 		req.Header.Set(fmt.Sprintf("x-ms-meta-%s", k), v)
 	}
 
@@ -137,15 +160,18 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 	}
 
 	now := time.Now().UTC()
-	if respETag := resp.Header.Get("ETag"); respETag != "" {
-		etag = respETag
+	etag := resp.Header.Get("ETag")
+	if etag == "" {
+		etag = fmt.Sprintf("\"%s\"", hex.EncodeToString(hMD5.Sum(nil)))
 	}
+	shaHex := hex.EncodeToString(hSHA.Sum(nil))
 
 	stored := *obj
 	stored.Bucket = d.cfg.Container
-	stored.Size = int64(len(buf))
+	stored.Size = opts.Size
 	stored.ContentType = contentType
 	stored.ETag = etag
+	stored.Metadata = meta
 	stored.ChecksumSHA256 = shaHex
 	stored.UpdatedAt = now
 	if stored.CreatedAt.IsZero() {
@@ -155,6 +181,70 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 	stored.Status = blobkit.StateCommitted
 
 	return &stored, nil
+}
+
+// uploadStreamMultipart streams an io.Reader of arbitrary/unknown size into staged blocks and commits them.
+func (d *Driver) uploadStreamMultipart(ctx context.Context, obj *blobkit.Object, r io.Reader, contentType string, meta map[string]string, opts blobkit.PutOptions) (*blobkit.Object, error) {
+	uploadID, err := d.CreateMultipart(ctx, obj, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	partSize := d.cfg.PartSize
+	buf := make([]byte, partSize)
+	var parts []blobkit.CompletedPart
+	var partNum int32 = 1
+	var totalSize int64
+
+	hSHA := sha256.New()
+
+	for {
+		if err := ctx.Err(); err != nil {
+			_ = d.AbortMultipart(context.Background(), obj.Key, uploadID)
+			return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
+		}
+
+		n, readErr := io.ReadFull(r, buf)
+		if n > 0 {
+			chunk := buf[:n]
+			hSHA.Write(chunk)
+			etag, partErr := d.UploadPart(ctx, obj.Key, uploadID, partNum, bytes.NewReader(chunk), int64(n))
+			if partErr != nil {
+				_ = d.AbortMultipart(context.Background(), obj.Key, uploadID)
+				return nil, partErr
+			}
+
+			parts = append(parts, blobkit.CompletedPart{
+				PartNumber: partNum,
+				ETag:       etag,
+				Size:       int64(n),
+			})
+			totalSize += int64(n)
+			partNum++
+		}
+
+		if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
+			break
+		}
+		if readErr != nil {
+			_ = d.AbortMultipart(context.Background(), obj.Key, uploadID)
+			return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, readErr)
+		}
+	}
+
+	targetObj := *obj
+	targetObj.ContentType = contentType
+	targetObj.Metadata = meta
+
+	res, err := d.CompleteMultipart(ctx, &targetObj, uploadID, parts)
+	if err != nil {
+		_ = d.AbortMultipart(context.Background(), obj.Key, uploadID)
+		return nil, err
+	}
+
+	res.ChecksumSHA256 = hex.EncodeToString(hSHA.Sum(nil))
+	res.Metadata = meta
+	return res, nil
 }
 
 // Get retrieves an object stream and its metadata from Azure Blob Storage.
@@ -588,7 +678,8 @@ func (d *Driver) Close() error {
 
 // blobURL returns the fully qualified URL for a blob resource.
 func (d *Driver) blobURL(key string) string {
-	cleanKey := strings.Trim(key, "/")
+	cleanKey := path.Clean("/" + strings.TrimSpace(key))
+	cleanKey = strings.TrimPrefix(cleanKey, "/")
 	parts := strings.Split(cleanKey, "/")
 	escapedParts := make([]string, len(parts))
 	for i, p := range parts {

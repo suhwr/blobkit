@@ -15,6 +15,12 @@ const (
 
 	// DefaultEndpointSuffix is the standard Azure public cloud storage endpoint suffix.
 	DefaultEndpointSuffix = "blob.core.windows.net"
+
+	// DefaultMultipartThreshold is the size threshold (32 MiB) at which uploads switch to chunked Block Blob staging.
+	DefaultMultipartThreshold int64 = 32 * 1024 * 1024
+
+	// DefaultPartSize is the chunk size (8 MiB) used for staged block uploads.
+	DefaultPartSize int64 = 8 * 1024 * 1024
 )
 
 // Config specifies options for the Azure Blob Storage driver.
@@ -42,6 +48,13 @@ type Config struct {
 
 	// APIVersion is the Azure REST API version. Defaults to DefaultAPIVersion ("2020-10-02").
 	APIVersion string
+
+	// MultipartThreshold is the size threshold in bytes above which chunked Block Blob staging is used.
+	// Defaults to DefaultMultipartThreshold (32 MiB).
+	MultipartThreshold int64
+
+	// PartSize is the chunk size in bytes for staged blocks. Defaults to DefaultPartSize (8 MiB).
+	PartSize int64
 
 	// RequestTimeout is the timeout applied to individual metadata requests. Defaults to 30s.
 	RequestTimeout time.Duration
@@ -87,6 +100,13 @@ func (c *Config) Validate() error {
 	}
 
 	c.PublicBaseURL = strings.TrimRight(c.PublicBaseURL, "/")
+
+	if c.MultipartThreshold <= 0 {
+		c.MultipartThreshold = DefaultMultipartThreshold
+	}
+	if c.PartSize <= 0 {
+		c.PartSize = DefaultPartSize
+	}
 
 	return nil
 }

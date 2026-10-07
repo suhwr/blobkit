@@ -65,13 +65,42 @@ func (d *Driver) Capabilities() blobkit.Capability {
 		blobkit.CapBatchDelete
 }
 
+func resolveMetadata(obj *blobkit.Object, opts blobkit.PutOptions) map[string]string {
+	if len(opts.Metadata) > 0 {
+		return opts.Metadata
+	}
+	if obj != nil && len(obj.Metadata) > 0 {
+		return obj.Metadata
+	}
+	return nil
+}
+
+func validateKey(key string) error {
+	k := strings.TrimSpace(key)
+	if k == "" {
+		return blobkit.ErrInvalidKey
+	}
+	if strings.ContainsRune(k, '\x00') || strings.ContainsRune(k, '\r') {
+		return blobkit.ErrSecurityViolation
+	}
+	for _, seg := range strings.Split(k, "/") {
+		if seg == ".." {
+			return blobkit.ErrSecurityViolation
+		}
+	}
+	return nil
+}
+
 // Put uploads an object stream to Google Drive, preserving S3-compatible overwrite semantics.
 func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts blobkit.PutOptions) (*blobkit.Object, error) {
 	if r == nil {
 		return nil, blobkit.ErrNilReader
 	}
-	if obj == nil || strings.TrimSpace(obj.Key) == "" {
+	if obj == nil {
 		return nil, blobkit.ErrInvalidKey
+	}
+	if err := validateKey(obj.Key); err != nil {
+		return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
 	}
 
 	// Check if a file with the same key already exists to perform in-place overwrite

@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Go Version](https://img.shields.io/badge/Go-%3E%3D%201.24-00ADD8.svg)](https://golang.org/)
 
-**BlobKit** is an enterprise-grade, high-performance object storage infrastructure library for Go. Engineered above AWS SDK v2, it delivers a provider-agnostic, resilient infrastructure layer for modern applications interfacing with any S3-compatible backend—including **Cloudflare R2**, **AWS S3**, **MinIO**, **Google Cloud Storage (S3 API)**, **Wasabi**, and **Backblaze B2**.
+**BlobKit** is an enterprise-grade, high-performance object storage infrastructure library for Go. Engineered with 8 native, production-hardened storage engines with zero external SDK bloat, it delivers a provider-agnostic, resilient infrastructure layer for modern applications interfacing with **AWS S3**, **Cloudflare R2**, **MinIO**, **Wasabi**, **Backblaze B2**, **Azure Blob Storage**, **Google Cloud Storage (Native JSON API)**, **WebDAV (Nextcloud / TrueNAS)**, **Google Drive (Shared Drives)**, **Local POSIX Filesystem**, **Remote SFTP / SSH**, and **Ephemeral In-Memory** storage.
 
 BlobKit is intentionally designed as an **infrastructure orchestration layer**, not a trivial SDK wrapper. It strictly separates application intent from physical wire mechanics, provides canonical object identity, enforces bounded streaming memory budgets, delivers intelligent multi-cloud routing with 3-state circuit breaking, prevents security vulnerabilities, and automates end-to-end lifecycle management.
 
@@ -87,16 +87,20 @@ BlobKit enforces a strict 3-tier boundary:
                                          v
 +-----------------------------------------------------------------------------------+
 | 3. PROVIDER DRIVER LAYER (Wire Abstraction)                                       |
-|    - AWS SDK v2 Driver (R2, S3, MinIO) with persistent pooled HTTP/2 transport   |
+|    - AWS SDK v2 Driver (AWS S3, Cloudflare R2, MinIO, Wasabi, Backblaze B2)       |
+|    - Native Azure Blob Storage Driver (Block Blobs, SAS, Azurite emulator)        |
+|    - Native Google Cloud Storage Driver (JSON API v1, 256KB Resumable, V4 Sign)   |
+|    - WebDAV Protocol Driver (Nextcloud, ownCloud, TrueNAS, Apache/Nginx)          |
+|    - Google Drive Driver (Personal & Enterprise Shared Drives, appProperties)     |
+|    - Local POSIX Filesystem Driver (Atomic swaps, Sidecar metadata, Edge)         |
+|    - Remote SFTP / SSH Driver (Connection pooling, Remote seeks, Sidecars)        |
 |    - Pure In-Memory Driver for offline unit tests and ephemeral workloads         |
-|    - Error scrubbing (sanitizes internal proxy dials and secret tokens)           |
-|    - Native server-side copy & driver multipart chunking                          |
 +-----------------------------------------------------------------------------------+
                                          |
                                          v
 +-----------------------------------------------------------------------------------+
 | 4. PHYSICAL STORAGE BACKENDS                                                      |
-|    Cloudflare R2  /  AWS S3  /  MinIO  /  Wasabi  /  Backblaze B2  /  GCS (S3 API)|
+|    AWS S3 / R2 / MinIO / Azure Blob / GCS / WebDAV / GDrive / Local NVMe / SFTP   |
 +-----------------------------------------------------------------------------------+
 ```
 
@@ -158,7 +162,19 @@ go get github.com/suhwr/blobkit
 
 ### 1. Multi-Cloud Provider Configurations
 
-BlobKit supports any S3-compatible backend out of the box using persistent HTTP/2 connection pools and bounded memory semaphores.
+BlobKit natively supports 8 production-grade storage engines and declarative fleet management. For in-depth architecture, configuration options, memory bounds, and security practices, refer to the dedicated provider guides:
+
+| Provider | Package | Supported Backends / Protocols | Dedicated Guide |
+| :--- | :--- | :--- | :---: |
+| **AWS S3 & Compatible** | `provider/s3` | AWS S3, Cloudflare R2, MinIO, Wasabi, Backblaze B2 | [Read S3 Guide ↗](docs/providers/s3.md) |
+| **Azure Blob Storage** | `provider/azure` | Native Azure Block Blobs, SAS Presigning, Azurite emulator | [Read Azure Guide ↗](docs/providers/azure.md) |
+| **Google Cloud Storage** | `provider/gcs` | Native GCS JSON API v1, 256KB Resumable, V4 Signed URLs | [Read GCS Guide ↗](docs/providers/gcs.md) |
+| **WebDAV Protocol** | `provider/webdav` | Nextcloud, ownCloud, TrueNAS, Apache/Nginx, Synology/QNAP | [Read WebDAV Guide ↗](docs/providers/webdav.md) |
+| **Google Drive** | `provider/gdrive` | Google Drive v3, Personal & Enterprise Shared Drives | [Read Google Drive Guide ↗](docs/providers/gdrive.md) |
+| **Local POSIX Filesystem**| `provider/fs` | NVMe, SSD, EBS, Edge Storage, Atomic Swaps, Sidecar Meta | [Read FS Guide ↗](docs/providers/fs.md) |
+| **Remote SFTP / SSH** | `provider/sftp` | Remote Linux/Unix Servers, SSH Keys, Connection Pooling | [Read SFTP Guide ↗](docs/providers/sftp.md) |
+| **In-Memory Harness** | `provider/memory` | Pure RAM Ephemeral, Zero-Credential Unit Testing | [Read Memory Guide ↗](docs/providers/memory.md) |
+| **Multi-Cloud Fleet** | `router/fleet` | Declarative JSON/YAML Multi-Cloud Fleet & Topologies | [Read Fleet Guide ↗](docs/providers/fleet.md) |
 
 #### a. Cloudflare R2 (Zero Egress CDN)
 

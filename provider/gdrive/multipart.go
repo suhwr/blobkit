@@ -50,7 +50,8 @@ func (d *Driver) CreateMultipart(ctx context.Context, obj *blobkit.Object, opts 
 		return "", blobkit.ErrInvalidKey
 	}
 
-	session, err := d.initiateResumableSession(ctx, obj.Key, obj.ContentType, opts.Size, "")
+	meta := resolveMetadata(obj, opts)
+	session, err := d.initiateResumableSession(ctx, obj.Key, obj.ContentType, opts.Size, "", meta)
 	if err != nil {
 		return "", err
 	}
@@ -254,7 +255,7 @@ func (d *Driver) ListParts(ctx context.Context, key string, uploadID string) ([]
 }
 
 // initiateResumableSession initiates a Resumable Upload session (POST for create, PATCH for update).
-func (d *Driver) initiateResumableSession(ctx context.Context, key, mimeType string, totalSize int64, existingFileID string) (*multipartSessionState, error) {
+func (d *Driver) initiateResumableSession(ctx context.Context, key, mimeType string, totalSize int64, existingFileID string, meta map[string]string) (*multipartSessionState, error) {
 	var endpoint string
 	var method string
 
@@ -264,11 +265,18 @@ func (d *Driver) initiateResumableSession(ctx context.Context, key, mimeType str
 		params.Set("supportsAllDrives", "true")
 	}
 
+	appProps := map[string]string{
+		"blobkit_key": key,
+	}
+	for k, v := range meta {
+		if k != "blobkit_key" {
+			appProps[k] = v
+		}
+	}
+
 	metadata := map[string]interface{}{
-		"name": path.Base(key),
-		"appProperties": map[string]string{
-			"blobkit_key": key,
-		},
+		"name":          path.Base(key),
+		"appProperties": appProps,
 	}
 
 	if existingFileID != "" {
@@ -329,7 +337,8 @@ func (d *Driver) initiateResumableSession(ctx context.Context, key, mimeType str
 
 // uploadStreamResumable streams an io.Reader of arbitrary size through chunks of MinChunkSize multiples.
 func (d *Driver) uploadStreamResumable(ctx context.Context, obj *blobkit.Object, r io.Reader, opts blobkit.PutOptions, existingFileID string) (*blobkit.Object, error) {
-	session, err := d.initiateResumableSession(ctx, obj.Key, obj.ContentType, opts.Size, existingFileID)
+	meta := resolveMetadata(obj, opts)
+	session, err := d.initiateResumableSession(ctx, obj.Key, obj.ContentType, opts.Size, existingFileID, meta)
 	if err != nil {
 		return nil, err
 	}

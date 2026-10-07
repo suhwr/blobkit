@@ -54,8 +54,21 @@ func (d *Driver) Capabilities() blobkit.Capability {
 		blobkit.CapBatchDelete
 }
 
+func resolveMetadata(obj *blobkit.Object, opts blobkit.PutOptions) map[string]string {
+	if len(opts.Metadata) > 0 {
+		return opts.Metadata
+	}
+	if obj != nil && len(obj.Metadata) > 0 {
+		return obj.Metadata
+	}
+	return nil
+}
+
 // Put writes an object stream atomically to the local filesystem using a temporary file.
 func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts blobkit.PutOptions) (*blobkit.Object, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("put", "", d.cfg.Name, err)
+	}
 	if r == nil {
 		return nil, blobkit.ErrNilReader
 	}
@@ -136,6 +149,7 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 	}
 	stored.Provider = d.cfg.Name
 	stored.Status = blobkit.StateCommitted
+	stored.Metadata = resolveMetadata(obj, opts)
 
 	// Persist sidecar metadata
 	if d.cfg.EnableSidecarMeta {
@@ -158,6 +172,9 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 // Get retrieves an object stream and its metadata from the filesystem.
 // Supports HTTP Byte-Range requests via file seeking.
 func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (*blobkit.ObjectReader, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("get", key, d.cfg.Name, err)
+	}
 	targetPath, err := resolvePath(d.cfg.RootDir, key, d.cfg.StagingDir)
 	if err != nil {
 		return nil, err
@@ -229,6 +246,9 @@ func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (
 
 // Head inspects an object and returns its metadata without reading the body.
 func (d *Driver) Head(ctx context.Context, key string) (*blobkit.Object, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("head", key, d.cfg.Name, err)
+	}
 	targetPath, err := resolvePath(d.cfg.RootDir, key, d.cfg.StagingDir)
 	if err != nil {
 		return nil, err
@@ -299,6 +319,9 @@ func (d *Driver) Head(ctx context.Context, key string) (*blobkit.Object, error) 
 
 // Delete removes an object and its sidecar metadata from the filesystem.
 func (d *Driver) Delete(ctx context.Context, key string) error {
+	if err := ctx.Err(); err != nil {
+		return blobkit.WrapError("delete", key, d.cfg.Name, err)
+	}
 	targetPath, err := resolvePath(d.cfg.RootDir, key, d.cfg.StagingDir)
 	if err != nil {
 		return err
@@ -315,6 +338,9 @@ func (d *Driver) Delete(ctx context.Context, key string) error {
 
 // DeleteBatch removes multiple keys concurrently using a bounded worker pool.
 func (d *Driver) DeleteBatch(ctx context.Context, keys []string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("delete_batch", "", d.cfg.Name, err)
+	}
 	if len(keys) == 0 {
 		return nil, nil
 	}
@@ -372,6 +398,9 @@ func (d *Driver) DeleteBatch(ctx context.Context, keys []string) ([]string, erro
 
 // Copy duplicates an object and its sidecar metadata within the filesystem.
 func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
+	if err := ctx.Err(); err != nil {
+		return blobkit.WrapError("copy", srcKey, d.cfg.Name, err)
+	}
 	srcPath, err := resolvePath(d.cfg.RootDir, srcKey, d.cfg.StagingDir)
 	if err != nil {
 		return err
@@ -437,6 +466,9 @@ func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
 
 // List traverses the filesystem root directory, filtering by prefix and delimiter.
 func (d *Driver) List(ctx context.Context, opts blobkit.ListOptions) (*blobkit.ListResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("list", opts.Prefix, d.cfg.Name, err)
+	}
 	var objects []blobkit.Object
 	var commonPrefixes []string
 	seenPrefixes := make(map[string]bool)

@@ -33,6 +33,10 @@ func mapSFTPError(op, key, driverName string, err error) error {
 		return nil
 	}
 
+	if blobkit.PreserveSentinel(err) {
+		return blobkit.WrapError(op, key, driverName, err)
+	}
+
 	scrubbedMsg := scrubCredentials(err.Error())
 
 	// Object Not Found checks

@@ -25,6 +25,9 @@ const (
 
 	// DefaultUploadAPIBaseURL is the official Google Cloud Storage Resumable Upload API endpoint.
 	DefaultUploadAPIBaseURL = "https://storage.googleapis.com/upload/storage/v1"
+
+	// DefaultMultipartThreshold is the size threshold (16 MiB) at which GCS uploads switch to Resumable Upload protocol.
+	DefaultMultipartThreshold int64 = 16 * 1024 * 1024
 )
 
 // Config specifies configuration parameters for the Google Cloud Storage driver.
@@ -59,6 +62,10 @@ type Config struct {
 	// Must be an exact multiple of 256 KiB (MinChunkSize). Defaults to DefaultChunkSize (8 MiB).
 	ChunkSize int
 
+	// MultipartThreshold is the size threshold in bytes above which the resumable upload protocol is used.
+	// Defaults to DefaultMultipartThreshold (16 MiB).
+	MultipartThreshold int64
+
 	// PublicBaseURL is an optional base URL for public CDN/proxy access (e.g. "https://cdn.example.com").
 	PublicBaseURL string
 
@@ -91,6 +98,10 @@ func (c *Config) Validate() error {
 		c.ChunkSize = DefaultChunkSize
 	} else if c.ChunkSize%MinChunkSize != 0 {
 		return fmt.Errorf("blobkit/gcs: ChunkSize must be an exact multiple of 256 KiB (%d bytes)", MinChunkSize)
+	}
+
+	if c.MultipartThreshold <= 0 {
+		c.MultipartThreshold = DefaultMultipartThreshold
 	}
 
 	if strings.TrimSpace(c.StorageAPIBaseURL) == "" {

@@ -64,13 +64,42 @@ func (d *Driver) Capabilities() blobkit.Capability {
 		blobkit.CapBatchDelete
 }
 
+func resolveMetadata(obj *blobkit.Object, opts blobkit.PutOptions) map[string]string {
+	if len(opts.Metadata) > 0 {
+		return opts.Metadata
+	}
+	if obj != nil && len(obj.Metadata) > 0 {
+		return obj.Metadata
+	}
+	return nil
+}
+
+func validateKey(key string) error {
+	k := strings.TrimSpace(key)
+	if k == "" {
+		return blobkit.ErrInvalidKey
+	}
+	if strings.ContainsRune(k, '\x00') || strings.ContainsRune(k, '\r') {
+		return blobkit.ErrSecurityViolation
+	}
+	for _, seg := range strings.Split(k, "/") {
+		if seg == ".." {
+			return blobkit.ErrSecurityViolation
+		}
+	}
+	return nil
+}
+
 // Put uploads an object stream to the WebDAV server via HTTP PUT.
 func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts blobkit.PutOptions) (*blobkit.Object, error) {
 	if r == nil {
 		return nil, blobkit.ErrNilReader
 	}
-	if obj == nil || strings.TrimSpace(obj.Key) == "" {
+	if obj == nil {
 		return nil, blobkit.ErrInvalidKey
+	}
+	if err := validateKey(obj.Key); err != nil {
+		return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
 	}
 
 	// Ensure parent collections (directories) exist on WebDAV
@@ -138,6 +167,7 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 	stored.Size = size
 	stored.ContentType = contentType
 	stored.ETag = etag
+	stored.Metadata = resolveMetadata(obj, opts)
 	stored.ChecksumSHA256 = shaHex
 	stored.UpdatedAt = now
 	if stored.CreatedAt.IsZero() {
@@ -697,7 +727,8 @@ func (d *Driver) propfindResource(ctx context.Context, key string, depth int) (*
 
 // objectURL constructs the complete URL for a given object key.
 func (d *Driver) objectURL(key string) string {
-	cleanKey := strings.Trim(key, "/")
+	cleanKey := path.Clean("/" + strings.TrimSpace(key))
+	cleanKey = strings.TrimPrefix(cleanKey, "/")
 	parts := strings.Split(cleanKey, "/")
 	escapedParts := make([]string, len(parts))
 	for i, p := range parts {

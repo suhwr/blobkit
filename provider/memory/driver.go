@@ -78,9 +78,47 @@ func (d *Driver) Capabilities() blobkit.Capability {
 		blobkit.CapMultipartSession
 }
 
+func resolveMetadata(obj *blobkit.Object, opts blobkit.PutOptions) map[string]string {
+	if len(opts.Metadata) > 0 {
+		return opts.Metadata
+	}
+	if obj != nil && len(obj.Metadata) > 0 {
+		return obj.Metadata
+	}
+	return nil
+}
+
+func validateKey(key string) error {
+	k := strings.TrimSpace(key)
+	if k == "" {
+		return blobkit.ErrInvalidKey
+	}
+	if strings.ContainsRune(k, '\x00') || strings.ContainsRune(k, '\r') {
+		return blobkit.ErrSecurityViolation
+	}
+	if strings.HasPrefix(k, "/") || strings.HasPrefix(k, "\\") {
+		return blobkit.ErrSecurityViolation
+	}
+	for _, seg := range strings.Split(k, "/") {
+		if seg == ".." {
+			return blobkit.ErrSecurityViolation
+		}
+	}
+	return nil
+}
+
 func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts blobkit.PutOptions) (*blobkit.Object, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("put", "", d.name, err)
+	}
 	if r == nil {
 		return nil, blobkit.ErrNilReader
+	}
+	if obj == nil {
+		return nil, blobkit.ErrInvalidKey
+	}
+	if err := validateKey(obj.Key); err != nil {
+		return nil, blobkit.WrapError("put", obj.Key, d.name, err)
 	}
 
 	data, err := io.ReadAll(r)
@@ -97,6 +135,7 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 	stored.Bucket = d.bucket
 	stored.Size = int64(len(data))
 	stored.ETag = etag
+	stored.Metadata = resolveMetadata(obj, opts)
 	stored.ChecksumSHA256 = hashHex
 	stored.UpdatedAt = now
 	if stored.CreatedAt.IsZero() {
@@ -116,6 +155,13 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 }
 
 func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (*blobkit.ObjectReader, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("get", key, d.name, err)
+	}
+	if err := validateKey(key); err != nil {
+		return nil, blobkit.WrapError("get", key, d.name, err)
+	}
+
 	d.mu.RLock()
 	item, ok := d.items[key]
 	d.mu.RUnlock()
@@ -142,6 +188,13 @@ func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (
 }
 
 func (d *Driver) Head(ctx context.Context, key string) (*blobkit.Object, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("head", key, d.name, err)
+	}
+	if err := validateKey(key); err != nil {
+		return nil, blobkit.WrapError("head", key, d.name, err)
+	}
+
 	d.mu.RLock()
 	item, ok := d.items[key]
 	d.mu.RUnlock()
@@ -155,6 +208,13 @@ func (d *Driver) Head(ctx context.Context, key string) (*blobkit.Object, error) 
 }
 
 func (d *Driver) Delete(ctx context.Context, key string) error {
+	if err := ctx.Err(); err != nil {
+		return blobkit.WrapError("delete", key, d.name, err)
+	}
+	if err := validateKey(key); err != nil {
+		return blobkit.WrapError("delete", key, d.name, err)
+	}
+
 	d.mu.Lock()
 	delete(d.items, key)
 	d.mu.Unlock()
@@ -162,11 +222,18 @@ func (d *Driver) Delete(ctx context.Context, key string) error {
 }
 
 func (d *Driver) DeleteBatch(ctx context.Context, keys []string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("delete_batch", "", d.name, err)
+	}
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	deleted := make([]string, 0, len(keys))
 	for _, k := range keys {
+		if err := validateKey(k); err != nil {
+			continue
+		}
 		if _, ok := d.items[k]; ok {
 			delete(d.items, k)
 			deleted = append(deleted, k)
@@ -176,6 +243,10 @@ func (d *Driver) DeleteBatch(ctx context.Context, keys []string) ([]string, erro
 }
 
 func (d *Driver) List(ctx context.Context, opts blobkit.ListOptions) (*blobkit.ListResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("list", opts.Prefix, d.name, err)
+	}
+
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
@@ -222,6 +293,13 @@ func (d *Driver) List(ctx context.Context, opts blobkit.ListOptions) (*blobkit.L
 }
 
 func (d *Driver) PresignGet(ctx context.Context, key string, opts blobkit.PresignOptions) (*blobkit.PresignedURL, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("presign_get", key, d.name, err)
+	}
+	if err := validateKey(key); err != nil {
+		return nil, blobkit.WrapError("presign_get", key, d.name, err)
+	}
+
 	d.mu.RLock()
 	_, ok := d.items[key]
 	d.mu.RUnlock()
@@ -245,6 +323,13 @@ func (d *Driver) PresignGet(ctx context.Context, key string, opts blobkit.Presig
 }
 
 func (d *Driver) PresignPut(ctx context.Context, key string, opts blobkit.PresignOptions) (*blobkit.PresignedURL, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("presign_put", key, d.name, err)
+	}
+	if err := validateKey(key); err != nil {
+		return nil, blobkit.WrapError("presign_put", key, d.name, err)
+	}
+
 	expiry := opts.Expiry
 	if expiry <= 0 {
 		expiry = blobkit.DefaultPresignExpiry
@@ -260,6 +345,9 @@ func (d *Driver) PresignPut(ctx context.Context, key string, opts blobkit.Presig
 }
 
 func (d *Driver) ResolveURL(key string) (string, error) {
+	if err := validateKey(key); err != nil {
+		return "", blobkit.WrapError("resolve_url", key, d.name, err)
+	}
 	if d.publicBaseURL != "" {
 		return fmt.Sprintf("%s/%s", d.publicBaseURL, strings.TrimLeft(key, "/")), nil
 	}
@@ -267,6 +355,16 @@ func (d *Driver) ResolveURL(key string) (string, error) {
 }
 
 func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
+	if err := ctx.Err(); err != nil {
+		return blobkit.WrapError("copy", srcKey, d.name, err)
+	}
+	if err := validateKey(srcKey); err != nil {
+		return blobkit.WrapError("copy", srcKey, d.name, err)
+	}
+	if err := validateKey(dstKey); err != nil {
+		return blobkit.WrapError("copy", dstKey, d.name, err)
+	}
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -291,6 +389,16 @@ func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
 }
 
 func (d *Driver) CreateMultipart(ctx context.Context, obj *blobkit.Object, opts blobkit.PutOptions) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", blobkit.WrapError("create_multipart", "", d.name, err)
+	}
+	if obj == nil {
+		return "", blobkit.ErrInvalidKey
+	}
+	if err := validateKey(obj.Key); err != nil {
+		return "", blobkit.WrapError("create_multipart", obj.Key, d.name, err)
+	}
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -305,6 +413,13 @@ func (d *Driver) CreateMultipart(ctx context.Context, obj *blobkit.Object, opts 
 }
 
 func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, partNumber int32, r io.Reader, size int64) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", blobkit.WrapError("upload_part", key, d.name, err)
+	}
+	if err := validateKey(key); err != nil {
+		return "", blobkit.WrapError("upload_part", key, d.name, err)
+	}
+
 	data, err := io.ReadAll(r)
 	if err != nil {
 		return "", blobkit.WrapError("upload_part", key, d.name, err)
@@ -325,6 +440,16 @@ func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, pa
 }
 
 func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, uploadID string, parts []blobkit.CompletedPart) (*blobkit.Object, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("complete_multipart", "", d.name, err)
+	}
+	if obj == nil {
+		return nil, blobkit.ErrInvalidKey
+	}
+	if err := validateKey(obj.Key); err != nil {
+		return nil, blobkit.WrapError("complete_multipart", obj.Key, d.name, err)
+	}
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -374,6 +499,13 @@ func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, upl
 }
 
 func (d *Driver) AbortMultipart(ctx context.Context, key string, uploadID string) error {
+	if err := ctx.Err(); err != nil {
+		return blobkit.WrapError("abort_multipart", key, d.name, err)
+	}
+	if err := validateKey(key); err != nil {
+		return blobkit.WrapError("abort_multipart", key, d.name, err)
+	}
+
 	d.mu.Lock()
 	delete(d.sessions, uploadID)
 	d.mu.Unlock()
@@ -381,6 +513,13 @@ func (d *Driver) AbortMultipart(ctx context.Context, key string, uploadID string
 }
 
 func (d *Driver) ListParts(ctx context.Context, key string, uploadID string) ([]blobkit.CompletedPart, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("list_parts", key, d.name, err)
+	}
+	if err := validateKey(key); err != nil {
+		return nil, blobkit.WrapError("list_parts", key, d.name, err)
+	}
+
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 

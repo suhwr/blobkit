@@ -1,6 +1,7 @@
 package blobkit
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"regexp"
@@ -10,6 +11,9 @@ import (
 var (
 	// ErrObjectNotFound indicates that the requested object does not exist in storage.
 	ErrObjectNotFound = errors.New("blobkit: object not found")
+
+	// ErrNotFound is an alias for ErrObjectNotFound for ergonomic parity.
+	ErrNotFound = ErrObjectNotFound
 
 	// ErrBucketNotFound indicates that the target bucket does not exist.
 	ErrBucketNotFound = errors.New("blobkit: bucket not found")
@@ -72,6 +76,9 @@ var (
 // Regex patterns to scrub sensitive data from error messages (tokens, credentials, internal IP/proxy addresses).
 var (
 	reSecretToken = regexp.MustCompile(`(?i)(token|key|secret|password|sig|signature)=([a-zA-Z0-9_\-\.%]+)`)
+	reBearerAuth  = regexp.MustCompile(`(?i)(Bearer\s+)[A-Za-z0-9\-\._~+/]+=*`)
+	reBasicAuth   = regexp.MustCompile(`(?i)(Basic\s+)[A-Za-z0-9+/=]+`)
+	rePrivateKey  = regexp.MustCompile(`(?s)-----BEGIN[^\-]+PRIVATE KEY-----.*?-----END[^\-]+PRIVATE KEY-----`)
 	reProxyDial   = regexp.MustCompile(`proxyconnect tcp: dial tcp [0-9\.:]+: `)
 	reInternalIP  = regexp.MustCompile(`(dial tcp (?:127\.0\.0\.1|10\.\d+\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+):\d+)`)
 )
@@ -137,15 +144,47 @@ func WrapError(op, key, provider string, err error) error {
 	}
 }
 
-// SanitizeErrorMessage strips internal proxy dials, local IPs, and signed URL tokens
-// from error strings so they are safe for client logging and user-facing error reporting.
+// PreserveSentinel reports whether err matches a domain sentinel or standard context cancellation error
+// that should be preserved as-is without being wrapped into a generic errors.New().
+func PreserveSentinel(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, ErrObjectNotFound) ||
+		errors.Is(err, ErrBucketNotFound) ||
+		errors.Is(err, ErrInvalidKey) ||
+		errors.Is(err, ErrInvalidID) ||
+		errors.Is(err, ErrPreconditionFailed) ||
+		errors.Is(err, ErrProviderUnavailable) ||
+		errors.Is(err, ErrQuotaExceeded) ||
+		errors.Is(err, ErrUploadTooLarge) ||
+		errors.Is(err, ErrUnsupportedOperation) ||
+		errors.Is(err, ErrMemoryBudgetExceeded) ||
+		errors.Is(err, ErrNilReader) ||
+		errors.Is(err, ErrSecurityViolation) ||
+		errors.Is(err, ErrMIMEMismatch) ||
+		errors.Is(err, ErrInvalidFilename) ||
+		errors.Is(err, ErrChecksumMismatch) ||
+		errors.Is(err, ErrSizeMismatch) ||
+		errors.Is(err, ErrObjectLocked) ||
+		errors.Is(err, ErrSessionNotFound) ||
+		errors.Is(err, ErrSessionExpired)
+}
+
+// SanitizeErrorMessage strips internal proxy dials, local IPs, authorization headers, private keys,
+// and secret tokens from error strings so they are safe for client logging and user-facing error reporting.
 func SanitizeErrorMessage(raw string) string {
 	if raw == "" {
 		return ""
 	}
 	sanitized := reProxyDial.ReplaceAllString(raw, "")
 	sanitized = reInternalIP.ReplaceAllString(sanitized, "dial tcp [scrubbed]")
-	sanitized = reSecretToken.ReplaceAllLiteralString(sanitized, "$1=[redacted]")
+	sanitized = reBearerAuth.ReplaceAllString(sanitized, "$1[redacted]")
+	sanitized = reBasicAuth.ReplaceAllString(sanitized, "$1[redacted]")
+	sanitized = rePrivateKey.ReplaceAllString(sanitized, "[redacted private key]")
+	sanitized = reSecretToken.ReplaceAllString(sanitized, "$1=[redacted]")
 	return sanitized
 }
 

@@ -8,9 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"mime/multipart"
 	"net/http"
-	"net/textproto"
 	"net/url"
 	"strconv"
 	"strings"
@@ -66,13 +64,42 @@ func (d *Driver) Capabilities() blobkit.Capability {
 	return caps
 }
 
+func resolveMetadata(obj *blobkit.Object, opts blobkit.PutOptions) map[string]string {
+	if len(opts.Metadata) > 0 {
+		return opts.Metadata
+	}
+	if obj != nil && len(obj.Metadata) > 0 {
+		return obj.Metadata
+	}
+	return nil
+}
+
+func validateKey(key string) error {
+	k := strings.TrimSpace(key)
+	if k == "" {
+		return blobkit.ErrInvalidKey
+	}
+	if strings.ContainsRune(k, '\x00') || strings.ContainsRune(k, '\r') {
+		return blobkit.ErrSecurityViolation
+	}
+	for _, seg := range strings.Split(k, "/") {
+		if seg == ".." {
+			return blobkit.ErrSecurityViolation
+		}
+	}
+	return nil
+}
+
 // Put uploads an object stream directly to Google Cloud Storage.
 func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts blobkit.PutOptions) (*blobkit.Object, error) {
 	if r == nil {
 		return nil, blobkit.ErrNilReader
 	}
-	if obj == nil || obj.Key == "" {
+	if obj == nil {
 		return nil, blobkit.ErrInvalidKey
+	}
+	if err := validateKey(obj.Key); err != nil {
+		return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
 	}
 
 	cleanKey := obj.Key
@@ -80,73 +107,31 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
+	meta := resolveMetadata(obj, opts)
 
-	// Buffer body and compute SHA-256 for integrity verification
+	// If size is unknown (streaming), exceeds MultipartThreshold, or has custom metadata,
+	// use GCS Resumable Upload protocol to keep memory bounded to ChunkSize.
+	if opts.Size <= 0 || opts.Size > d.cfg.MultipartThreshold || len(meta) > 0 {
+		return d.uploadStreamResumable(ctx, obj, r, contentType, meta, opts)
+	}
+
+	// Single-shot direct streaming upload without full in-memory buffering
+	endpoint := fmt.Sprintf("%s/b/%s/o?uploadType=media&name=%s",
+		d.cfg.UploadAPIBaseURL,
+		url.PathEscape(d.cfg.Bucket),
+		url.QueryEscape(cleanKey),
+	)
+
 	h := sha256.New()
-	buf := new(bytes.Buffer)
-	tee := io.TeeReader(r, h)
-	if _, err := io.Copy(buf, tee); err != nil {
+	var bodyReader io.Reader = io.LimitReader(r, opts.Size)
+	tee := io.TeeReader(bodyReader, h)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, tee)
+	if err != nil {
 		return nil, blobkit.WrapError("put", cleanKey, d.cfg.Name, err)
 	}
-	shaHex := hex.EncodeToString(h.Sum(nil))
-
-	var req *http.Request
-	var err error
-
-	// If custom metadata is supplied, perform uploadType=multipart (multipart/related)
-	if len(opts.Metadata) > 0 {
-		var mpBuf bytes.Buffer
-		mw := multipart.NewWriter(&mpBuf)
-
-		// Part 1: JSON metadata
-		part1Headers := make(textproto.MIMEHeader)
-		part1Headers.Set("Content-Type", "application/json; charset=UTF-8")
-		p1, err := mw.CreatePart(part1Headers)
-		if err != nil {
-			return nil, blobkit.WrapError("put", cleanKey, d.cfg.Name, err)
-		}
-		metaJSON, _ := json.Marshal(map[string]interface{}{
-			"name":        cleanKey,
-			"contentType": contentType,
-			"metadata":    opts.Metadata,
-		})
-		_, _ = p1.Write(metaJSON)
-
-		// Part 2: Media data
-		part2Headers := make(textproto.MIMEHeader)
-		part2Headers.Set("Content-Type", contentType)
-		p2, err := mw.CreatePart(part2Headers)
-		if err != nil {
-			return nil, blobkit.WrapError("put", cleanKey, d.cfg.Name, err)
-		}
-		_, _ = p2.Write(buf.Bytes())
-		_ = mw.Close()
-
-		endpoint := fmt.Sprintf("%s/b/%s/o?uploadType=multipart",
-			d.cfg.UploadAPIBaseURL,
-			url.PathEscape(d.cfg.Bucket),
-		)
-
-		req, err = http.NewRequestWithContext(ctx, http.MethodPost, endpoint, &mpBuf)
-		if err != nil {
-			return nil, blobkit.WrapError("put", cleanKey, d.cfg.Name, err)
-		}
-		req.Header.Set("Content-Type", fmt.Sprintf("multipart/related; boundary=%s", mw.Boundary()))
-	} else {
-		// Single-shot uploadType=media
-		endpoint := fmt.Sprintf("%s/b/%s/o?uploadType=media&name=%s",
-			d.cfg.UploadAPIBaseURL,
-			url.PathEscape(d.cfg.Bucket),
-			url.QueryEscape(cleanKey),
-		)
-
-		req, err = http.NewRequestWithContext(ctx, http.MethodPost, endpoint, buf)
-		if err != nil {
-			return nil, blobkit.WrapError("put", cleanKey, d.cfg.Name, err)
-		}
-		req.Header.Set("Content-Type", contentType)
-		req.Header.Set("Content-Length", strconv.Itoa(buf.Len()))
-	}
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Content-Length", strconv.FormatInt(opts.Size, 10))
 
 	if err := d.authorizeRequest(ctx, req); err != nil {
 		return nil, err
@@ -170,11 +155,77 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 	}
 
 	result := d.mapObjectResource(cleanKey, &res)
-	result.ChecksumSHA256 = shaHex
+	result.ChecksumSHA256 = hex.EncodeToString(h.Sum(nil))
+	result.Metadata = meta
 	result.Provider = d.cfg.Name
 	result.Status = blobkit.StateCommitted
 
 	return result, nil
+}
+
+// uploadStreamResumable streams an io.Reader into GCS via Resumable Upload protocol in chunks of ChunkSize.
+func (d *Driver) uploadStreamResumable(ctx context.Context, obj *blobkit.Object, r io.Reader, contentType string, meta map[string]string, opts blobkit.PutOptions) (*blobkit.Object, error) {
+	targetObj := *obj
+	targetObj.ContentType = contentType
+	targetObj.Metadata = meta
+
+	putOpts := opts
+	putOpts.Metadata = meta
+
+	uploadID, err := d.CreateMultipart(ctx, &targetObj, putOpts)
+	if err != nil {
+		return nil, err
+	}
+
+	chunkSize := d.cfg.ChunkSize
+	buf := make([]byte, chunkSize)
+	var parts []blobkit.CompletedPart
+	var partNum int32 = 1
+
+	hSHA := sha256.New()
+
+	for {
+		if err := ctx.Err(); err != nil {
+			_ = d.AbortMultipart(context.Background(), obj.Key, uploadID)
+			return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
+		}
+
+		n, readErr := io.ReadFull(r, buf)
+		if n > 0 {
+			chunk := buf[:n]
+			hSHA.Write(chunk)
+			etag, partErr := d.UploadPart(ctx, obj.Key, uploadID, partNum, bytes.NewReader(chunk), int64(n))
+			if partErr != nil {
+				_ = d.AbortMultipart(context.Background(), obj.Key, uploadID)
+				return nil, partErr
+			}
+
+			parts = append(parts, blobkit.CompletedPart{
+				PartNumber: partNum,
+				ETag:       etag,
+				Size:       int64(n),
+			})
+			partNum++
+		}
+
+		if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
+			break
+		}
+		if readErr != nil {
+			_ = d.AbortMultipart(context.Background(), obj.Key, uploadID)
+			return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, readErr)
+		}
+	}
+
+	res, err := d.CompleteMultipart(ctx, &targetObj, uploadID, parts)
+	if err != nil {
+		_ = d.AbortMultipart(context.Background(), obj.Key, uploadID)
+		return nil, err
+	}
+
+	res.ChecksumSHA256 = hex.EncodeToString(hSHA.Sum(nil))
+	res.Metadata = meta
+	return res, nil
 }
 
 // Get retrieves an object stream and its metadata from Google Cloud Storage.

@@ -31,6 +31,9 @@ type fsMultipartSession struct {
 
 // CreateMultipart initiates a chunked multipart upload session on local disk.
 func (d *Driver) CreateMultipart(ctx context.Context, obj *blobkit.Object, opts blobkit.PutOptions) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", blobkit.WrapError("create_multipart", "", d.cfg.Name, err)
+	}
 	if obj == nil || strings.TrimSpace(obj.Key) == "" {
 		return "", blobkit.ErrInvalidKey
 	}
@@ -70,6 +73,9 @@ func (d *Driver) CreateMultipart(ctx context.Context, obj *blobkit.Object, opts 
 
 // UploadPart writes an individual chunk to the staging directory and calculates its ETag.
 func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, partNumber int32, r io.Reader, size int64) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, err)
+	}
 	if r == nil {
 		return "", blobkit.ErrNilReader
 	}
@@ -82,7 +88,7 @@ func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, pa
 	d.sessionsMu.RUnlock()
 
 	if !found {
-		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, blobkit.ErrInvalidID)
+		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, blobkit.ErrSessionNotFound)
 	}
 
 	session.mu.Lock()
@@ -114,6 +120,9 @@ func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, pa
 
 // CompleteMultipart concatenates staged chunks sequentially into the final file atomically.
 func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, uploadID string, parts []blobkit.CompletedPart) (*blobkit.Object, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("complete_multipart", "", d.cfg.Name, err)
+	}
 	d.sessionsMu.Lock()
 	session, found := d.sessions[uploadID]
 	if found {
@@ -122,7 +131,7 @@ func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, upl
 	d.sessionsMu.Unlock()
 
 	if !found {
-		return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, blobkit.ErrInvalidID)
+		return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, blobkit.ErrSessionNotFound)
 	}
 
 	session.mu.Lock()
@@ -229,6 +238,9 @@ func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, upl
 
 // AbortMultipart removes all staged chunks and cancels the session.
 func (d *Driver) AbortMultipart(ctx context.Context, key string, uploadID string) error {
+	if err := ctx.Err(); err != nil {
+		return blobkit.WrapError("abort_multipart", key, d.cfg.Name, err)
+	}
 	d.sessionsMu.Lock()
 	session, found := d.sessions[uploadID]
 	if found {
@@ -252,6 +264,9 @@ func (d *Driver) AbortMultipart(ctx context.Context, key string, uploadID string
 
 // ListParts returns the list of parts currently present in the staging directory.
 func (d *Driver) ListParts(ctx context.Context, key string, uploadID string) ([]blobkit.CompletedPart, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("list_parts", key, d.cfg.Name, err)
+	}
 	d.sessionsMu.RLock()
 	session, found := d.sessions[uploadID]
 	d.sessionsMu.RUnlock()
@@ -266,7 +281,7 @@ func (d *Driver) ListParts(ctx context.Context, key string, uploadID string) ([]
 	entries, err := os.ReadDir(stagingPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, blobkit.WrapError("list_parts", key, d.cfg.Name, blobkit.ErrInvalidID)
+			return nil, blobkit.WrapError("list_parts", key, d.cfg.Name, blobkit.ErrSessionNotFound)
 		}
 		return nil, blobkit.WrapError("list_parts", key, d.cfg.Name, err)
 	}

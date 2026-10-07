@@ -122,6 +122,7 @@ func (d *Driver) uploadMultipart(ctx context.Context, obj *blobkit.Object, r io.
 	var partNum int32 = 1
 
 	// Stream reading loop
+uploadLoop:
 	for {
 		if ctx.Err() != nil {
 			collectErr = ctx.Err()
@@ -156,7 +157,7 @@ func (d *Driver) uploadMultipart(ctx context.Context, obj *blobkit.Object, r io.
 				d.putChunkBuffer(bufPtr)
 				d.cfg.GlobalMemoryLimiter.Release(int64(n))
 				collectErr = ctx.Err()
-				break
+				break uploadLoop
 			}
 		} else {
 			// No bytes read, return buffer and release full budget

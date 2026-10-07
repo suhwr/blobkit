@@ -24,13 +24,7 @@ func scrubCredentials(msg string) string {
 // wrapHTTPError translates WebDAV HTTP response status codes into BlobKit domain sentinel errors.
 func wrapHTTPError(op, key, driverName string, statusCode int, rawErr error) error {
 	if statusCode == 0 && rawErr != nil {
-		if errors.Is(rawErr, blobkit.ErrObjectNotFound) ||
-			errors.Is(rawErr, blobkit.ErrBucketNotFound) ||
-			errors.Is(rawErr, blobkit.ErrQuotaExceeded) ||
-			errors.Is(rawErr, blobkit.ErrProviderUnavailable) ||
-			errors.Is(rawErr, blobkit.ErrPreconditionFailed) ||
-			errors.Is(rawErr, blobkit.ErrUnsupportedOperation) ||
-			errors.Is(rawErr, blobkit.ErrSecurityViolation) {
+		if blobkit.PreserveSentinel(rawErr) {
 			return blobkit.WrapError(op, key, driverName, rawErr)
 		}
 		return blobkit.WrapError(op, key, driverName, errors.New(scrubCredentials(rawErr.Error())))

@@ -804,3 +804,64 @@ func TestDriver_IntegrationWithBlobKitClient(t *testing.T) {
 		t.Fatalf("expected ErrObjectNotFound, got: %v", err)
 	}
 }
+
+func TestDriver_StreamingPut_AutoChunking_And_Security(t *testing.T) {
+	mock := newMockAzureServer("blobs")
+	server := httptest.NewServer(mock)
+	defer server.Close()
+	ctx := context.Background()
+
+	mockKey := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte("A"), 32))
+	cfg := azure.Config{
+		Name:               "azure-test",
+		AccountName:        "mockstorageaccount",
+		AccountKey:         mockKey,
+		Container:          "blobs",
+		CustomEndpoint:     server.URL,
+		MultipartThreshold: 256,
+		PartSize:           128,
+		HTTPClient:         server.Client(),
+	}
+	driver, err := azure.NewDriver(cfg)
+	if err != nil {
+		t.Fatalf("failed to create driver: %v", err)
+	}
+
+	payload := bytes.Repeat([]byte("multipart-chunk-data-"), 50) // ~1050 bytes > 256
+	key := "autochunk/test.bin"
+
+	putObj, err := driver.Put(ctx, &blobkit.Object{Key: key}, bytes.NewReader(payload), blobkit.PutOptions{
+		Size:     int64(len(payload)),
+		Metadata: map[string]string{"uploader": "chunk-bot"},
+	})
+	if err != nil {
+		t.Fatalf("Put with autochunk failed: %v", err)
+	}
+
+	if putObj.Size != int64(len(payload)) {
+		t.Fatalf("expected size %d, got %d", len(payload), putObj.Size)
+	}
+	if putObj.Metadata["uploader"] != "chunk-bot" {
+		t.Fatalf("expected uploader metadata chunk-bot, got: %v", putObj.Metadata)
+	}
+
+	// Verify download matches
+	reader, err := driver.Get(ctx, key, blobkit.GetOptions{})
+	if err != nil {
+		t.Fatalf("Get autochunk blob failed: %v", err)
+	}
+	readBytes, err := io.ReadAll(reader.Body)
+	reader.Body.Close()
+	if err != nil {
+		t.Fatalf("ReadAll failed: %v", err)
+	}
+	if !bytes.Equal(readBytes, payload) {
+		t.Fatal("autochunk content mismatch")
+	}
+
+	// Path traversal attack rejection
+	_, err = driver.Put(ctx, &blobkit.Object{Key: "../../etc/passwd"}, strings.NewReader("bad"), blobkit.PutOptions{})
+	if !errors.Is(err, blobkit.ErrSecurityViolation) {
+		t.Fatalf("expected ErrSecurityViolation for traversal, got: %v", err)
+	}
+}

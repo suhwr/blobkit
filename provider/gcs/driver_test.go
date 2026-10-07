@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -1116,3 +1117,53 @@ func TestDriver_IntegrationWithBlobKitClient(t *testing.T) {
 		t.Fatalf("expected ErrObjectNotFound, got: %v", err)
 	}
 }
+
+func TestDriver_StreamingPut_AutoResumable_And_Security(t *testing.T) {
+	mock := newMockGCSServer("test-bucket")
+	driver, server := setupTestDriver(t, mock)
+	defer server.Close()
+	ctx := context.Background()
+
+	// Configure tiny threshold so upload switches to resumable upload protocol
+	driver.cfg.MultipartThreshold = 256 * 1024 // 256 KiB
+	driver.cfg.ChunkSize = 256 * 1024          // 256 KiB (MinChunkSize)
+
+	payload := bytes.Repeat([]byte("gcs-resumable-chunk-data-"), 20000) // ~500 KiB > 256 KiB
+	key := "autoresumable/sample.dat"
+
+	putObj, err := driver.Put(ctx, &blobkit.Object{Key: key}, bytes.NewReader(payload), blobkit.PutOptions{
+		Size:     int64(len(payload)),
+		Metadata: map[string]string{"env": "prod", "tier": "gold"},
+	})
+	if err != nil {
+		t.Fatalf("Put with autoresumable failed: %v", err)
+	}
+
+	if putObj.Size != int64(len(payload)) {
+		t.Fatalf("expected size %d, got %d", len(payload), putObj.Size)
+	}
+	if putObj.Metadata["tier"] != "gold" {
+		t.Fatalf("expected gold tier metadata, got: %v", putObj.Metadata)
+	}
+
+	// Verify download matches
+	reader, err := driver.Get(ctx, key, blobkit.GetOptions{})
+	if err != nil {
+		t.Fatalf("Get autoresumable blob failed: %v", err)
+	}
+	readBytes, err := io.ReadAll(reader.Body)
+	reader.Body.Close()
+	if err != nil {
+		t.Fatalf("ReadAll failed: %v", err)
+	}
+	if !bytes.Equal(readBytes, payload) {
+		t.Fatal("autoresumable content mismatch")
+	}
+
+	// Path traversal rejection
+	_, err = driver.Put(ctx, &blobkit.Object{Key: "../../../etc/shadow"}, strings.NewReader("bad"), blobkit.PutOptions{})
+	if !errors.Is(err, blobkit.ErrSecurityViolation) {
+		t.Fatalf("expected ErrSecurityViolation for path traversal, got: %v", err)
+	}
+}
+
