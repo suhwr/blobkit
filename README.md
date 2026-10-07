@@ -25,6 +25,7 @@ BlobKit is intentionally designed as an **infrastructure orchestration layer**, 
     - [In-Memory Driver (Offline Testing & CI/CD)](#d-in-memory-driver-offline-testing--cicd)
     - [Google Drive Driver (Cloud & Shared Drives)](#e-google-drive-driver-cloud--shared-drives)
     - [Local POSIX Filesystem Driver (Zero Cost & Edge Storage)](#f-local-posix-filesystem-driver-zero-cost--edge-storage)
+    - [WebDAV Protocol Driver (Nextcloud, ownCloud, TrueNAS, NAS)](#g-webdav-protocol-driver-nextcloud-owncloud-truenas-nas)
   - [2. Advanced Multi-Provider Routing](#2-advanced-multi-provider-routing)
     - [Namespace Tiered Routing](#a-namespace-tiered-routing)
     - [Active-Passive Failover](#b-active-passive-failover)
@@ -256,6 +257,22 @@ fsDriver, err := fs.NewDriver(fs.Config{
     FileMode:          0644,
     EnableSidecarMeta: true,                            // Atomically persist .meta.json sidecars
     StagingDir:        ".staging",                      // Chunk staging directory for multipart
+})
+```
+
+#### g. WebDAV Protocol Driver (Nextcloud, ownCloud, TrueNAS, NAS)
+
+Native RFC 4918 implementation connecting BlobKit to self-hosted cloud platforms (**Nextcloud**, **ownCloud**), **TrueNAS (ZFS pools)**, Apache/Nginx WebDAV, and private NAS appliances with streaming PUT/GET, byte-range seeks, and automatic `MKCOL` collection provisioning:
+
+```go
+import "github.com/suhwr/blobkit/provider/webdav"
+
+webdavDriver, err := webdav.NewDriver(webdav.Config{
+    Name:          "nextcloud-primary",
+    Endpoint:      "https://cloud.example.com/remote.php/dav/files/admin",
+    Username:      "admin",
+    Password:      "app-password-or-token",
+    PublicBaseURL: "https://cloud.example.com/s", // Optional public link prefix
 })
 ```
 
