@@ -26,6 +26,7 @@ BlobKit is intentionally designed as an **infrastructure orchestration layer**, 
     - [Google Drive Driver (Cloud & Shared Drives)](#e-google-drive-driver-cloud--shared-drives)
     - [Local POSIX Filesystem Driver (Zero Cost & Edge Storage)](#f-local-posix-filesystem-driver-zero-cost--edge-storage)
     - [WebDAV Protocol Driver (Nextcloud, ownCloud, TrueNAS, NAS)](#g-webdav-protocol-driver-nextcloud-owncloud-truenas-nas)
+    - [Azure Blob Storage Driver (Native Block Blobs & SAS Presigning)](#h-azure-blob-storage-driver-native-block-blobs--sas-presigning)
   - [2. Advanced Multi-Provider Routing](#2-advanced-multi-provider-routing)
     - [Namespace Tiered Routing](#a-namespace-tiered-routing)
     - [Active-Passive Failover](#b-active-passive-failover)
@@ -273,6 +274,24 @@ webdavDriver, err := webdav.NewDriver(webdav.Config{
     Username:      "admin",
     Password:      "app-password-or-token",
     PublicBaseURL: "https://cloud.example.com/s", // Optional public link prefix
+})
+```
+
+#### h. Azure Blob Storage Driver (Native Block Blobs & SAS Presigning)
+
+Native Azure Blob Storage driver adhering to BlobKit's pure object storage abstraction. Supports Block Blob uploads, server-side block staging (`comp=block`) and commits (`comp=blocklist`), SharedKey HMAC-SHA256 authentication, Service SAS token generation for presigned URLs, byte-range streaming, server-side synchronous copy, batch deletes, and credential scrubbing:
+
+```go
+import "github.com/suhwr/blobkit/provider/azure"
+
+azureDriver, err := azure.NewDriver(azure.Config{
+    Name:           "azure-primary",
+    AccountName:    "mystorageaccount",
+    AccountKey:     "base64-encoded-storage-key",
+    ContainerName:  "my-container",
+    // Optional: custom endpoint for Azurite emulator or sovereign clouds
+    // CustomEndpoint: "http://127.0.0.1:10000/mystorageaccount",
+    PublicBaseURL:  "https://cdn.example.com", // Optional public CDN prefix
 })
 ```
 
