@@ -1922,3 +1922,16 @@ func (c *Client) Bucket(ctx context.Context, providerName string) (*Bucket, erro
 	}
 	return NewBucket(drv)
 }
+
+// OpenSeeker returns an io.ReadSeekCloser and io.ReaderAt over the specified target (ObjectID or Key).
+func (c *Client) OpenSeeker(ctx context.Context, target string) (*SeekableReader, error) {
+	key, providerName, err := c.resolveTarget(ctx, target)
+	if err != nil {
+		return nil, err
+	}
+	bucket, err := c.Bucket(ctx, providerName)
+	if err != nil {
+		return nil, err
+	}
+	return bucket.OpenSeeker(ctx, key)
+}
