@@ -1909,3 +1909,16 @@ func (c *Client) findStaleSessions(ctx context.Context, before time.Time, limit 
 	}
 	return stale, nil
 }
+
+// Bucket returns a low-level Bucket bound to the specified provider name,
+// or the default driver resolved by the router if providerName is empty.
+func (c *Client) Bucket(ctx context.Context, providerName string) (*Bucket, error) {
+	drv, err := c.router.Select(ctx, RouteContext{
+		Op:             OpPut,
+		ForcedProvider: providerName,
+	})
+	if err != nil {
+		return nil, WrapError("bucket", "", providerName, err)
+	}
+	return NewBucket(drv)
+}

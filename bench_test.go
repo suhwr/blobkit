@@ -222,3 +222,56 @@ func BenchmarkCircuitBreaker_Select(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkBucket_Put(b *testing.B) {
+	ctx := context.Background()
+	memDriver := memory.NewDriver(memory.Config{Bucket: "bench"})
+	bucket, err := blobkit.NewBucket(memDriver)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer bucket.Close()
+
+	payload := []byte("Benchmark payload 1KB data block lorem ipsum dolor sit amet")
+	opts := blobkit.PutOptions{
+		ContentType: "text/plain",
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_, err := bucket.Put(ctx, "bench/test.txt", bytes.NewReader(payload), opts)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkBucket_Get(b *testing.B) {
+	ctx := context.Background()
+	memDriver := memory.NewDriver(memory.Config{Bucket: "bench"})
+	bucket, err := blobkit.NewBucket(memDriver)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer bucket.Close()
+
+	payload := []byte("Benchmark payload 1KB data block lorem ipsum dolor sit amet")
+	_, err = bucket.Put(ctx, "bench/test.txt", bytes.NewReader(payload), blobkit.PutOptions{})
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		reader, err := bucket.Get(ctx, "bench/test.txt", blobkit.GetOptions{})
+		if err != nil {
+			b.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, reader)
+		_ = reader.Close()
+	}
+}

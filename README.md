@@ -5,9 +5,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Go Version](https://img.shields.io/badge/Go-%3E%3D%201.24-00ADD8.svg)](https://golang.org/)
 
-**BlobKit** is an enterprise-grade, high-performance object storage infrastructure library for Go. Engineered with 8 native, production-hardened storage engines with zero external SDK bloat, it delivers a provider-agnostic, resilient infrastructure layer for modern applications interfacing with **AWS S3**, **Cloudflare R2**, **MinIO**, **Wasabi**, **Backblaze B2**, **Azure Blob Storage**, **Google Cloud Storage (Native JSON API)**, **WebDAV (Nextcloud / TrueNAS)**, **Google Drive (Shared Drives)**, **Local POSIX Filesystem**, **Remote SFTP / SSH**, and **Ephemeral In-Memory** storage.
+**BlobKit** is a modular, high-performance object storage library for Go. Engineered with 8 native, production-hardened storage engines with zero external SDK bloat, it provides a clean, unified storage layer for applications interfacing with **AWS S3**, **Cloudflare R2**, **MinIO**, **Wasabi**, **Backblaze B2**, **Azure Blob Storage**, **Google Cloud Storage (Native JSON API)**, **WebDAV (Nextcloud / TrueNAS)**, **Google Drive (Shared Drives)**, **Local POSIX Filesystem**, **Remote SFTP / SSH**, and **Ephemeral In-Memory** storage.
 
-BlobKit is intentionally designed as an **infrastructure orchestration layer**, not a trivial SDK wrapper. It strictly separates application intent from physical wire mechanics, provides canonical object identity, enforces bounded streaming memory budgets, delivers intelligent multi-cloud routing with 3-state circuit breaking, prevents security vulnerabilities, and automates end-to-end lifecycle management.
+BlobKit offers two distinct operating modes depending on your architecture:
+1. **Low-Level Core (`Bucket`)**: A fast, stateless, key-value storage abstraction with direct streaming (`io.WriteCloser`), zero database dependencies, and sub-microsecond throughput.
+2. **High-Level Orchestrator (`Client`)**: A full-featured storage engine providing canonical object identities (UUIDv7), database metadata registries, policy verification, intelligent multi-cloud routing (circuit breakers, failover), and automated lifecycle management.
 
 ---
 
@@ -17,6 +19,7 @@ BlobKit is intentionally designed as an **infrastructure orchestration layer**, 
 - [Identity & Delivery Separation](#identity--delivery-separation)
 - [Feature Matrix](#feature-matrix)
 - [Installation](#installation)
+- [Choosing Your API Tier: Low-Level `Bucket` vs. High-Level `Client`](#choosing-your-api-tier-low-level-bucket-vs-high-level-client)
 - [Comprehensive Guide & Code Examples](#comprehensive-guide--code-examples)
   - [1. Multi-Cloud Provider Configurations](#1-multi-cloud-provider-configurations)
     - [Cloudflare R2 (Zero Egress CDN)](#a-cloudflare-r2-zero-egress-cdn)
@@ -28,7 +31,7 @@ BlobKit is intentionally designed as an **infrastructure orchestration layer**, 
     - [WebDAV Protocol Driver (Nextcloud, ownCloud, TrueNAS, NAS)](#g-webdav-protocol-driver-nextcloud-owncloud-truenas-nas)
     - [Azure Blob Storage Driver (Native Block Blobs & SAS Presigning)](#h-azure-blob-storage-driver-native-block-blobs--sas-presigning)
     - [Google Cloud Storage Driver (Native JSON API & V4 Signed URLs)](#i-google-cloud-storage-driver-native-json-api--v4-signed-urls)
-    - [SFTP / SSH Storage Driver (Enterprise Remote Linux/Unix Storage)](#j-sftp--ssh-storage-driver-enterprise-remote-linuxunix-storage)
+    - [SFTP / SSH Storage Driver (Remote Linux/Unix Server Storage)](#j-sftp--ssh-storage-driver-remote-linuxunix-server-storage)
   - [2. Advanced Multi-Provider Routing](#2-advanced-multi-provider-routing)
     - [Namespace Tiered Routing](#a-namespace-tiered-routing)
     - [Active-Passive Failover](#b-active-passive-failover)
@@ -158,6 +161,80 @@ go get github.com/suhwr/blobkit
 
 ---
 
+## Choosing Your API Tier: Low-Level `Bucket` vs. High-Level `Client`
+
+BlobKit is architected to give developers full flexibility. Choose the layer that matches your system requirements:
+
+| Capability | Low-Level Core (`Bucket`) | High-Level Orchestrator (`Client`) |
+| :--- | :--- | :--- |
+| **Primary Identity** | Direct Physical Key (`"reports/2026.pdf"`) | Canonical `ObjectID` (UUIDv7) + Key |
+| **Database Dependency** | **None (Zero Database, Stateless)** | Pluggable Metadata Registry (Postgres, SQLite, Memory) |
+| **Object State Machine** | Direct I/O (`Put`, `Get`, `Delete`) | States: `Pending` ➔ `Committed` ➔ `Deleted` |
+| **Streaming Primitives** | `io.WriteCloser` via `bucket.NewWriter()` | Streaming with MIME sniff & SHA-256 verification |
+| **Routing & Topologies** | Single Driver / Bucket | Multi-driver Failover, Circuit Breaking & Tiering |
+| **Lifecycle & Compliance**| Provider-native lifecycle | Soft-delete, WORM legal hold, automated background sweeper |
+| **Best For** | Microservices, background workers, pure storage I/O | Central storage platforms, multi-tenant SaaS, audit systems |
+
+### 🚀 Quick Start: Low-Level `Bucket` (Stateless Direct I/O)
+
+Ideal for microservices or tasks where you simply want universal storage without running a database:
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "io"
+    "strings"
+
+    "github.com/suhwr/blobkit"
+    "github.com/suhwr/blobkit/provider/s3"
+)
+
+func main() {
+    ctx := context.Background()
+
+    // 1. Initialize any storage driver
+    driver, _ := s3.NewDriver(s3.Config{
+        Region:          "us-east-1",
+        Bucket:          "my-app-uploads",
+        AccessKeyID:     "MY_KEY",
+        SecretAccessKey: "MY_SECRET",
+    })
+
+    // 2. Wrap into a stateless Bucket (no database required!)
+    bucket, _ := blobkit.NewBucket(driver)
+    defer bucket.Close()
+
+    // 3. Put an object stream
+    key := "docs/invoice_001.txt"
+    _, _ = bucket.Put(ctx, key, strings.NewReader("Invoice Total: $120.00"), blobkit.PutOptions{
+        ContentType: "text/plain",
+    })
+
+    // 4. Convenience helpers: PutBytes & GetBytes
+    _ = bucket.PutBytes(ctx, "cache/flag.bin", []byte{0x01, 0x02}, blobkit.PutOptions{})
+    data, _, _ := bucket.GetBytes(ctx, "cache/flag.bin", blobkit.GetOptions{})
+    fmt.Printf("Read %d bytes\n", len(data))
+
+    // 5. Streaming io.WriteCloser (zero memory buffering)
+    writer, _ := bucket.NewWriter(ctx, "logs/app.log", blobkit.PutOptions{
+        ContentType: "text/plain",
+    })
+    writer.Write([]byte("Application booted successfully\n"))
+    writer.Close() // Automatically finalizes upload to S3
+
+    // 6. Inspect & Delete
+    exists, _ := bucket.Exists(ctx, key)
+    if exists {
+        _ = bucket.Delete(ctx, key)
+    }
+}
+```
+
+---
+
 ## Comprehensive Guide & Code Examples
 
 ### 1. Multi-Cloud Provider Configurations
@@ -206,7 +283,7 @@ func createS3Driver() (*s3.Driver, error) {
     return s3.NewDriver(s3.Config{
         Name:            "aws-s3-backup",
         Region:          "us-east-1",
-        Bucket:          "enterprise-backup-vault",
+        Bucket:          "production-backup-vault",
         AccessKeyID:     "YOUR_AWS_ACCESS_KEY_ID",
         SecretAccessKey: "YOUR_AWS_SECRET_ACCESS_KEY",
         UsePathStyle:    false, // Virtual hosted-style addressing for S3
@@ -336,9 +413,9 @@ gcsDriver, err := gcs.NewDriver(gcs.Config{
 })
 ```
 
-#### j. SFTP / SSH Storage Driver (Enterprise Remote Linux/Unix Storage)
+#### j. SFTP / SSH Storage Driver (Remote Linux/Unix Server Storage)
 
-Native SFTP / SSH storage driver connecting BlobKit to remote Linux/Unix file servers, private NAS appliances, and enterprise secure file transfer clusters. Supports SSH password or private key authentication (with optional passphrase), atomic temporary file staging, byte-range seeks, sidecar metadata persistence, chroot containment defenses, and multiplexed SSH sessions:
+Native SFTP / SSH storage driver connecting BlobKit to remote Linux/Unix file servers, private NAS appliances, and secure file transfer clusters. Supports SSH password or private key authentication (with optional passphrase), atomic temporary file staging, byte-range seeks, sidecar metadata persistence, chroot containment defenses, and multiplexed SSH sessions:
 
 ```go
 import "github.com/suhwr/blobkit/provider/sftp"
@@ -774,7 +851,7 @@ sqliteStore, err := sqlite.New(sqlite.Config{
     AutoMigrate: true, // Automatically creates tables and indexes
 })
 
-// Option C: PostgreSQL Store (Clustered, enterprise production database)
+// Option C: PostgreSQL Store (Production relational database)
 import "github.com/suhwr/blobkit/registry/postgres"
 pgStore, err := postgres.New(postgres.Config{
     DSN:         "postgres://user:pass@localhost:5432/app_db?sslmode=disable",
@@ -913,19 +990,21 @@ func TestUserAvatarUpload(t *testing.T) {
 
 ## Performance Benchmarks
 
-Measured on AMD EPYC 7C13 64-Core Processor (Linux x86_64, Go 1.24):
+Measured on AMD EPYC 7C13 Processor (8 CPU cores allocated, Linux x86_64, Go 1.27):
 
-| Benchmark Scenario | Throughput / Ops | Latency (ns/op) | Memory (B/op) | Allocs/op |
-| :--- | :--- | :--- | :--- | :--- |
-| `BenchmarkCircuitBreaker_Select` | 75,700,000+ | **14.68 ns/op** | **0 B/op** | **0 allocs/op** |
-| `BenchmarkLRUCache_Hit` | 3,030,000+ | **402.7 ns/op** | **320 B/op** | **1 allocs/op** |
-| `BenchmarkKeyGeneration_UUIDv7` | 2,420,000+ | **530.6 ns/op** | **208 B/op** | **4 allocs/op** |
-| `BenchmarkKeyGeneration_DatePrefix` | 1,430,000+ | **855.1 ns/op** | **256 B/op** | **5 allocs/op** |
-| `BenchmarkKeyGeneration_HashSharded`| 1,480,000+ | **874.9 ns/op** | **416 B/op** | **7 allocs/op** |
-| `BenchmarkMIMESniff` | 1,340,000+ | **894.8 ns/op** | **624 B/op** | **3 allocs/op** |
-| `BenchmarkClient_Get_ByObjectID` | 1,000,000+ | **1,457 ns/op** | **707 B/op** | **4 allocs/op** |
-| `BenchmarkClient_Put_Standalone` | 163,000+ | **7,347 ns/op** | **3,019 B/op** | **27 allocs/op** |
-| `BenchmarkClient_Put_WithRegistry` | 122,000+ | **10,795 ns/op** | **4,290 B/op** | **30 allocs/op** |
+| Benchmark Scenario | Throughput / Ops | Latency (ns/op) | Memory (B/op) | Allocs/op | Architectural Role |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `BenchmarkCircuitBreaker_Select-8` | 86,390,000+ | **13.92 ns/op** | **0 B/op** | **0 allocs/op** | Zero-allocation route decision |
+| `BenchmarkLRUCache_Hit-8` | 4,640,000+ | **279.4 ns/op** | **320 B/op** | **1 allocs/op** | Sub-microsecond metadata cache |
+| `BenchmarkKeyGeneration_UUIDv7-8` | 2,270,000+ | **441.3 ns/op** | **208 B/op** | **4 allocs/op** | Time-ordered collision-proof keys |
+| `BenchmarkMIMESniff-8` | 2,050,000+ | **593.7 ns/op** | **624 B/op** | **3 allocs/op** | 512B zero-rewind magic signature check |
+| `BenchmarkKeyGeneration_HashSharded-8` | 1,720,000+ | **696.2 ns/op** | **416 B/op** | **7 allocs/op** | High-cardinality directory partitioning |
+| `BenchmarkKeyGeneration_DatePrefix-8` | 1,760,000+ | **711.6 ns/op** | **256 B/op** | **5 allocs/op** | YYYY/MM/DD prefix layout |
+| `BenchmarkBucket_Get-8` | 1,530,000+ | **735.4 ns/op** | **450 B/op** | **5 allocs/op** | **Low-level direct key read (Bucket)** |
+| `BenchmarkClient_Get_ByObjectID-8` | 1,000,000+ | **1,124 ns/op** | **739 B/op** | **5 allocs/op** | Logical ID resolution + read (Client) |
+| `BenchmarkBucket_Put-8` | 484,000+ | **2,335 ns/op** | **1,537 B/op** | **12 allocs/op** | **Low-level direct wire upload (3.3x faster)** |
+| `BenchmarkClient_Put_Standalone-8` | 163,000+ | **7,706 ns/op** | **3,234 B/op** | **33 allocs/op** | MIME sniff + SHA256 TeeReader + KeyGen |
+| `BenchmarkClient_Put_WithRegistry-8` | 120,000+ | **9,905 ns/op** | **4,509 B/op** | **36 allocs/op** | Full pipeline + in-memory SQL state machine |
 
 ---
 
