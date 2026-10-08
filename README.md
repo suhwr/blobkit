@@ -20,7 +20,15 @@ BlobKit offers two distinct operating modes depending on your architecture:
 - [Feature Matrix](#feature-matrix)
 - [Installation](#installation)
 - [Choosing Your API Tier: Low-Level `Bucket` vs. High-Level `Client`](#choosing-your-api-tier-low-level-bucket-vs-high-level-client)
-- [Comprehensive Guide & Code Examples](#comprehensive-guide--code-examples)
+- [Low-Level Storage Engine & Wire-Level Architecture](#low-level-storage-engine--wire-level-architecture)
+  - [1. Stateless `Bucket` Architecture & Direct Key I/O](#1-stateless-bucket-architecture--direct-key-io)
+  - [2. Asynchronous Streaming Writes (`bucket.NewWriter`)](#2-asynchronous-streaming-writes-bucketnewwriter)
+  - [3. Kernel Zero-Copy Streaming (`ObjectReader.WriteTo`)](#3-kernel-zero-copy-streaming-objectreaderwriteto)
+  - [4. Random-Access Seeking (`SeekableReader` & `zip.NewReader`)](#4-random-access-seeking-seekablereader--zipnewreader)
+  - [5. Building Custom Storage Drivers (`BaseDriver` SPI)](#5-building-custom-storage-drivers-basedriver-spi)
+  - [6. Driver Middleware & Interceptor Pipeline](#6-driver-middleware--interceptor-pipeline)
+  - [7. Low-Level Error Taxonomy & Resilient Retries](#7-low-level-error-taxonomy--resilient-retries)
+- [High-Level Orchestrator & Enterprise Features](#high-level-orchestrator--enterprise-features)
   - [1. Multi-Cloud Provider Configurations](#1-multi-cloud-provider-configurations)
     - [Cloudflare R2 (Zero Egress CDN)](#a-cloudflare-r2-zero-egress-cdn)
     - [AWS S3 (Standard / Multi-Region)](#b-aws-s3-standard--multi-region)
@@ -235,7 +243,559 @@ func main() {
 
 ---
 
-## Comprehensive Guide & Code Examples
+## Low-Level Storage Engine & Wire-Level Architecture
+
+The Low-Level Core in BlobKit (`blobkit.Bucket`) is engineered for maximum throughput, predictable memory footprint, and architectural minimalism. When building microservices, background ingestion workers, data pipelines, high-performance reverse proxies, or edge runtimes, you don't need a relational database, UUIDv7 object identity mappings, or complex lifecycle state machines. You simply need fast, reliable, zero-overhead storage I/O directly on the wire.
+
+```
++-----------------------------------------------------------------------------+
+|                         APPLICATION CODE / PIPELINE                         |
+|   (io.Reader / io.Writer / io.ReaderAt / io.ReadSeeker / []byte payloads)   |
++-----------------------------------------------------------------------------+
+                                      |
+              +-----------------------+-----------------------+
+              |                                               |
+              v                                               v
++-------------------------------+             +-------------------------------+
+|      blobkit.Bucket           |             |      SeekableReader           |
+|  - Direct Key-Value Storage   |             |  - io.ReadSeekCloser          |
+|  - Asynchronous NewWriter()   |             |  - io.ReaderAt (Concurrency)  |
+|  - Fast PutBytes / GetBytes   |             |  - HTTP Byte-Range Seeks      |
+|  - Low-level Multipart SPI    |             |  - ZIP / Parquet / Media      |
++-------------------------------+             +-------------------------------+
+              |                                               |
+              +-----------------------+-----------------------+
+                                      |
+                                      v
++-----------------------------------------------------------------------------+
+|                         DRIVER INTERCEPTOR PIPELINE                         |
+|   WrapDriver(driver, LatencyMiddleware, CustomRateLimiter, AuditLogger)     |
++-----------------------------------------------------------------------------+
+                                      |
+                                      v
++-----------------------------------------------------------------------------+
+|                     NORMATIVE DRIVER CONTRACT & SPI                         |
+|   blobkit.Driver interface  <--- embedded by --->  blobkit.BaseDriver       |
++-----------------------------------------------------------------------------+
+                                      |
+                                      v
++-----------------------------------------------------------------------------+
+|                     ZERO-COPY KERNEL STREAMING                              |
+|   ObjectReader.WriteTo(w) -> Linux sendfile(2) / splice(2) fast path        |
++-----------------------------------------------------------------------------+
+```
+
+### 1. Stateless `Bucket` Architecture & Direct Key I/O
+
+A `Bucket` wraps any `blobkit.Driver` directly. It communicates using physical storage keys without touching an external database:
+
+- **Ultra-low latency**: Reads resolve in **~735 ns/op** and uploads in **~2.3 µs/op** (over **3.3x faster** than full client orchestration).
+- **Direct key addressing**: Store and retrieve using exact paths (e.g. `media/2026/avatar.png`).
+- **Memory-efficient helpers**: In-memory byte slices can be saved and retrieved via `PutBytes` and `GetBytes` without manual buffer management.
+- **Direct provider multipart**: Initiate, upload parts, and complete provider multipart sessions directly using raw keys (`CreateMultipart`, `UploadPart`, `CompleteMultipart`).
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "strings"
+
+    "github.com/suhwr/blobkit"
+    "github.com/suhwr/blobkit/provider/s3"
+)
+
+func main() {
+    ctx := context.Background()
+
+    // 1. Initialize any storage driver
+    driver, err := s3.NewDriver(s3.Config{
+        Region:          "us-east-1",
+        Bucket:          "my-app-uploads",
+        AccessKeyID:     "MY_KEY",
+        SecretAccessKey: "MY_SECRET",
+    })
+    if err != nil {
+        panic(err)
+    }
+
+    // 2. Wrap into a stateless Bucket (no database required!)
+    bucket, err := blobkit.NewBucket(driver)
+    if err != nil {
+        panic(err)
+    }
+    defer bucket.Close()
+
+    // 3. Put an object stream directly to a key
+    key := "docs/invoice_001.txt"
+    _, err = bucket.Put(ctx, key, strings.NewReader("Invoice Total: $120.00"), blobkit.PutOptions{
+        ContentType: "text/plain",
+        Metadata: map[string]string{
+            "tier": "enterprise",
+        },
+    })
+
+    // 4. Convenience fast paths: PutBytes & GetBytes
+    _ = bucket.PutBytes(ctx, "cache/flags.bin", []byte{0x01, 0x02, 0x03}, blobkit.PutOptions{})
+    data, meta, _ := bucket.GetBytes(ctx, "cache/flags.bin", blobkit.GetOptions{})
+    fmt.Printf("Read %d bytes (content-type: %s)\n", len(data), meta.ContentType)
+
+    // 5. Inspect metadata (Head) & Existence check
+    exists, _ := bucket.Exists(ctx, key)
+    if exists {
+        head, _ := bucket.Head(ctx, key)
+        fmt.Printf("Key: %s, Size: %d bytes\n", head.Key, head.Size)
+    }
+
+    // 6. Direct server-side Copy & Delete
+    _ = bucket.Copy(ctx, key, "docs/invoice_001_backup.txt")
+    _ = bucket.Delete(ctx, key)
+
+    // 7. Paginated listing by key prefix
+    result, _ := bucket.List(ctx, blobkit.ListOptions{
+        Prefix: "docs/",
+        Limit:  50,
+    })
+    for _, obj := range result.Objects {
+        fmt.Printf("- %s (%d bytes)\n", obj.Key, obj.Size)
+    }
+}
+```
+
+### 2. Asynchronous Streaming Writes (`bucket.NewWriter`)
+
+When streaming dynamically generated content (e.g. database dumps, telemetry streams, audio encodes, or compressed archives), buffering the entire output in memory or temporary disk files wastes memory and adds disk I/O latency.
+
+`bucket.NewWriter(ctx, key, opts)` returns a standard `io.WriteCloser` backed by an internal asynchronous pipe (`io.Pipe`). As bytes are written into the writer, they are streamed concurrently to the remote storage driver. Calling `.Close()` automatically flushes the pipe and awaits provider confirmation:
+
+```go
+package main
+
+import (
+    "compress/gzip"
+    "context"
+    "log"
+
+    "github.com/suhwr/blobkit"
+)
+
+// Stream dynamically compressed gzip data directly to object storage with O(1) memory
+func StreamArchive(ctx context.Context, bucket *blobkit.Bucket, key string) error {
+    // 1. Open an asynchronous streaming writer
+    writer, err := bucket.NewWriter(ctx, key, blobkit.PutOptions{
+        ContentType: "application/gzip",
+    })
+    if err != nil {
+        return err
+    }
+
+    // 2. Wrap writer in standard streaming compressor
+    gz := gzip.NewWriter(writer)
+
+    // 3. Write data chunks on-the-fly
+    payload := []byte("streamed log entry line 1\nstreamed log entry line 2\n")
+    if _, err := gz.Write(payload); err != nil {
+        // Abort the pipe immediately on error to terminate the background upload
+        _ = writer.CloseWithError(err)
+        return err
+    }
+
+    // 4. Flush and close gzip framing blocks first
+    if err := gz.Close(); err != nil {
+        _ = writer.CloseWithError(err)
+        return err
+    }
+
+    // 5. Close the BucketWriter to finalize upload and receive remote persistence error if any
+    if err := writer.Close(); err != nil {
+        log.Printf("Upload failed on storage provider: %v", err)
+        return err
+    }
+
+    log.Println("Streaming upload successfully committed")
+    return nil
+}
+```
+
+### 3. Kernel Zero-Copy Streaming (`ObjectReader.WriteTo`)
+
+BlobKit's `ObjectReader` implements standard Go `io.WriterTo`:
+
+```go
+func (r *ObjectReader) WriteTo(w io.Writer) (int64, error)
+```
+
+When serving objects over HTTP handlers, reverse proxies, or TCP connections (`*net.TCPConn`), Go runtime's `io.Copy` detects `io.WriterTo`. If the underlying driver stream is backed by an OS file descriptor or socket, the transfer engages Linux kernel zero-copy mechanisms like `sendfile(2)` or `splice(2)`. This moves data straight across kernel buffers without allocating heap memory or copying bytes into userspace Go application memory:
+
+```go
+package main
+
+import (
+    "fmt"
+    "net/http"
+
+    "github.com/suhwr/blobkit"
+)
+
+// High-throughput HTTP Asset Server leveraging kernel zero-copy transfer
+func BlobServerHandler(bucket *blobkit.Bucket) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        key := r.URL.Path[1:] // e.g. "assets/video.mp4"
+
+        // Open object stream
+        reader, err := bucket.Get(r.Context(), key, blobkit.GetOptions{})
+        if err != nil {
+            if blobkit.IsNotFound(err) {
+                http.NotFound(w, r)
+                return
+            }
+            http.Error(w, "storage error", http.StatusInternalServerError)
+            return
+        }
+        defer reader.Close()
+
+        // Set response metadata headers
+        if reader.ContentType != "" {
+            w.Header().Set("Content-Type", reader.ContentType)
+        }
+        if reader.Size > 0 {
+            w.Header().Set("Content-Length", fmt.Sprintf("%d", reader.Size))
+        }
+
+        // Fast-Path: WriteTo streams directly to http.ResponseWriter
+        // Utilizing sendfile(2)/splice(2) fast paths with zero heap allocations
+        _, _ = reader.WriteTo(w)
+    }
+}
+```
+
+### 4. Random-Access Seeking (`SeekableReader` & `zip.NewReader`)
+
+Cloud object storage (AWS S3, Cloudflare R2, Google Cloud Storage, Azure Blob Storage) operates on HTTP byte ranges (`Range: bytes=start-end`), whereas Go standard library packages (such as `archive/zip.NewReader`, Parquet table readers, video atom decoders, or PDF parsers) require `io.ReaderAt` or `io.ReadSeekCloser`.
+
+`bucket.OpenSeeker(ctx, key)` creates an adapter that bridges this gap seamlessly:
+- Implements `io.ReadSeekCloser` and `io.ReaderAt`.
+- Thread-safe `ReadAt` calls execute range GET requests concurrently across goroutines.
+- Reuses active body streams when sequential reads continue from current cursor.
+
+#### Example: Extracting a File from a 50GB Remote ZIP Without Downloading It
+
+In the ZIP file specification, the **Central Directory** index is located at the very **end** of the archive. A standard downloader would need to download all 50GB. With `SeekableReader`, Go's `zip.NewReader` only fetches the trailing metadata bytes over Range GET, then jumps directly to the compressed offset of the requested file:
+
+```go
+package main
+
+import (
+    "archive/zip"
+    "context"
+    "fmt"
+    "io"
+
+    "github.com/suhwr/blobkit"
+)
+
+func ExtractZipEntry(ctx context.Context, bucket *blobkit.Bucket, zipKey string, targetFile string) ([]byte, error) {
+    // 1. Open random-access seeker over remote cloud blob
+    seeker, err := bucket.OpenSeeker(ctx, zipKey)
+    if err != nil {
+        return nil, err
+    }
+    defer seeker.Close()
+
+    // 2. Mount directly into archive/zip.NewReader
+    // Only reads the end-of-archive Central Directory bytes over HTTP Range!
+    zipReader, err := zip.NewReader(seeker, seeker.Size())
+    if err != nil {
+        return nil, fmt.Errorf("failed to parse zip central directory: %w", err)
+    }
+
+    // 3. Locate and stream only the specific file
+    for _, file := range zipReader.File {
+        if file.Name == targetFile {
+            rc, err := file.Open()
+            if err != nil {
+                return nil, err
+            }
+            defer rc.Close()
+
+            // Stream and read ONLY the target file bytes!
+            return io.ReadAll(rc)
+        }
+    }
+
+    return nil, fmt.Errorf("entry %q not found in remote archive", targetFile)
+}
+```
+
+### 5. Building Custom Storage Drivers (`BaseDriver` SPI)
+
+BlobKit is completely extensible. You can write your own storage driver (e.g. for Redis, IPFS, Ceph RADOS, Couchbase, or internal corporate storage) in under 50 lines of Go code by embedding `blobkit.BaseDriver`.
+
+#### Why Embed `blobkit.BaseDriver`?
+The normative BlobKit Driver Contract specifies that any capability not supported by a driver must return `blobkit.ErrUnsupportedOperation`. Embedding `BaseDriver` provides safe, contract-compliant stub implementations for all optional methods (`Copy`, `List`, `PresignGet`, `CreateMultipart`, etc.), so you only need to implement the core methods your backend supports:
+
+```go
+package mydriver
+
+import (
+    "bytes"
+    "context"
+    "io"
+    "sync"
+
+    "github.com/suhwr/blobkit"
+)
+
+// CustomDriver implements blobkit.Driver for an in-memory key-value engine.
+type CustomDriver struct {
+    blobkit.BaseDriver // Provides compliant stubs for all unadvertised capabilities
+    data map[string][]byte
+    mu   sync.RWMutex
+}
+
+func NewCustomDriver(name string) *CustomDriver {
+    return &CustomDriver{
+        BaseDriver: blobkit.NewBaseDriver(
+            name,
+            blobkit.CapCore|blobkit.CapByteRangeGet, // Advertised capability bitmask
+        ),
+        data: make(map[string][]byte),
+    }
+}
+
+// 1. Put stores a blob stream
+func (d *CustomDriver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts blobkit.PutOptions) (*blobkit.Object, error) {
+    payload, err := io.ReadAll(r)
+    if err != nil {
+        return nil, blobkit.WrapError("put", obj.Key, d.Name(), err)
+    }
+
+    d.mu.Lock()
+    d.data[obj.Key] = payload
+    d.mu.Unlock()
+
+    res := *obj
+    res.Size = int64(len(payload))
+    return &res, nil
+}
+
+// 2. Get retrieves a blob stream
+func (d *CustomDriver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (*blobkit.ObjectReader, error) {
+    d.mu.RLock()
+    payload, exists := d.data[key]
+    d.mu.RUnlock()
+
+    if !exists {
+        return nil, blobkit.WrapError("get", key, d.Name(), blobkit.ErrObjectNotFound)
+    }
+
+    return &blobkit.ObjectReader{
+        Object: blobkit.Object{Key: key, Size: int64(len(payload))},
+        Body:   io.NopCloser(bytes.NewReader(payload)),
+    }, nil
+}
+
+// 3. Head inspects blob metadata
+func (d *CustomDriver) Head(ctx context.Context, key string) (*blobkit.Object, error) {
+    d.mu.RLock()
+    payload, exists := d.data[key]
+    d.mu.RUnlock()
+
+    if !exists {
+        return nil, blobkit.WrapError("head", key, d.Name(), blobkit.ErrObjectNotFound)
+    }
+    return &blobkit.Object{Key: key, Size: int64(len(payload))}, nil
+}
+
+// 4. Delete removes a blob
+func (d *CustomDriver) Delete(ctx context.Context, key string) error {
+    d.mu.Lock()
+    delete(d.data, key)
+    d.mu.Unlock()
+    return nil
+}
+
+// 5. Close releases driver resources
+func (d *CustomDriver) Close() error {
+    return nil
+}
+```
+
+#### Verifying Custom Drivers with the Contract Test Suite
+You can verify your custom driver against BlobKit's normative contract suite in a single line:
+
+```go
+package mydriver_test
+
+import (
+    "testing"
+    "github.com/suhwr/blobkit"
+    "github.com/suhwr/blobkit/testutil"
+)
+
+func TestCustomDriverContract(t *testing.T) {
+    testutil.RunDriverContractTests(t, func() blobkit.Driver {
+        return NewCustomDriver("test-custom")
+    })
+}
+```
+
+### 6. Driver Middleware & Interceptor Pipeline
+
+BlobKit provides a composable middleware architecture inspired by HTTP middleware. Middlewares intercept wire-level driver operations to inject observability, chaos testing, audit trails, encryption, or rate limiting.
+
+#### Architecture: `WrapDriver` & `DelegateDriver`
+- `blobkit.WrapDriver(driver, middlewares...)`: Composes multiple middlewares outside-in.
+- `blobkit.DelegateDriver`: A transparent proxy struct that implements `blobkit.Driver`. Middleware authors embed `DelegateDriver` and selectively override only the methods they want to intercept.
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+    "time"
+
+    "github.com/suhwr/blobkit"
+    "github.com/suhwr/blobkit/provider/s3"
+)
+
+// Example 1: Built-in Latency Middleware (Measures exact wire duration)
+func withLatencyInstrumentation(rawDriver blobkit.Driver) blobkit.Driver {
+    return blobkit.WrapDriver(rawDriver, blobkit.LatencyMiddleware(func(op blobkit.Operation, key string, duration time.Duration, err error) {
+        log.Printf("[METRICS] Op=%s Key=%s Latency=%v Err=%v", op, key, duration, err)
+    }))
+}
+
+// Example 2: Custom Security Audit Middleware
+type SecurityAuditMiddleware struct {
+    blobkit.DelegateDriver
+    logger *log.Logger
+}
+
+func NewSecurityAuditMiddleware(logger *log.Logger) blobkit.DriverMiddleware {
+    return func(next blobkit.Driver) blobkit.Driver {
+        return &SecurityAuditMiddleware{
+            DelegateDriver: blobkit.NewDelegateDriver(next),
+            logger:         logger,
+        }
+    }
+}
+
+// Intercept only Delete operations
+func (m *SecurityAuditMiddleware) Delete(ctx context.Context, key string) error {
+    m.logger.Printf("[SECURITY AUDIT] Permanent delete requested for key=%s", key)
+    return m.DelegateDriver.Delete(ctx, key)
+}
+
+func main() {
+    rawDriver, _ := s3.NewDriver(s3.Config{
+        Region: "us-east-1",
+        Bucket: "app-bucket",
+    })
+
+    // Chain middlewares: Audit runs first, then Latency, then the raw Driver
+    instrumentedDriver := blobkit.WrapDriver(
+        rawDriver,
+        blobkit.LatencyMiddleware(func(op blobkit.Operation, key string, duration time.Duration, err error) {
+            log.Printf("Op %s took %v", op, duration)
+        }),
+        NewSecurityAuditMiddleware(log.Default()),
+    )
+
+    bucket, _ := blobkit.NewBucket(instrumentedDriver)
+    // All bucket operations pass through the middleware chain
+}
+```
+
+### 7. Low-Level Error Taxonomy & Resilient Retries
+
+BlobKit standardizes all errors across cloud providers into a unified taxonomy wrapped in `blobkit.StorageError`:
+
+```go
+type StorageError struct {
+    Op       string // "get", "put", "head", "delete", etc.
+    Key      string // Object key that triggered the error
+    Provider string // Provider identifier (e.g. "s3-primary", "azure-archive")
+    Err      error  // Underlying sentinel error
+}
+```
+
+#### Error Classification Predicates
+
+| Helper Function | Indicates | Safe to Retry? | Example Sentinel Errors |
+| :--- | :--- | :---: | :--- |
+| `blobkit.IsNotFound(err)` | Object or bucket does not exist | **No** | `ErrObjectNotFound`, `ErrBucketNotFound` |
+| `blobkit.IsPermanent(err)` | Non-recoverable client errors | **No** | `ErrInvalidKey`, `ErrPermissionDenied`, `ErrChecksumMismatch`, `ErrSecurityViolation` |
+| `blobkit.IsTransient(err)` | Temporary network / server outages | **Yes** | `ErrProviderUnavailable`, `ErrRateLimited`, 502/503/504, connection reset |
+| `blobkit.IsSecurityViolation(err)` | Security / MIME policy blocked | **No** | `ErrSecurityViolation`, `ErrMIMEMismatch` |
+| `blobkit.IsObjectLocked(err)` | Object locked by WORM / legal hold | **No** | `ErrObjectLocked` |
+| `blobkit.IsRateLimited(err)` | Throttling / 429 Too Many Requests | **Yes** (with backoff) | `ErrRateLimited` |
+
+#### Resilient Retry Loop Example
+
+```go
+package main
+
+import (
+    "context"
+    "errors"
+    "log"
+    "time"
+
+    "github.com/suhwr/blobkit"
+)
+
+func FetchWithRetry(ctx context.Context, bucket *blobkit.Bucket, key string) ([]byte, error) {
+    maxRetries := 3
+    backoff := 150 * time.Millisecond
+
+    for attempt := 1; attempt <= maxRetries; attempt++ {
+        data, _, err := bucket.GetBytes(ctx, key, blobkit.GetOptions{})
+        if err == nil {
+            return data, nil
+        }
+
+        // 1. Immediately abort on permanent non-retryable errors
+        if blobkit.IsPermanent(err) {
+            if blobkit.IsNotFound(err) {
+                log.Printf("Object not found: %s", key)
+            } else if blobkit.IsPermissionDenied(err) {
+                log.Printf("Access forbidden: check IAM permissions")
+            }
+            return nil, err
+        }
+
+        // 2. Retry only transient recoverable errors
+        if blobkit.IsTransient(err) {
+            log.Printf("Attempt %d transiently failed (%v). Retrying in %v...", attempt, err, backoff)
+            select {
+            case <-ctx.Done():
+                return nil, ctx.Err()
+            case <-time.After(backoff):
+                backoff *= 2 // Exponential backoff
+                continue
+            }
+        }
+
+        return nil, err
+    }
+
+    return nil, errors.New("maximum retries exceeded")
+}
+```
+
+#### Automated Credential Scrubbing
+To prevent accidental data leakage into log ingestion services (Sentry, Datadog, CloudWatch), all errors returned by BlobKit automatically scrub:
+- AWS, Azure, and Google Cloud HMAC signatures (`X-Amz-Signature`, `X-Goog-Signature`, `sig=...`)
+- Bearer tokens, Basic Auth headers, and OAuth refresh tokens
+- RSA and Ed25519 private key PEM headers
+- Internal RFC 1918 IP addresses (`10.x.x.x`, `172.16-31.x.x`, `192.168.x.x`, `127.0.0.1`)
+
+---
+
+## High-Level Orchestrator & Enterprise Features
 
 ### 1. Multi-Cloud Provider Configurations
 
