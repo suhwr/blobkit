@@ -26,19 +26,23 @@ func Sniff(r io.Reader, filename, hintMIME string) (io.Reader, string, error) {
 		return r, trimmedHint, nil
 	}
 
-	// If r is an io.ReadSeeker, we can read the peek buffer and simply seek back to 0.
+	// If r is an io.ReadSeeker, we can read the peek buffer and seek back to the starting offset.
 	if seeker, ok := r.(io.ReadSeeker); ok {
-		buf := make([]byte, SniffSize)
-		n, err := seeker.Read(buf)
-		if err != nil && err != io.EOF {
-			return r, "application/octet-stream", err
+		currentOffset, posErr := seeker.Seek(0, io.SeekCurrent)
+		if posErr == nil {
+			buf := make([]byte, SniffSize)
+			n, err := seeker.Read(buf)
+			if err != nil && err != io.EOF {
+				_, _ = seeker.Seek(currentOffset, io.SeekStart)
+				return r, "application/octet-stream", err
+			}
+			// Reset back to starting position
+			if _, seekErr := seeker.Seek(currentOffset, io.SeekStart); seekErr != nil {
+				return r, "application/octet-stream", seekErr
+			}
+			detected := detectMIME(buf[:n], filename)
+			return seeker, detected, nil
 		}
-		// Reset back to start
-		if _, seekErr := seeker.Seek(0, io.SeekStart); seekErr != nil {
-			return r, "application/octet-stream", seekErr
-		}
-		detected := detectMIME(buf[:n], filename)
-		return seeker, detected, nil
 	}
 
 	// General streaming io.Reader: read up to 512 bytes without exhausting the stream

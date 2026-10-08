@@ -47,6 +47,7 @@ type CircuitBreakerRouter struct {
 	consecutiveWins  int
 	lastTripped      time.Time
 	probeInFlight    bool
+	probeStarted     time.Time
 }
 
 // NewCircuitBreakerRouter constructs a 3-state circuit breaker router.
@@ -107,6 +108,7 @@ func (r *CircuitBreakerRouter) Select(ctx context.Context, rc RouteContext) (blo
 			r.state = CircuitHalfOpen
 			r.consecutiveWins = 0
 			r.probeInFlight = true
+			r.probeStarted = time.Now()
 			return r.primary, nil // Grant canary probe lease
 		}
 
@@ -117,8 +119,9 @@ func (r *CircuitBreakerRouter) Select(ctx context.Context, rc RouteContext) (blo
 	}
 
 	if r.state == CircuitHalfOpen {
-		if !r.probeInFlight {
+		if !r.probeInFlight || time.Since(r.probeStarted) > r.cooldown {
 			r.probeInFlight = true
+			r.probeStarted = time.Now()
 			return r.primary, nil // Grant canary probe lease
 		}
 		// Probe already in-flight: route other traffic to fallback
@@ -146,9 +149,6 @@ func (r *CircuitBreakerRouter) AllDrivers() []blobkit.Driver {
 // ReportFailure updates the breaker on execution failure for transient errors.
 // Permanent client errors (e.g. 404, bad keys) do not trip the circuit breaker.
 func (r *CircuitBreakerRouter) ReportFailure(driver string, err error) {
-	if err != nil && blobkit.IsPermanent(err) {
-		return
-	}
 	if r.primary == nil || driver != r.primary.Name() {
 		return
 	}
@@ -157,11 +157,19 @@ func (r *CircuitBreakerRouter) ReportFailure(driver string, err error) {
 	defer r.mu.Unlock()
 
 	if r.state == CircuitHalfOpen {
-		// Immediate trip back to open on canary failure
 		r.probeInFlight = false
+		if err != nil && blobkit.IsPermanent(err) {
+			// Permanent client errors do not trip breaker back to Open, but release the probe lease
+			return
+		}
+		// Immediate trip back to open on canary failure
 		r.state = CircuitOpen
 		r.lastTripped = time.Now()
 		r.consecutiveWins = 0
+		return
+	}
+
+	if err != nil && blobkit.IsPermanent(err) {
 		return
 	}
 

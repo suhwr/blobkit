@@ -150,3 +150,46 @@ func TestSweeper_StartStop(t *testing.T) {
 	time.Sleep(120 * time.Millisecond)
 	sweeper.Stop()
 }
+
+func TestSweeper_ConcurrentStop(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	driver := memory.NewDriver(memory.Config{Name: "mem-sweep-concurrent"})
+	client, err := blobkit.New(blobkit.WithDriver(driver))
+	if err != nil {
+		t.Fatalf("failed to init client: %v", err)
+	}
+	defer client.Close()
+
+	sweeper, err := lifecycle.NewSweeper(client, lifecycle.SweeperConfig{
+		Interval: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewSweeper failed: %v", err)
+	}
+
+	if err := sweeper.Start(ctx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	// Call Stop from multiple goroutines concurrently
+	const workers = 10
+	errChan := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("Stop panicked: %v", r)
+				}
+				errChan <- nil
+			}()
+			sweeper.Stop()
+		}()
+	}
+
+	for i := 0; i < workers; i++ {
+		<-errChan
+	}
+}
+

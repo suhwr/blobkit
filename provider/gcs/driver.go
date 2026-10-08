@@ -202,6 +202,7 @@ func (d *Driver) uploadStreamResumable(ctx context.Context, obj *blobkit.Object,
 	buf := make([]byte, chunkSize)
 	var parts []blobkit.CompletedPart
 	var partNum int32 = 1
+	var totalSize int64
 
 	hSHA := sha256.New()
 
@@ -213,6 +214,7 @@ func (d *Driver) uploadStreamResumable(ctx context.Context, obj *blobkit.Object,
 
 		n, readErr := io.ReadFull(r, buf)
 		if n > 0 {
+			totalSize += int64(n)
 			chunk := buf[:n]
 			hSHA.Write(chunk)
 			etag, partErr := d.UploadPart(ctx, obj.Key, uploadID, partNum, bytes.NewReader(chunk), int64(n))
@@ -235,6 +237,19 @@ func (d *Driver) uploadStreamResumable(ctx context.Context, obj *blobkit.Object,
 		if readErr != nil {
 			_ = d.AbortMultipart(context.Background(), obj.Key, uploadID)
 			return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, readErr)
+		}
+	}
+
+	if opts.ExplicitSize || (opts.Size > 0 && opts.Size != blobkit.SizeUnknown) {
+		if totalSize != opts.Size {
+			_ = d.AbortMultipart(context.Background(), obj.Key, uploadID)
+			return nil, blobkit.ErrSizeMismatch
+		}
+	}
+	if sr, ok := r.(*blobkit.SizeReader); ok {
+		if vErr := sr.Verify(); vErr != nil {
+			_ = d.AbortMultipart(context.Background(), obj.Key, uploadID)
+			return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, vErr)
 		}
 	}
 

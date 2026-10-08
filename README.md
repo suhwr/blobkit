@@ -28,6 +28,7 @@ BlobKit offers two distinct operating modes depending on your architecture:
   - [5. Building Custom Storage Drivers (`BaseDriver` SPI)](#5-building-custom-storage-drivers-basedriver-spi)
   - [6. Driver Middleware & Interceptor Pipeline](#6-driver-middleware--interceptor-pipeline)
   - [7. Low-Level Error Taxonomy & Resilient Retries](#7-low-level-error-taxonomy--resilient-retries)
+  - [8. Wire-Level Protocols & Concurrency Internals Deep Dive](#8-wire-level-protocols--concurrency-internals-deep-dive)
 - [High-Level Orchestrator & Enterprise Features](#high-level-orchestrator--enterprise-features)
   - [1. Multi-Cloud Provider Configurations](#1-multi-cloud-provider-configurations)
     - [Cloudflare R2 (Zero Egress CDN)](#a-cloudflare-r2-zero-egress-cdn)
@@ -793,6 +794,50 @@ To prevent accidental data leakage into log ingestion services (Sentry, Datadog,
 - RSA and Ed25519 private key PEM headers
 - Internal RFC 1918 IP addresses (`10.x.x.x`, `172.16-31.x.x`, `192.168.x.x`, `127.0.0.1`)
 
+### 8. Wire-Level Protocols & Concurrency Internals Deep Dive
+
+BlobKit interfaces directly with storage backends at the raw wire level without heavy, monolithic vendor SDKs. Understanding how BlobKit manages chunking, concurrency, atomic state transitions, and memory allocations allows you to build mission-critical infrastructure with deterministic behavior.
+
+#### a. Provider Wire Protocols for Resumable & Chunked Uploads
+
+Each storage provider implements its own chunking specification. BlobKit unifies these protocols behind the normative `Driver` interface:
+
+| Provider | Protocol Architecture | Wire Mechanics & Finalization | Guarantees & Edge Cases |
+| :--- | :--- | :--- | :--- |
+| **AWS S3 / R2 / MinIO** | AWS Multipart Upload | `POST /?uploads` $\rightarrow$ `PUT /?partNumber=N&uploadId=ID` $\rightarrow$ `POST /?uploadId=ID` (XML block list) | MD5 / SHA-256 etag verification per part. Same-key copy uses `MetadataDirectiveReplace`. |
+| **Azure Blob Storage** | Azure Block Blobs | `PUT /blob?comp=block&blockid=ID` (base64) $\rightarrow$ `PUT /blob?comp=blocklist` (XML block list) | Preserves `stored.Size` on unknown-size streams. Appends SAS tokens to `x-ms-copy-source` on internal Copy. |
+| **Google Cloud Storage** | GCS Resumable Upload | `POST /upload/storage/v1/b/...` (session URI) $\rightarrow$ `PUT <session_uri>` with `Content-Range: bytes START-END/TOTAL` | Aborts session on client context cancellation or size mismatch (`ErrSizeMismatch`). |
+| **Google Drive** | Resumable Drive v3 API | `POST /upload/drive/v3/files?uploadType=resumable` $\rightarrow$ `PUT <uri>` with 256 KiB chunks $\rightarrow$ `bytes */uploaded` finalizer | Ref-counted per-key mutex locks prevent duplicate files on race conditions. Explicit boundary finalization prevents 308 hang. |
+| **Local POSIX Filesystem** | Staged Temporary Files | Chunks written to `tmp_<uploadID>` $\rightarrow$ atomic rename `os.Rename(tmp, dst)` + sidecar `.meta.json` | Atomic rename ensures zero partial reads. Suffix range queries (`bytes=-N`) parse from EOF. |
+| **Remote SFTP / SSH** | Remote Atomic Staging | Staged via `sftp.Client` $\rightarrow$ atomic remote rename $\rightarrow$ sidecar `.meta.json` | Non-destructive atomic move first, avoiding premature deletion of existing target files. |
+
+#### b. Thread Safety & Race-Free Concurrency Model
+
+BlobKit is verified with the Go race detector (`go test -race ./...`) under high concurrent workloads:
+
+1. **Per-Session Lock Serialization**:
+   Concurrent calls to `client.UploadPart` targeting the same resumable session are serialized through `sessionLocks sync.Map` with per-session mutexes. This prevents lost updates where two concurrent worker goroutines simultaneously fetch and overwrite the session's uploaded parts slice.
+
+2. **Stampede Defense with Panic-Safe Singleflight**:
+   The `singleflightGroup` collapses concurrent identical `Head` or metadata queries into a single driver lookup. If the leader goroutine panics, the panic is caught, the error is safely propagated to all awaiting follower goroutines, and the leader re-panics—preventing deadlocks, memory leaks, or followers receiving phantom `(nil, nil)` results.
+
+3. **Immutable Deep Cloning**:
+   Metadata maps and session parts retrieved from or saved into in-memory caches (`cache/lru.go`) and registries (`registry/memory.go`) are deeply cloned. External modifications to returned structs will never mutate internal cache entries or cause concurrent map read/write panics.
+
+4. **Non-Destructive Rollback Compensation**:
+   In `client.Copy`, destination pre-existence is audited prior to initiating the copy. If a post-copy metadata save fails, BlobKit's rollback compensation only deletes the destination file if it did **not** exist prior to the operation. Pre-existing files are never deleted on rollback.
+
+#### c. Kernel Zero-Copy & RFC 9110 Byte-Range Streaming
+
+- **Linux Zero-Copy (`sendfile` / `splice`)**:
+  BlobKit's `ObjectReader` exposes `WriteTo(w io.Writer)`. When streaming to a network socket (such as an `http.ResponseWriter` backed by `net.TCPConn`), Go's internal runtime engages `sendfile(2)` or `splice(2)`. Bytes stream directly from file descriptors or driver sockets to the network card without touching application user-space memory buffers.
+- **RFC 9110 Range Compliance**:
+  All drivers declaring `CapByteRangeGet` strictly parse HTTP Range headers, including:
+  - Standard ranges: `bytes=0-1024` (inclusive offsets 0 through 1024)
+  - Open-ended ranges: `bytes=2048-` (offset 2048 through EOF)
+  - Suffix ranges: `bytes=-500` (trailing 500 bytes of the object)
+  - Exact EOF behavior: `SeekableReader.ReadAt` returns `io.EOF` whenever bytes read are less than the requested buffer at object boundaries, guaranteeing 100% compliance with Go's standard library `io.ReaderAt` contracts.
+
 ---
 
 ## High-Level Orchestrator & Enterprise Features
@@ -1236,11 +1281,8 @@ defer reader.Close()
 io.Copy(destFile, reader)
 
 // 2. Byte-Range request (fetch bytes 1024 to 4096)
-start := int64(1024)
-end := int64(4096)
 rangeReader, err := client.Get(ctx, obj.ID, blobkit.GetOptions{
-    RangeStart: &start,
-    RangeEnd:   &end,
+    Range: "bytes=1024-4096",
 })
 if err != nil {
     log.Fatal(err)

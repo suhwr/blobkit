@@ -122,8 +122,47 @@ func (s *mockDriveServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
+			// Finalize upload after exact chunk boundary
+			if len(body) == 0 && strings.HasPrefix(contentRange, "bytes */") && contentRange != "bytes */*" {
+				session.Completed = true
+				h := md5.Sum(session.Buffer)
+				checksum := hex.EncodeToString(h[:])
+
+				var file *mockFile
+				if session.IsUpdate && session.TargetFileID != "" {
+					file = s.files[session.TargetFileID]
+					if file != nil {
+						file.Data = session.Buffer
+						file.MD5Checksum = checksum
+						file.ModifiedTime = time.Now().UTC()
+					}
+				}
+
+				if file == nil {
+					s.nextID++
+					fileID := fmt.Sprintf("file_%d", s.nextID)
+					file = &mockFile{
+						ID:           fileID,
+						Name:         session.Name,
+						MimeType:     session.MimeType,
+						Data:         session.Buffer,
+						MD5Checksum:  checksum,
+						CreatedTime:  time.Now().UTC(),
+						ModifiedTime: time.Now().UTC(),
+						AppProperties: map[string]string{
+							"blobkit_key": session.Key,
+						},
+					}
+					s.files[fileID] = file
+				}
+
+				session.FileID = file.ID
+				s.writeFileResponse(w, file)
+				return
+			}
+
 			// Status inquiry with 0 bytes
-			if len(body) == 0 && (contentRange == "bytes */*" || strings.HasPrefix(contentRange, "bytes */")) {
+			if len(body) == 0 && contentRange == "bytes */*" {
 				if session.Completed {
 					file := s.files[session.FileID]
 					s.writeFileResponse(w, file)
@@ -1098,3 +1137,104 @@ func TestDriver_IntegrationWithBlobKitClient(t *testing.T) {
 		t.Fatalf("expected ErrObjectNotFound, got: %v", err)
 	}
 }
+
+func TestDriver_ResumableStreamBoundaryUpload(t *testing.T) {
+	mock := newMockDriveServer()
+	driver, server := setupTestDriver(t, mock)
+	defer server.Close()
+	defer driver.Close()
+	ctx := context.Background()
+
+	// Exactly 256 KiB = ChunkSize (ends on chunk boundary)
+	payload := bytes.Repeat([]byte("A"), 256*1024)
+	key := "boundary/chunk_boundary.dat"
+
+	obj, err := driver.Put(ctx, &blobkit.Object{Key: key}, bytes.NewReader(payload), blobkit.PutOptions{
+		Size: blobkit.SizeUnknown, // Unknown size stream
+	})
+	if err != nil {
+		t.Fatalf("Put on chunk boundary failed: %v", err)
+	}
+	if obj.Size != int64(len(payload)) {
+		t.Fatalf("expected size %d, got %d", len(payload), obj.Size)
+	}
+
+	headObj, err := driver.Head(ctx, key)
+	if err != nil {
+		t.Fatalf("Head failed: %v", err)
+	}
+	if headObj.Size != int64(len(payload)) {
+		t.Fatalf("head size mismatch: %d != %d", headObj.Size, len(payload))
+	}
+}
+
+func TestGDrive_Copy_SameKey(t *testing.T) {
+	mock := newMockDriveServer()
+	driver, server := setupTestDriver(t, mock)
+	defer server.Close()
+	defer driver.Close()
+	ctx := context.Background()
+
+	key := "self-copy-gdrive.txt"
+	_, err := driver.Put(ctx, &blobkit.Object{Key: key}, strings.NewReader("content"), blobkit.PutOptions{Size: 7})
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	// Copy to same key should succeed and not create duplicate file
+	err = driver.Copy(ctx, key, key)
+	if err != nil {
+		t.Fatalf("Copy to same key failed: %v", err)
+	}
+}
+
+func TestGDrive_Copy_OverwritesAndDeletesDuplicate(t *testing.T) {
+	mock := newMockDriveServer()
+	driver, server := setupTestDriver(t, mock)
+	defer server.Close()
+	defer driver.Close()
+	ctx := context.Background()
+
+	srcKey := "source-file.txt"
+	dstKey := "dest-file.txt"
+
+	_, err := driver.Put(ctx, &blobkit.Object{Key: srcKey}, strings.NewReader("source data"), blobkit.PutOptions{Size: 11})
+	if err != nil {
+		t.Fatalf("Put src failed: %v", err)
+	}
+
+	_, err = driver.Put(ctx, &blobkit.Object{Key: dstKey}, strings.NewReader("old dest data"), blobkit.PutOptions{Size: 13})
+	if err != nil {
+		t.Fatalf("Put dst failed: %v", err)
+	}
+
+	// Record old file ID before copy
+	oldDstID, err := driver.Head(ctx, dstKey)
+	if err != nil {
+		t.Fatalf("Head dst before copy failed: %v", err)
+	}
+
+	// Perform copy overwriting existing dstKey
+	err = driver.Copy(ctx, srcKey, dstKey)
+	if err != nil {
+		t.Fatalf("Copy overwrite failed: %v", err)
+	}
+
+	// Verify new content at dstKey
+	newDstObj, err := driver.Head(ctx, dstKey)
+	if err != nil {
+		t.Fatalf("Head dst after copy failed: %v", err)
+	}
+	if newDstObj.Size != 11 {
+		t.Fatalf("expected new size 11, got %d", newDstObj.Size)
+	}
+
+	// Check that mock server does not have orphan old file
+	mock.mu.Lock()
+	_, oldStillExists := mock.files[oldDstID.ID]
+	mock.mu.Unlock()
+	if oldStillExists {
+		t.Fatal("expected old overwritten file to be deleted from Google Drive")
+	}
+}
+

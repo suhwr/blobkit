@@ -86,6 +86,17 @@ func resolveMetadata(obj *blobkit.Object, opts blobkit.PutOptions) map[string]st
 	return nil
 }
 
+func cloneMetadata(m map[string]string) map[string]string {
+	if m == nil {
+		return nil
+	}
+	cp := make(map[string]string, len(m))
+	for k, v := range m {
+		cp[k] = v
+	}
+	return cp
+}
+
 func validateKey(key string) error {
 	return blobkit.ValidateKey(key)
 }
@@ -128,7 +139,7 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 	stored.Bucket = d.bucket
 	stored.Size = int64(len(data))
 	stored.ETag = etag
-	stored.Metadata = resolveMetadata(obj, opts)
+	stored.Metadata = cloneMetadata(resolveMetadata(obj, opts))
 	stored.ChecksumSHA256 = hashHex
 	stored.UpdatedAt = now
 	if stored.CreatedAt.IsZero() {
@@ -178,8 +189,14 @@ func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (
 		data = subData
 	}
 
+	obj := item.obj
+	obj.Metadata = cloneMetadata(item.obj.Metadata)
+	if opts.Range != "" {
+		obj.Size = int64(len(data))
+	}
+
 	return &blobkit.ObjectReader{
-		Object: item.obj,
+		Object: obj,
 		Body:   io.NopCloser(bytes.NewReader(data)),
 	}, nil
 }
@@ -201,6 +218,7 @@ func (d *Driver) Head(ctx context.Context, key string) (*blobkit.Object, error) 
 	}
 
 	obj := item.obj
+	obj.Metadata = cloneMetadata(item.obj.Metadata)
 	return &obj, nil
 }
 
@@ -305,7 +323,9 @@ func (d *Driver) List(ctx context.Context, opts blobkit.ListOptions) (*blobkit.L
 			break
 		}
 		k := keys[i]
-		res.Objects = append(res.Objects, d.items[k].obj)
+		resObj := d.items[k].obj
+		resObj.Metadata = cloneMetadata(resObj.Metadata)
+		res.Objects = append(res.Objects, resObj)
 		count++
 	}
 
@@ -341,6 +361,10 @@ func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
 	if err := validateKey(dstKey); err != nil {
 		return blobkit.WrapError("copy", dstKey, d.name, err)
 	}
+	if srcKey == dstKey {
+		_, err := d.Head(ctx, srcKey)
+		return err
+	}
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -352,6 +376,7 @@ func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
 
 	copiedObj := item.obj
 	copiedObj.Key = dstKey
+	copiedObj.Metadata = cloneMetadata(item.obj.Metadata)
 	copiedObj.UpdatedAt = time.Now().UTC()
 
 	// Clone payload bytes
@@ -380,10 +405,12 @@ func (d *Driver) CreateMultipart(ctx context.Context, obj *blobkit.Object, opts 
 	defer d.mu.Unlock()
 
 	uploadID := fmt.Sprintf("mem-upload-%d", time.Now().UnixNano())
+	objCopy := *obj
+	objCopy.Metadata = cloneMetadata(obj.Metadata)
 	d.sessions[uploadID] = &memMultipartSession{
 		uploadID: uploadID,
 		key:      obj.Key,
-		obj:      *obj,
+		obj:      objCopy,
 		parts:    make(map[int32][]byte),
 	}
 	return uploadID, nil
@@ -489,6 +516,7 @@ func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, upl
 	stored.Size = int64(len(finalData))
 	stored.ETag = etag
 	stored.ChecksumSHA256 = hashHex
+	stored.Metadata = cloneMetadata(session.obj.Metadata)
 	stored.UpdatedAt = now
 	if stored.CreatedAt.IsZero() {
 		stored.CreatedAt = now
@@ -606,7 +634,7 @@ func parseRange(rangeHeader string, data []byte) ([]byte, error) {
 		}
 	}
 
-	if start > end || start >= total {
+	if start < 0 || start > end || start >= total {
 		return nil, blobkit.ErrPreconditionFailed
 	}
 	if end >= total {

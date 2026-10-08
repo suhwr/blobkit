@@ -110,6 +110,12 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 		return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
 	}
 
+	if err := ctx.Err(); err != nil {
+		tmpFile.Close()
+		_ = os.Remove(tmpName)
+		return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
+	}
+
 	if err := sizeReader.Verify(); err != nil {
 		tmpFile.Close()
 		_ = os.Remove(tmpName)
@@ -219,19 +225,37 @@ func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (
 	var reader io.ReadCloser = f
 	totalSize := fi.Size()
 
-	// Parse HTTP Range header if requested (e.g. "bytes=100-200" or "bytes=100-")
+	// Parse HTTP Range header if requested (e.g. "bytes=100-200", "bytes=100-", or "bytes=-500")
 	if opts.Range != "" && strings.HasPrefix(opts.Range, "bytes=") {
 		rangeSpec := strings.TrimPrefix(opts.Range, "bytes=")
 		parts := strings.Split(rangeSpec, "-")
 		if len(parts) == 2 {
-			start, err1 := strconv.ParseInt(parts[0], 10, 64)
-			var end int64 = totalSize - 1
-			var err2 error
-			if parts[1] != "" {
-				end, err2 = strconv.ParseInt(parts[1], 10, 64)
-			}
-
-			if err1 != nil || err2 != nil || start < 0 || start > totalSize || end < start {
+			var start, end int64
+			if parts[0] == "" && parts[1] != "" {
+				// Suffix range: bytes=-N
+				suffixLen, err := strconv.ParseInt(parts[1], 10, 64)
+				if err != nil || suffixLen <= 0 {
+					f.Close()
+					return nil, blobkit.WrapError("get", key, d.cfg.Name, blobkit.ErrPreconditionFailed)
+				}
+				if suffixLen >= totalSize {
+					start = 0
+				} else {
+					start = totalSize - suffixLen
+				}
+				end = totalSize - 1
+			} else if parts[0] != "" {
+				var err1, err2 error
+				start, err1 = strconv.ParseInt(parts[0], 10, 64)
+				end = totalSize - 1
+				if parts[1] != "" {
+					end, err2 = strconv.ParseInt(parts[1], 10, 64)
+				}
+				if err1 != nil || err2 != nil || start < 0 || start > totalSize || end < start {
+					f.Close()
+					return nil, blobkit.WrapError("get", key, d.cfg.Name, blobkit.ErrPreconditionFailed)
+				}
+			} else {
 				f.Close()
 				return nil, blobkit.WrapError("get", key, d.cfg.Name, blobkit.ErrPreconditionFailed)
 			}
@@ -422,6 +446,11 @@ func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
 	if err := ctx.Err(); err != nil {
 		return blobkit.WrapError("copy", srcKey, d.cfg.Name, err)
 	}
+	if srcKey == dstKey {
+		_, err := d.Head(ctx, srcKey)
+		return err
+	}
+
 	srcPath, err := resolvePath(d.cfg.RootDir, srcKey, d.cfg.StagingDir)
 	if err != nil {
 		return err

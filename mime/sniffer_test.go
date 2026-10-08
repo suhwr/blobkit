@@ -111,3 +111,34 @@ func TestSniffHintOverride(t *testing.T) {
 		t.Fatal("stream mismatch")
 	}
 }
+
+func TestSniff_SeekerNonZeroOffset(t *testing.T) {
+	pngHeader := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D}
+	prefix := []byte("PREFIXLEN10")
+	full := append(prefix, pngHeader...)
+
+	reader := bytes.NewReader(full)
+	// Seek past the prefix
+	_, err := reader.Seek(int64(len(prefix)), io.SeekStart)
+	if err != nil {
+		t.Fatalf("seek failed: %v", err)
+	}
+
+	reconstructed, ct, err := mime.Sniff(reader, "image.png", "")
+	if err != nil {
+		t.Fatalf("Sniff failed: %v", err)
+	}
+	if ct != "image/png" {
+		t.Fatalf("expected 'image/png', got %s", ct)
+	}
+
+	// Verify reading from reconstructed stream continues from offset, NOT rewinded to 0
+	readRemaining, err := io.ReadAll(reconstructed)
+	if err != nil {
+		t.Fatalf("ReadAll failed: %v", err)
+	}
+	if !bytes.Equal(readRemaining, pngHeader) {
+		t.Fatalf("expected %v, got %v", pngHeader, readRemaining)
+	}
+}
+

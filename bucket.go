@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
+	"sync/atomic"
 )
 
 // Bucket provides a lightweight, stateless, key-value object storage abstraction.
@@ -230,15 +232,16 @@ func (b *Bucket) ListParts(ctx context.Context, key string, uploadID string) ([]
 
 // BucketWriter implements io.WriteCloser for streaming writes directly into storage.
 type BucketWriter struct {
+	once   sync.Once
 	pw     *io.PipeWriter
 	doneCh chan error
 	err    error
-	closed bool
+	closed atomic.Bool
 }
 
 // Write writes a slice of bytes to the underlying streaming pipeline.
 func (w *BucketWriter) Write(p []byte) (n int, err error) {
-	if w.closed {
+	if w.closed.Load() {
 		return 0, errors.New("blobkit: writer is closed")
 	}
 	return w.pw.Write(p)
@@ -246,23 +249,21 @@ func (w *BucketWriter) Write(p []byte) (n int, err error) {
 
 // Close finalizes the upload stream and waits for the storage backend to confirm persistence.
 func (w *BucketWriter) Close() error {
-	if w.closed {
-		return w.err
-	}
-	w.closed = true
-	_ = w.pw.Close()
-	w.err = <-w.doneCh
+	w.once.Do(func() {
+		w.closed.Store(true)
+		_ = w.pw.Close()
+		w.err = <-w.doneCh
+	})
 	return w.err
 }
 
 // CloseWithError aborts the streaming upload with the specified error.
 func (w *BucketWriter) CloseWithError(err error) error {
-	if w.closed {
-		return w.err
-	}
-	w.closed = true
-	_ = w.pw.CloseWithError(err)
-	w.err = <-w.doneCh
+	w.once.Do(func() {
+		w.closed.Store(true)
+		_ = w.pw.CloseWithError(err)
+		w.err = <-w.doneCh
+	})
 	return w.err
 }
 

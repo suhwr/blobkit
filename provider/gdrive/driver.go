@@ -122,6 +122,9 @@ func readErrorBody(body io.Reader) []byte {
 
 // Put uploads an object stream to Google Drive, preserving S3-compatible overwrite semantics.
 func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts blobkit.PutOptions) (*blobkit.Object, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("put", "", d.cfg.Name, err)
+	}
 	if r == nil {
 		return nil, blobkit.ErrNilReader
 	}
@@ -158,6 +161,9 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 
 // Get retrieves an object stream and its metadata from Google Drive.
 func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (*blobkit.ObjectReader, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("get", key, d.cfg.Name, err)
+	}
 	if err := blobkit.ValidateKey(key); err != nil {
 		return nil, err
 	}
@@ -235,6 +241,9 @@ func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (
 
 // Head inspects an object and returns its metadata without downloading the body.
 func (d *Driver) Head(ctx context.Context, key string) (*blobkit.Object, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("head", key, d.cfg.Name, err)
+	}
 	if err := blobkit.ValidateKey(key); err != nil {
 		return nil, err
 	}
@@ -290,6 +299,9 @@ func (d *Driver) Head(ctx context.Context, key string) (*blobkit.Object, error) 
 
 // Delete removes an object from Google Drive permanently.
 func (d *Driver) Delete(ctx context.Context, key string) error {
+	if err := ctx.Err(); err != nil {
+		return blobkit.WrapError("delete", key, d.cfg.Name, err)
+	}
 	if err := blobkit.ValidateKey(key); err != nil {
 		return err
 	}
@@ -305,6 +317,15 @@ func (d *Driver) Delete(ctx context.Context, key string) error {
 		return err
 	}
 
+	d.cache.Delete(key)
+	if err := d.deleteFileByID(ctx, fileID); err != nil {
+		return wrapHTTPError("delete", key, d.cfg.Name, 0, nil, err)
+	}
+
+	return nil
+}
+
+func (d *Driver) deleteFileByID(ctx context.Context, fileID string) error {
 	params := url.Values{}
 	if d.cfg.SupportsAllDrives {
 		params.Set("supportsAllDrives", "true")
@@ -313,24 +334,22 @@ func (d *Driver) Delete(ctx context.Context, key string) error {
 	endpoint := fmt.Sprintf("%s/files/%s?%s", d.cfg.DriveAPIBaseURL, url.PathEscape(fileID), params.Encode())
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
 	if err != nil {
-		return blobkit.WrapError("delete", key, d.cfg.Name, err)
+		return err
 	}
 
 	if err := d.authorizeRequest(ctx, req); err != nil {
-		return blobkit.WrapError("delete", key, d.cfg.Name, err)
+		return err
 	}
 
 	resp, err := d.httpClient.Do(req)
 	if err != nil {
-		return wrapHTTPError("delete", key, d.cfg.Name, 0, nil, err)
+		return err
 	}
 	defer resp.Body.Close()
 
-	d.cache.Delete(key)
-
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
 		bodyBytes := readErrorBody(resp.Body)
-		return wrapHTTPError("delete", key, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
+		return wrapHTTPError("delete", fileID, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
 	}
 
 	return nil
@@ -340,6 +359,9 @@ func (d *Driver) Delete(ctx context.Context, key string) error {
 func (d *Driver) DeleteBatch(ctx context.Context, keys []string) ([]string, error) {
 	if len(keys) == 0 {
 		return nil, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("delete_batch", "", d.cfg.Name, err)
 	}
 	for _, k := range keys {
 		if err := blobkit.ValidateKey(k); err != nil {
@@ -400,6 +422,9 @@ func (d *Driver) DeleteBatch(ctx context.Context, keys []string) ([]string, erro
 
 // Copy duplicates an object within Google Drive and updates the destination key.
 func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
+	if err := ctx.Err(); err != nil {
+		return blobkit.WrapError("copy", srcKey, d.cfg.Name, err)
+	}
 	if err := blobkit.ValidateKey(srcKey); err != nil {
 		return err
 	}
@@ -407,10 +432,20 @@ func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
 		return err
 	}
 
+	if srcKey == dstKey {
+		_, err := d.resolveFileID(ctx, srcKey)
+		return err
+	}
+
+	unlock := d.acquireKeyLock(dstKey)
+	defer unlock()
+
 	srcFileID, err := d.resolveFileID(ctx, srcKey)
 	if err != nil {
 		return err
 	}
+
+	existingDstFileID, _ := d.lookupFileID(ctx, dstKey)
 
 	metadata := map[string]interface{}{
 		"name":    path.Base(dstKey),
@@ -458,11 +493,18 @@ func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
 		d.cache.Set(dstKey, fileResp.ID)
 	}
 
+	if existingDstFileID != "" && existingDstFileID != fileResp.ID {
+		_ = d.deleteFileByID(ctx, existingDstFileID)
+	}
+
 	return nil
 }
 
 // List lists objects in Google Drive matching the provided criteria.
 func (d *Driver) List(ctx context.Context, opts blobkit.ListOptions) (*blobkit.ListResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("list", opts.Prefix, d.cfg.Name, err)
+	}
 	params := url.Values{}
 	query := fmt.Sprintf("'%s' in parents and trashed = false", escapeQueryParam(d.cfg.FolderID))
 	params.Set("q", query)
@@ -738,7 +780,8 @@ func (d *Driver) mapDriveFileToObject(key string, file *driveFileResponse) *blob
 	}
 }
 
-// escapeQueryParam escapes single quotes in values for Google Drive 'q' search queries.
+// escapeQueryParam escapes backslashes and single quotes in values for Google Drive 'q' search queries.
 func escapeQueryParam(val string) string {
+	val = strings.ReplaceAll(val, "\\", "\\\\")
 	return strings.ReplaceAll(val, "'", "\\'")
 }

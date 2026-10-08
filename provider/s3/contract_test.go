@@ -36,6 +36,7 @@ type mockS3Server struct {
 	objects    map[string]*mockS3Object
 	uploads    map[string]map[int32][]byte // uploadID -> partNumber -> data
 	uploadKeys map[string]string           // uploadID -> key
+	maxParts   int
 }
 
 func newMockS3Server(bucket string) *mockS3Server {
@@ -200,14 +201,47 @@ func (s *mockS3Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		marker := 0
+		if mStr := r.URL.Query().Get("part-number-marker"); mStr != "" {
+			marker, _ = strconv.Atoi(mStr)
+		}
+		maxParts := 1000
+		if s.maxParts > 0 {
+			maxParts = s.maxParts
+		}
+		if mpStr := r.URL.Query().Get("max-parts"); mpStr != "" {
+			if mp, err := strconv.Atoi(mpStr); err == nil && mp > 0 {
+				maxParts = mp
+			}
+		}
+
+		var allPartNums []int
+		for num := range stagedParts {
+			if int(num) > marker {
+				allPartNums = append(allPartNums, int(num))
+			}
+		}
+		sort.Ints(allPartNums)
+
+		isTruncated := len(allPartNums) > maxParts
+		limit := len(allPartNums)
+		if isTruncated {
+			limit = maxParts
+		}
+		pagePartNums := allPartNums[:limit]
+
+		var nextMarker string
+		if isTruncated && len(pagePartNums) > 0 {
+			nextMarker = strconv.Itoa(pagePartNums[len(pagePartNums)-1])
+		}
+
 		var xmlBuf bytes.Buffer
 		xmlBuf.WriteString(`<ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`)
-		var partNums []int
-		for num := range stagedParts {
-			partNums = append(partNums, int(num))
+		xmlBuf.WriteString(fmt.Sprintf(`<IsTruncated>%t</IsTruncated>`, isTruncated))
+		if nextMarker != "" {
+			xmlBuf.WriteString(fmt.Sprintf(`<NextPartNumberMarker>%s</NextPartNumberMarker>`, nextMarker))
 		}
-		sort.Ints(partNums)
-		for _, num := range partNums {
+		for _, num := range pagePartNums {
 			pData := stagedParts[int32(num)]
 			h := md5.Sum(pData)
 			etag := fmt.Sprintf("\"%s\"", hex.EncodeToString(h[:]))

@@ -3,6 +3,7 @@ package policy_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/suhwr/blobkit"
@@ -58,11 +59,11 @@ func TestPolicy_SanitizeAndInjectionDefense(t *testing.T) {
 		t.Fatalf("expected 'passwd', got %q", sanitized)
 	}
 
-	// 2. CRLF header injection
-	maliciousHeader := "attachment; filename=\"safe.jpg\"\r\nSet-Cookie: stolen=123"
+	// 2. CRLF header injection and null byte stripping
+	maliciousHeader := "attachment; filename=\"safe.jpg\"\x00\r\nSet-Cookie: stolen=123"
 	cleaned := policy.SanitizeHeader(maliciousHeader)
-	if cleaned == maliciousHeader || len(cleaned) == 0 {
-		t.Fatal("CRLF header was not sanitized")
+	if cleaned == maliciousHeader || len(cleaned) == 0 || strings.Contains(cleaned, "\x00") {
+		t.Fatalf("CRLF / null-byte header was not properly sanitized: %q", cleaned)
 	}
 
 	// 3. Path traversal detection via Validate

@@ -175,23 +175,24 @@ func SanitizeFilename(raw string) string {
 	if raw == "" {
 		return ""
 	}
+	raw = strings.ReplaceAll(raw, "\\", "/")
 	cleaned := filepath.Base(raw)
-	cleaned = strings.ReplaceAll(cleaned, "\\", "")
 	cleaned = strings.ReplaceAll(cleaned, "\x00", "")
 	cleaned = reCRLF.ReplaceAllString(cleaned, "")
 	cleaned = reControlChars.ReplaceAllString(cleaned, "")
 	cleaned = strings.TrimSpace(cleaned)
-	if cleaned == "." || cleaned == ".." {
+	if cleaned == "." || cleaned == ".." || cleaned == "/" {
 		return ""
 	}
 	return cleaned
 }
 
-// SanitizeHeader removes CRLF characters to prevent HTTP response splitting / header injection.
+// SanitizeHeader removes CRLF characters and null bytes to prevent HTTP response splitting / header injection.
 func SanitizeHeader(raw string) string {
 	if raw == "" {
 		return ""
 	}
+	raw = strings.ReplaceAll(raw, "\x00", "")
 	return reCRLF.ReplaceAllString(raw, " ")
 }
 

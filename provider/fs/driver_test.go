@@ -264,14 +264,13 @@ func TestDriver_MultipartLifecycle(t *testing.T) {
 	if len(parts) != 3 {
 		t.Fatalf("expected 3 parts, got %d", len(parts))
 	}
-
-	// 4. CompleteMultipart
-	completedParts := []blobkit.CompletedPart{
-		{PartNumber: 1, ETag: etag1, Size: int64(len(chunk1))},
-		{PartNumber: 2, ETag: etag2, Size: int64(len(chunk2))},
-		{PartNumber: 3, ETag: etag3, Size: int64(len(chunk3))},
+	if parts[0].ETag != etag1 || parts[1].ETag != etag2 || parts[2].ETag != etag3 {
+		t.Fatalf("ListParts etags mismatch: got [%s, %s, %s], expected [%s, %s, %s]",
+			parts[0].ETag, parts[1].ETag, parts[2].ETag, etag1, etag2, etag3)
 	}
-	finalObj, err := driver.CompleteMultipart(ctx, obj, uploadID, completedParts)
+
+	// 4. CompleteMultipart using returned parts directly
+	finalObj, err := driver.CompleteMultipart(ctx, obj, uploadID, parts)
 	if err != nil {
 		t.Fatalf("CompleteMultipart failed: %v", err)
 	}
@@ -516,5 +515,38 @@ func TestDriver_IntegrationWithBlobKitClient(t *testing.T) {
 	_, err = client.Head(ctx, obj.Key)
 	if !errors.Is(err, blobkit.ErrObjectNotFound) {
 		t.Fatalf("expected ErrObjectNotFound, got: %v", err)
+	}
+}
+
+func TestDriver_SuffixByteRange(t *testing.T) {
+	driver, _ := newTestDriver(t)
+	defer driver.Close()
+	ctx := context.Background()
+
+	payload := []byte("0123456789abcdefghijklmnopqrstuvwxyz")
+	key := "suffix/test.txt"
+	_, err := driver.Put(ctx, &blobkit.Object{Key: key}, bytes.NewReader(payload), blobkit.PutOptions{
+		Size: int64(len(payload)),
+	})
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	// Request last 6 bytes: bytes=-6
+	r, err := driver.Get(ctx, key, blobkit.GetOptions{
+		Range: "bytes=-6",
+	})
+	if err != nil {
+		t.Fatalf("Get with suffix range failed: %v", err)
+	}
+	defer r.Body.Close()
+
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		t.Fatalf("ReadAll failed: %v", err)
+	}
+	expected := "uvwxyz"
+	if string(data) != expected {
+		t.Fatalf("expected suffix %q, got %q", expected, string(data))
 	}
 }

@@ -512,41 +512,40 @@ func (d *Driver) uploadStreamResumable(ctx context.Context, obj *blobkit.Object,
 		}
 	}
 
-	// If empty file (0 bytes), finalize upload
-	if uploaded == 0 {
-		if sr, ok := r.(*blobkit.SizeReader); ok {
-			if err := sr.Verify(); err != nil {
-				_ = d.AbortMultipart(context.Background(), obj.Key, session.uploadURI)
-				return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
-			}
-		}
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodPut, session.uploadURI, bytes.NewReader(nil))
-		if err != nil {
+	// Finalize upload if not yet completed (e.g. empty file or stream ending on chunk boundary)
+	if sr, ok := r.(*blobkit.SizeReader); ok {
+		if err := sr.Verify(); err != nil {
+			_ = d.AbortMultipart(context.Background(), obj.Key, session.uploadURI)
 			return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
 		}
-		req.Header.Set("Content-Length", "0")
-		req.Header.Set("Content-Range", "bytes */0")
-
-		resp, err := d.httpClient.Do(req)
-		if err != nil {
-			return nil, wrapHTTPError("put", obj.Key, d.cfg.Name, 0, nil, err)
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
-			bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-			var fileResp driveFileResponse
-			if err := json.Unmarshal(bodyBytes, &fileResp); err != nil {
-				return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
-			}
-			res := d.mapDriveFileToObject(obj.Key, &fileResp)
-			d.cache.Set(obj.Key, fileResp.ID)
-			return res, nil
-		}
-		bodyBytes := readErrorBody(resp.Body)
-		return nil, wrapHTTPError("put", obj.Key, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
 	}
 
-	return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, fmt.Errorf("unexpected end of upload stream without completion"))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, session.uploadURI, bytes.NewReader(nil))
+	if err != nil {
+		_ = d.AbortMultipart(context.Background(), obj.Key, session.uploadURI)
+		return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
+	}
+	req.Header.Set("Content-Length", "0")
+	req.Header.Set("Content-Range", fmt.Sprintf("bytes */%d", uploaded))
+
+	resp, err := d.httpClient.Do(req)
+	if err != nil {
+		_ = d.AbortMultipart(context.Background(), obj.Key, session.uploadURI)
+		return nil, wrapHTTPError("put", obj.Key, d.cfg.Name, 0, nil, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		var fileResp driveFileResponse
+		if err := json.Unmarshal(bodyBytes, &fileResp); err != nil {
+			return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
+		}
+		res := d.mapDriveFileToObject(obj.Key, &fileResp)
+		d.cache.Set(obj.Key, fileResp.ID)
+		return res, nil
+	}
+	bodyBytes := readErrorBody(resp.Body)
+	_ = d.AbortMultipart(context.Background(), obj.Key, session.uploadURI)
+	return nil, wrapHTTPError("put", obj.Key, d.cfg.Name, resp.StatusCode, bodyBytes, nil)
 }

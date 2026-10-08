@@ -227,6 +227,12 @@ func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, upl
 	now := time.Now().UTC()
 	etag := resp.Header.Get("ETag")
 
+	if totalSize == 0 && len(parts) > 0 {
+		if headObj, headErr := d.Head(ctx, obj.Key); headErr == nil && headObj != nil {
+			totalSize = headObj.Size
+		}
+	}
+
 	res := *obj
 	res.Bucket = d.cfg.Container
 	res.Size = totalSize
@@ -314,15 +320,29 @@ func (d *Driver) ListParts(ctx context.Context, key string, uploadID string) ([]
 		return nil, blobkit.WrapError("list_parts", key, d.cfg.Name, err)
 	}
 
-	var parts []blobkit.CompletedPart
-	for _, b := range append(blResp.CommittedBlocks, blResp.UncommittedBlocks...) {
+	seen := make(map[int32]blobkit.CompletedPart)
+	for _, b := range blResp.CommittedBlocks {
 		num := parseBlockID(b.Name)
 		if num > 0 {
-			parts = append(parts, blobkit.CompletedPart{
+			seen[num] = blobkit.CompletedPart{
 				PartNumber: num,
 				Size:       b.Size,
-			})
+			}
 		}
+	}
+	for _, b := range blResp.UncommittedBlocks {
+		num := parseBlockID(b.Name)
+		if num > 0 {
+			seen[num] = blobkit.CompletedPart{
+				PartNumber: num,
+				Size:       b.Size,
+			}
+		}
+	}
+
+	parts := make([]blobkit.CompletedPart, 0, len(seen))
+	for _, p := range seen {
+		parts = append(parts, p)
 	}
 
 	sort.Slice(parts, func(i, j int) bool {

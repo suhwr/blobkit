@@ -58,6 +58,7 @@ func (c *LRUCache) Get(key string) (*blobkit.Object, bool) {
 
 	c.evictList.MoveToFront(elem)
 	cp := *item.obj
+	cp.Metadata = cloneMetadata(item.obj.Metadata)
 	return &cp, true
 }
 
@@ -75,11 +76,14 @@ func (c *LRUCache) Set(key string, obj *blobkit.Object, ttl time.Duration) {
 		exp = time.Now().UTC().Add(ttl)
 	}
 
+	storedObj := *obj
+	storedObj.Metadata = cloneMetadata(obj.Metadata)
+
 	// Update existing element
 	if elem, exists := c.items[key]; exists {
 		c.evictList.MoveToFront(elem)
 		item := elem.Value.(*cacheItem)
-		item.obj = obj
+		item.obj = &storedObj
 		item.expiresAt = exp
 		item.isNegative = false
 		return
@@ -92,12 +96,23 @@ func (c *LRUCache) Set(key string, obj *blobkit.Object, ttl time.Duration) {
 
 	item := &cacheItem{
 		key:        key,
-		obj:        obj,
+		obj:        &storedObj,
 		expiresAt:  exp,
 		isNegative: false,
 	}
 	elem := c.evictList.PushFront(item)
 	c.items[key] = elem
+}
+
+func cloneMetadata(m map[string]string) map[string]string {
+	if m == nil {
+		return nil
+	}
+	cp := make(map[string]string, len(m))
+	for k, v := range m {
+		cp[k] = v
+	}
+	return cp
 }
 
 // SetNegative records a negative lookup (object does not exist) with TTL.

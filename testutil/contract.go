@@ -219,6 +219,15 @@ func RunDriverContractTests(t *testing.T, factory func(t *testing.T) (blobkit.Dr
 			t.Fatalf("source object should still exist after copy: %v", err)
 		}
 
+		// Copying object to itself should succeed and preserve object
+		if err := driver.Copy(ctx, srcKey, srcKey); err != nil {
+			t.Fatalf("Copy to self failed: %v", err)
+		}
+		selfHead, err := driver.Head(ctx, srcKey)
+		if err != nil || selfHead == nil {
+			t.Fatalf("source object should still exist after copy to self: %v", err)
+		}
+
 		// Non-existent source must fail with ErrObjectNotFound
 		err = driver.Copy(ctx, "contract-tests/non_existent.txt", "contract-tests/dest_non.txt")
 		if err == nil {

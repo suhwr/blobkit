@@ -235,3 +235,105 @@ func TestSQLiteStore_WithClientAndSweeper(t *testing.T) {
 		t.Fatalf("expected ErrObjectNotFound after purge, got %v", getErr)
 	}
 }
+
+func TestSQLiteStore_NonexistentErrors(t *testing.T) {
+	ctx := context.Background()
+	store, err := sqlite.New(sqlite.Config{
+		FilePath:    ":memory:",
+		AutoMigrate: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to init sqlite store: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.UpdateStatus(ctx, "nonexistent", blobkit.StateCommitted); !errors.Is(err, blobkit.ErrObjectNotFound) {
+		t.Fatalf("expected ErrObjectNotFound on UpdateStatus, got %v", err)
+	}
+
+	if err := store.HardDelete(ctx, "nonexistent"); !errors.Is(err, blobkit.ErrObjectNotFound) {
+		t.Fatalf("expected ErrObjectNotFound on HardDelete, got %v", err)
+	}
+
+	if err := store.DeleteSession(ctx, "nonexistent"); !errors.Is(err, blobkit.ErrSessionNotFound) {
+		t.Fatalf("expected ErrSessionNotFound on DeleteSession, got %v", err)
+	}
+}
+
+func TestSQLiteStore_SubNamespace_DeletedBefore_AndOrdering(t *testing.T) {
+	ctx := context.Background()
+	store, err := sqlite.New(sqlite.Config{
+		FilePath:    ":memory:",
+		AutoMigrate: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to init sqlite store: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	_ = store.Save(ctx, &blobkit.Record{
+		ObjectID:  "sq-ns-1",
+		Key:       "media/file1.png",
+		Namespace: "media",
+		Status:    blobkit.StateCommitted,
+		CreatedAt: now.Add(-10 * time.Minute),
+	})
+	_ = store.Save(ctx, &blobkit.Record{
+		ObjectID:  "sq-ns-2",
+		Key:       "media/images/file2.png",
+		Namespace: "media/images",
+		Status:    blobkit.StateCommitted,
+		CreatedAt: now.Add(-5 * time.Minute),
+	})
+	_ = store.Save(ctx, &blobkit.Record{
+		ObjectID:  "sq-ns-3",
+		Key:       "media_other/file3.png",
+		Namespace: "media_other",
+		Status:    blobkit.StateCommitted,
+		CreatedAt: now.Add(-1 * time.Minute),
+	})
+
+	// 1. Find by "media" should match "media" and "media/images", but NOT "media_other"
+	matched, err := store.Find(ctx, blobkit.Filter{Namespace: "media"})
+	if err != nil {
+		t.Fatalf("Find failed: %v", err)
+	}
+	if len(matched) != 2 {
+		t.Fatalf("expected 2 matches for namespace 'media', got %d", len(matched))
+	}
+
+	// 2. Ordering: verify newest first (DESC)
+	if matched[0].ObjectID != "sq-ns-2" || matched[1].ObjectID != "sq-ns-1" {
+		t.Fatalf("expected DESC order ('sq-ns-2' before 'sq-ns-1'), got [%s, %s]", matched[0].ObjectID, matched[1].ObjectID)
+	}
+
+	// 3. Soft-deleted records test with DeletedBefore
+	delTime1 := now.Add(-2 * time.Hour)
+	delTime2 := now.Add(-10 * time.Minute)
+	_ = store.Save(ctx, &blobkit.Record{
+		ObjectID:  "sq-del-1",
+		Key:       "del1.txt",
+		Status:    blobkit.StateDeleted,
+		DeletedAt: &delTime1,
+	})
+	_ = store.Save(ctx, &blobkit.Record{
+		ObjectID:  "sq-del-2",
+		Key:       "del2.txt",
+		Status:    blobkit.StateDeleted,
+		DeletedAt: &delTime2,
+	})
+
+	cutoff := now.Add(-1 * time.Hour)
+	delMatched, err := store.Find(ctx, blobkit.Filter{
+		Status:        blobkit.StateDeleted,
+		DeletedBefore: &cutoff,
+	})
+	if err != nil {
+		t.Fatalf("Find deleted failed: %v", err)
+	}
+	if len(delMatched) != 1 || delMatched[0].ObjectID != "sq-del-1" {
+		t.Fatalf("expected only sq-del-1, got %+v", delMatched)
+	}
+}
+

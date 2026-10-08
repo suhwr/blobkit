@@ -110,6 +110,9 @@ func (s *Sweeper) RunOnce(ctx context.Context) (*SweepResult, error) {
 			if rec.LegalHold {
 				continue
 			}
+			if rec.RetentionUntil != nil && rec.RetentionUntil.After(now) {
+				continue
+			}
 			candidateIDs = append(candidateIDs, rec.ObjectID)
 		}
 		if len(candidateIDs) > 0 {
@@ -149,7 +152,7 @@ func (s *Sweeper) RunOnce(ctx context.Context) (*SweepResult, error) {
 	}
 
 	// 3. Abort stale multipart upload sessions
-	sessionCutoff := now
+	sessionCutoff := now.Add(-s.cfg.MultipartStaleTTL)
 	staleSessions, err := s.client.FindStaleSessions(ctx, sessionCutoff, s.cfg.BatchSize)
 	if err != nil {
 		res.Errors = append(res.Errors, fmt.Errorf("find stale sessions: %w", err))
@@ -208,11 +211,16 @@ func (s *Sweeper) Start(ctx context.Context) error {
 // Stop gracefully signals the background sweeper loop to shut down and waits for completion.
 func (s *Sweeper) Stop() {
 	s.mu.Lock()
-	if !s.running.Load() {
+	if !s.running.Load() || s.stopCh == nil {
 		s.mu.Unlock()
 		return
 	}
-	close(s.stopCh)
+	select {
+	case <-s.stopCh:
+		// already closed
+	default:
+		close(s.stopCh)
+	}
 	done := s.doneCh
 	s.mu.Unlock()
 

@@ -141,3 +141,183 @@ func TestMemoryStore_Pagination(t *testing.T) {
 		t.Fatal("pagination overlap detected")
 	}
 }
+
+func TestMemoryStore_NonexistentErrors(t *testing.T) {
+	ctx := context.Background()
+	store := registry.NewMemoryStore()
+	defer store.Close()
+
+	if err := store.UpdateStatus(ctx, "nonexistent", blobkit.StateCommitted); !errors.Is(err, blobkit.ErrObjectNotFound) {
+		t.Fatalf("expected ErrObjectNotFound on UpdateStatus, got %v", err)
+	}
+
+	if err := store.HardDelete(ctx, "nonexistent"); !errors.Is(err, blobkit.ErrObjectNotFound) {
+		t.Fatalf("expected ErrObjectNotFound on HardDelete, got %v", err)
+	}
+
+	if err := store.DeleteSession(ctx, "nonexistent"); !errors.Is(err, blobkit.ErrSessionNotFound) {
+		t.Fatalf("expected ErrSessionNotFound on DeleteSession, got %v", err)
+	}
+}
+
+func TestMemoryStore_DeepCloning(t *testing.T) {
+	ctx := context.Background()
+	store := registry.NewMemoryStore()
+	defer store.Close()
+
+	meta := map[string]string{"foo": "bar"}
+	rec := &registry.Record{
+		ObjectID: "clone-id",
+		Key:      "clone-key",
+		Metadata: meta,
+	}
+	if err := store.Save(ctx, rec); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+
+	meta["foo"] = "tampered"
+	fetched, err := store.GetByID(ctx, "clone-id")
+	if err != nil {
+		t.Fatalf("GetByID failed: %v", err)
+	}
+	if fetched.Metadata["foo"] != "bar" {
+		t.Fatalf("expected 'bar', got %q", fetched.Metadata["foo"])
+	}
+
+	fetched.Metadata["foo"] = "retrieved-tampered"
+	fetched2, _ := store.GetByID(ctx, "clone-id")
+	if fetched2.Metadata["foo"] != "bar" {
+		t.Fatalf("expected 'bar', got %q", fetched2.Metadata["foo"])
+	}
+
+	// Resumable session cloning
+	parts := []blobkit.CompletedPart{{PartNumber: 1, ETag: "etag1", Size: 100}}
+	sess := &registry.UploadSession{
+		ID:    "sess-clone",
+		Parts: parts,
+	}
+	if err := store.SaveSession(ctx, sess); err != nil {
+		t.Fatalf("SaveSession failed: %v", err)
+	}
+
+	parts[0].ETag = "tampered-etag"
+	fetchedSess, err := store.GetSession(ctx, "sess-clone")
+	if err != nil {
+		t.Fatalf("GetSession failed: %v", err)
+	}
+	if fetchedSess.Parts[0].ETag != "etag1" {
+		t.Fatalf("expected 'etag1', got %q", fetchedSess.Parts[0].ETag)
+	}
+}
+
+func TestMemoryStore_ReusingKeyAfterDeletion(t *testing.T) {
+	ctx := context.Background()
+	store := registry.NewMemoryStore()
+	defer store.Close()
+
+	rec1 := &registry.Record{
+		ObjectID: "id-1",
+		Key:      "logs/app.log",
+		Status:   blobkit.StateCommitted,
+	}
+	if err := store.Save(ctx, rec1); err != nil {
+		t.Fatalf("Save rec1 failed: %v", err)
+	}
+
+	// Active key collision
+	rec2 := &registry.Record{
+		ObjectID: "id-2",
+		Key:      "logs/app.log",
+		Status:   blobkit.StateCommitted,
+	}
+	if err := store.Save(ctx, rec2); err == nil {
+		t.Fatal("expected key collision error when saving active duplicate key")
+	}
+
+	// Delete rec1
+	if err := store.UpdateStatus(ctx, "id-1", blobkit.StateDeleted); err != nil {
+		t.Fatalf("UpdateStatus deleted failed: %v", err)
+	}
+
+	// Now rec2 should save successfully
+	if err := store.Save(ctx, rec2); err != nil {
+		t.Fatalf("Save rec2 after rec1 deletion failed: %v", err)
+	}
+
+	// GetByKey should now return rec2
+	fetched, err := store.GetByKey(ctx, "logs/app.log")
+	if err != nil {
+		t.Fatalf("GetByKey failed: %v", err)
+	}
+	if fetched.ObjectID != "id-2" {
+		t.Fatalf("expected 'id-2', got %q", fetched.ObjectID)
+	}
+}
+
+func TestMemoryStore_SubNamespaceAndDeletedBefore(t *testing.T) {
+	ctx := context.Background()
+	store := registry.NewMemoryStore()
+	defer store.Close()
+
+	now := time.Now().UTC()
+	_ = store.Save(ctx, &registry.Record{
+		ObjectID:  "rec-ns-1",
+		Key:       "media/file1.png",
+		Namespace: "media",
+		Status:    blobkit.StateCommitted,
+		CreatedAt: now.Add(-10 * time.Minute),
+	})
+	_ = store.Save(ctx, &registry.Record{
+		ObjectID:  "rec-ns-2",
+		Key:       "media/images/file2.png",
+		Namespace: "media/images",
+		Status:    blobkit.StateCommitted,
+		CreatedAt: now.Add(-5 * time.Minute),
+	})
+	_ = store.Save(ctx, &registry.Record{
+		ObjectID:  "rec-ns-3",
+		Key:       "media_other/file3.png",
+		Namespace: "media_other",
+		Status:    blobkit.StateCommitted,
+		CreatedAt: now.Add(-1 * time.Minute),
+	})
+
+	// Find by "media" should match "media" and "media/images", but NOT "media_other"
+	matched, err := store.Find(ctx, registry.Filter{Namespace: "media"})
+	if err != nil {
+		t.Fatalf("Find failed: %v", err)
+	}
+	if len(matched) != 2 {
+		t.Fatalf("expected 2 matches for namespace 'media', got %d", len(matched))
+	}
+
+	// Soft-deleted records test with DeletedBefore
+	delTime1 := now.Add(-2 * time.Hour)
+	delTime2 := now.Add(-10 * time.Minute)
+	_ = store.Save(ctx, &registry.Record{
+		ObjectID:  "rec-del-1",
+		Key:       "del1.txt",
+		Status:    blobkit.StateDeleted,
+		DeletedAt: &delTime1,
+	})
+	_ = store.Save(ctx, &registry.Record{
+		ObjectID:  "rec-del-2",
+		Key:       "del2.txt",
+		Status:    blobkit.StateDeleted,
+		DeletedAt: &delTime2,
+	})
+
+	cutoff := now.Add(-1 * time.Hour)
+	delMatched, err := store.Find(ctx, registry.Filter{
+		Status:        blobkit.StateDeleted,
+		DeletedBefore: &cutoff,
+	})
+	if err != nil {
+		t.Fatalf("Find deleted failed: %v", err)
+	}
+	if len(delMatched) != 1 || delMatched[0].ObjectID != "rec-del-1" {
+		t.Fatalf("expected only rec-del-1, got %+v", delMatched)
+	}
+}
+
+

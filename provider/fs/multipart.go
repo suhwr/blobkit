@@ -127,6 +127,7 @@ func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, pa
 	}
 
 	etag := fmt.Sprintf("\"%s\"", hex.EncodeToString(hasher.Sum(nil)))
+	_ = os.WriteFile(partFile+".etag", []byte(etag), d.cfg.FileMode)
 	return etag, nil
 }
 
@@ -340,7 +341,7 @@ func (d *Driver) ListParts(ctx context.Context, key string, uploadID string) ([]
 	var parts []blobkit.CompletedPart
 	for _, e := range entries {
 		name := e.Name()
-		if !strings.HasPrefix(name, "part_") {
+		if !strings.HasPrefix(name, "part_") || strings.HasSuffix(name, ".etag") {
 			continue
 		}
 
@@ -355,8 +356,18 @@ func (d *Driver) ListParts(ctx context.Context, key string, uploadID string) ([]
 			continue
 		}
 
+		partPath := filepath.Join(stagingPath, name)
+		var partETag string
+		if etagBytes, err := os.ReadFile(partPath + ".etag"); err == nil {
+			partETag = string(etagBytes)
+		} else if data, err := os.ReadFile(partPath); err == nil {
+			h := md5.Sum(data)
+			partETag = fmt.Sprintf("\"%s\"", hex.EncodeToString(h[:]))
+		}
+
 		parts = append(parts, blobkit.CompletedPart{
 			PartNumber: int32(partNum),
+			ETag:       partETag,
 			Size:       info.Size(),
 		})
 	}

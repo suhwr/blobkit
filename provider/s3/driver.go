@@ -562,12 +562,18 @@ func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
 	if err := blobkit.ValidateKey(dstKey); err != nil {
 		return d.wrapError("copy", dstKey, err)
 	}
-	source := d.cfg.Bucket + "/" + (&url.URL{Path: strings.TrimLeft(srcKey, "/")}).EscapedPath()
-	_, err := d.client.CopyObject(ctx, &s3client.CopyObjectInput{
+	cleanSrc := strings.TrimLeft(srcKey, "/")
+	cleanDst := strings.TrimLeft(dstKey, "/")
+	source := d.cfg.Bucket + "/" + (&url.URL{Path: cleanSrc}).EscapedPath()
+	input := &s3client.CopyObjectInput{
 		Bucket:     aws.String(d.cfg.Bucket),
-		Key:        aws.String(strings.TrimLeft(dstKey, "/")),
+		Key:        aws.String(cleanDst),
 		CopySource: aws.String(source),
-	})
+	}
+	if cleanSrc == cleanDst {
+		input.MetadataDirective = types.MetadataDirectiveReplace
+	}
+	_, err := d.client.CopyObject(ctx, input)
 	if err != nil {
 		return d.wrapError("copy", srcKey, err)
 	}
@@ -698,6 +704,12 @@ func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, upl
 		return nil, d.wrapError("complete_multipart", obj.Key, err)
 	}
 
+	if totalSize == 0 && len(parts) > 0 {
+		if headObj, headErr := d.Head(ctx, obj.Key); headErr == nil && headObj.Size > 0 {
+			totalSize = headObj.Size
+		}
+	}
+
 	stored := *obj
 	stored.Bucket = d.cfg.Bucket
 	stored.Size = totalSize
@@ -734,34 +746,47 @@ func (d *Driver) ListParts(ctx context.Context, key string, uploadID string) ([]
 	if err := blobkit.ValidateKey(key); err != nil {
 		return nil, d.wrapError("list_parts", key, err)
 	}
-	resp, err := d.client.ListParts(ctx, &s3client.ListPartsInput{
-		Bucket:   aws.String(d.cfg.Bucket),
-		Key:      aws.String(key),
-		UploadId: aws.String(uploadID),
-	})
-	if err != nil {
-		return nil, d.wrapError("list_parts", key, err)
-	}
+
 	var parts []blobkit.CompletedPart
-	for _, p := range resp.Parts {
-		var num int32
-		if p.PartNumber != nil {
-			num = *p.PartNumber
-		}
-		var etag string
-		if p.ETag != nil {
-			etag = *p.ETag
-		}
-		var size int64
-		if p.Size != nil {
-			size = *p.Size
-		}
-		parts = append(parts, blobkit.CompletedPart{
-			PartNumber: num,
-			ETag:       etag,
-			Size:       size,
+	var partNumberMarker *string
+
+	for {
+		resp, err := d.client.ListParts(ctx, &s3client.ListPartsInput{
+			Bucket:           aws.String(d.cfg.Bucket),
+			Key:              aws.String(key),
+			UploadId:         aws.String(uploadID),
+			PartNumberMarker: partNumberMarker,
 		})
+		if err != nil {
+			return nil, d.wrapError("list_parts", key, err)
+		}
+
+		for _, p := range resp.Parts {
+			var num int32
+			if p.PartNumber != nil {
+				num = *p.PartNumber
+			}
+			var etag string
+			if p.ETag != nil {
+				etag = *p.ETag
+			}
+			var size int64
+			if p.Size != nil {
+				size = *p.Size
+			}
+			parts = append(parts, blobkit.CompletedPart{
+				PartNumber: num,
+				ETag:       etag,
+				Size:       size,
+			})
+		}
+
+		if resp.IsTruncated == nil || !*resp.IsTruncated || resp.NextPartNumberMarker == nil || *resp.NextPartNumberMarker == "" {
+			break
+		}
+		partNumberMarker = resp.NextPartNumberMarker
 	}
+
 	return parts, nil
 }
 

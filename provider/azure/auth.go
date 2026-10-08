@@ -104,18 +104,27 @@ func buildCanonicalizedResource(u *url.URL, accountName string) string {
 	var sb strings.Builder
 	sb.WriteString("/")
 	sb.WriteString(accountName)
-	sb.WriteString(u.Path)
+	path := u.EscapedPath()
+	if path == "" {
+		path = u.Path
+	}
+	sb.WriteString(path)
 
 	query := u.Query()
 	if len(query) > 0 {
+		lowerQuery := make(map[string][]string, len(query))
 		var paramNames []string
-		for k := range query {
-			paramNames = append(paramNames, strings.ToLower(k))
+		for k, v := range query {
+			lk := strings.ToLower(k)
+			if _, exists := lowerQuery[lk]; !exists {
+				paramNames = append(paramNames, lk)
+			}
+			lowerQuery[lk] = append(lowerQuery[lk], v...)
 		}
 		sort.Strings(paramNames)
 
 		for _, p := range paramNames {
-			vals := query[p]
+			vals := lowerQuery[p]
 			sort.Strings(vals)
 			sb.WriteString("\n")
 			sb.WriteString(p)
@@ -150,6 +159,7 @@ func generateBlobSAS(accountName, accountKey, container, blob, permissions, apiV
 		apiVersion,            // signedVersion
 		"b",                   // signedResource (b = blob)
 		"",                    // signedSnapshotTime
+		"",                    // signedEncryptionScope
 		"",                    // rscc
 		"",                    // rscd
 		"",                    // rsce

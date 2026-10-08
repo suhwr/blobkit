@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 	"testing"
 
 	"github.com/suhwr/blobkit"
@@ -233,3 +234,49 @@ func TestClient_BucketBridge(t *testing.T) {
 		t.Fatalf("expected %q, got %q", testData, got)
 	}
 }
+
+func TestBucketWriter_ConcurrentClose(t *testing.T) {
+	ctx := context.Background()
+	driver := memory.NewDriver(memory.Config{Bucket: "test-bucket"})
+	bucket, err := blobkit.NewBucket(driver)
+	if err != nil {
+		t.Fatalf("NewBucket failed: %v", err)
+	}
+
+	w, err := bucket.NewWriter(ctx, "concurrent-writer.txt", blobkit.PutOptions{})
+	if err != nil {
+		t.Fatalf("NewWriter failed: %v", err)
+	}
+
+	_, err = w.Write([]byte("streaming content"))
+	if err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+
+	const workers = 10
+	var wg sync.WaitGroup
+	errs := make([]error, workers)
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			errs[idx] = w.Close()
+		}(i)
+	}
+
+	wg.Wait()
+
+	for i, closeErr := range errs {
+		if closeErr != nil {
+			t.Errorf("worker %d got non-nil close error: %v", i, closeErr)
+		}
+	}
+
+	// Further writes must fail with closed error
+	_, writeAfterCloseErr := w.Write([]byte("more"))
+	if writeAfterCloseErr == nil {
+		t.Fatal("expected error writing to closed BucketWriter, got nil")
+	}
+}
+

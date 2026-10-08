@@ -31,46 +31,65 @@ func (c *Client) Reconcile(ctx context.Context, dryRun bool) (*ReconciliationRep
 	}
 
 	// 1. Audit all committed registry records
-	recs, err := c.registry.Find(ctx, Filter{Status: StateCommitted})
-	if err != nil {
-		return nil, WrapError("reconcile_find_records", "", "", err)
-	}
-
-	for _, rec := range recs {
-		select {
-		case <-ctx.Done():
-			return report, ctx.Err()
-		default:
-		}
-
-		report.TotalChecked++
-
-		driver, rErr := c.router.Select(ctx, RouteContext{
-			Op:             OpHead,
-			Key:            rec.Key,
-			ForcedProvider: rec.Provider,
+	offset := 0
+	const reconcileBatchSize = 1000
+	for {
+		recs, err := c.registry.Find(ctx, Filter{
+			Status: StateCommitted,
+			Limit:  reconcileBatchSize,
+			Offset: offset,
 		})
-		if rErr != nil {
-			report.GhostRecords = append(report.GhostRecords, rec.ObjectID)
-			continue
+		if err != nil {
+			return nil, WrapError("reconcile_find_records", "", "", err)
+		}
+		if len(recs) == 0 {
+			break
 		}
 
-		headObj, headErr := driver.Head(ctx, rec.Key)
-		if headErr != nil {
-			if IsNotFound(headErr) {
-				report.GhostRecords = append(report.GhostRecords, rec.ObjectID)
-				if !dryRun {
-					if err := c.registry.UpdateStatus(ctx, rec.ObjectID, StateDeleted); err == nil {
-						report.Repaired++
+		for _, rec := range recs {
+			select {
+			case <-ctx.Done():
+				return report, ctx.Err()
+			default:
+			}
+
+			report.TotalChecked++
+
+			driver, rErr := c.router.Select(ctx, RouteContext{
+				Op:             OpHead,
+				Key:            rec.Key,
+				ForcedProvider: rec.Provider,
+			})
+			if rErr != nil {
+				continue
+			}
+
+			headObj, headErr := driver.Head(ctx, rec.Key)
+			if headErr != nil {
+				if IsNotFound(headErr) {
+					report.GhostRecords = append(report.GhostRecords, rec.ObjectID)
+					if !dryRun {
+						if err := c.registry.UpdateStatus(ctx, rec.ObjectID, StateDeleted); err == nil {
+							report.Repaired++
+							if c.cache != nil {
+								c.cache.Delete(rec.ObjectID)
+								c.cache.Delete(rec.Key)
+							}
+						}
 					}
 				}
+				continue
 			}
-			continue
+
+			if headObj.Size != rec.Size {
+				report.MismatchedSize = append(report.MismatchedSize, rec.Key)
+			}
 		}
 
-		if headObj.Size != rec.Size {
-			report.MismatchedSize = append(report.MismatchedSize, rec.Key)
+		if len(recs) < reconcileBatchSize {
+			break
 		}
+		offset += len(recs)
 	}
 
 	// 2. Audit storage drivers for orphan files

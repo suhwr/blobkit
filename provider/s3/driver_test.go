@@ -1,8 +1,11 @@
 package s3_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
@@ -189,3 +192,131 @@ func searchSubstr(s, sub string) bool {
 	}
 	return false
 }
+
+func TestS3_ListParts_Pagination(t *testing.T) {
+	bucket := "pagination-bucket"
+	mockServer := newMockS3Server(bucket)
+	mockServer.maxParts = 4 // force 4 parts per page
+	ts := httptest.NewServer(mockServer)
+	defer ts.Close()
+
+	driver, err := s3.NewDriver(s3.Config{
+		Bucket:    bucket,
+		Endpoint:  ts.URL,
+		UsePathStyle: true,
+	})
+	if err != nil {
+		t.Fatalf("NewDriver failed: %v", err)
+	}
+	defer driver.Close()
+
+	ctx := context.Background()
+	key := "large-multipart.bin"
+	uploadID, err := driver.CreateMultipart(ctx, &blobkit.Object{Key: key}, blobkit.PutOptions{})
+	if err != nil {
+		t.Fatalf("CreateMultipart failed: %v", err)
+	}
+
+	// Upload 10 parts (will span 3 pages: 4 + 4 + 2)
+	const totalParts = 10
+	for i := int32(1); i <= totalParts; i++ {
+		data := []byte(fmt.Sprintf("part-%02d-content", i))
+		_, err := driver.UploadPart(ctx, key, uploadID, i, bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			t.Fatalf("UploadPart %d failed: %v", i, err)
+		}
+	}
+
+	parts, err := driver.ListParts(ctx, key, uploadID)
+	if err != nil {
+		t.Fatalf("ListParts failed: %v", err)
+	}
+
+	if len(parts) != totalParts {
+		t.Fatalf("expected %d parts after paginated listing, got %d", totalParts, len(parts))
+	}
+
+	for i, p := range parts {
+		expectedNum := int32(i + 1)
+		if p.PartNumber != expectedNum {
+			t.Errorf("part index %d: expected PartNumber %d, got %d", i, expectedNum, p.PartNumber)
+		}
+	}
+}
+
+func TestS3_UploadMultipart_SizeMismatch(t *testing.T) {
+	bucket := "mismatch-bucket"
+	mockServer := newMockS3Server(bucket)
+	ts := httptest.NewServer(mockServer)
+	defer ts.Close()
+
+	driver, err := s3.NewDriver(s3.Config{
+		Bucket:              bucket,
+		Endpoint:            ts.URL,
+		UsePathStyle:        true,
+		MultipartThreshold: 1024,
+		MultipartPartSize:  1024,
+	})
+	if err != nil {
+		t.Fatalf("NewDriver failed: %v", err)
+	}
+	defer driver.Close()
+
+	ctx := context.Background()
+	key := "mismatch.bin"
+	actualData := bytes.Repeat([]byte("X"), 3000)
+
+	// Declare explicit size of 2000, but stream yields 3000 bytes
+	_, err = driver.Put(ctx, &blobkit.Object{Key: key}, bytes.NewReader(actualData), blobkit.PutOptions{
+		Size:         2000,
+		ExplicitSize: true,
+	})
+	if !errors.Is(err, blobkit.ErrSizeMismatch) {
+		t.Fatalf("expected ErrSizeMismatch, got %v", err)
+	}
+}
+
+func TestS3_CompleteMultipart_HeadFallbackSize(t *testing.T) {
+	bucket := "head-fallback-bucket"
+	mockServer := newMockS3Server(bucket)
+	ts := httptest.NewServer(mockServer)
+	defer ts.Close()
+
+	driver, err := s3.NewDriver(s3.Config{
+		Bucket:       bucket,
+		Endpoint:     ts.URL,
+		UsePathStyle: true,
+	})
+	if err != nil {
+		t.Fatalf("NewDriver failed: %v", err)
+	}
+	defer driver.Close()
+
+	ctx := context.Background()
+	key := "multipart_head_fallback.bin"
+	uploadID, err := driver.CreateMultipart(ctx, &blobkit.Object{Key: key}, blobkit.PutOptions{})
+	if err != nil {
+		t.Fatalf("CreateMultipart failed: %v", err)
+	}
+
+	partData := []byte("hello world multipart s3 fallback")
+	etag, err := driver.UploadPart(ctx, key, uploadID, 1, bytes.NewReader(partData), int64(len(partData)))
+	if err != nil {
+		t.Fatalf("UploadPart failed: %v", err)
+	}
+
+	// Caller provides standard CompletedPart without Size (Size: 0)
+	parts := []blobkit.CompletedPart{
+		{PartNumber: 1, ETag: etag, Size: 0},
+	}
+
+	completedObj, err := driver.CompleteMultipart(ctx, &blobkit.Object{Key: key}, uploadID, parts)
+	if err != nil {
+		t.Fatalf("CompleteMultipart failed: %v", err)
+	}
+
+	if completedObj.Size != int64(len(partData)) {
+		t.Fatalf("expected completedObj.Size %d via Head fallback, got %d", len(partData), completedObj.Size)
+	}
+}
+

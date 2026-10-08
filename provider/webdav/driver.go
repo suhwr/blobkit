@@ -86,6 +86,9 @@ func readErrorBody(body io.Reader) []byte {
 
 // Put uploads an object stream to the WebDAV server via HTTP PUT.
 func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts blobkit.PutOptions) (*blobkit.Object, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("put", "", d.cfg.Name, err)
+	}
 	if r == nil {
 		return nil, blobkit.ErrNilReader
 	}
@@ -191,6 +194,9 @@ func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (
 	if err := blobkit.ValidateKey(key); err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("get", key, d.cfg.Name, err)
+	}
 
 	endpoint := d.objectURL(key)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
@@ -266,6 +272,9 @@ func (d *Driver) Head(ctx context.Context, key string) (*blobkit.Object, error) 
 	if err := blobkit.ValidateKey(key); err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("head", key, d.cfg.Name, err)
+	}
 
 	endpoint := d.objectURL(key)
 
@@ -321,6 +330,9 @@ func (d *Driver) Delete(ctx context.Context, key string) error {
 	if err := blobkit.ValidateKey(key); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return blobkit.WrapError("delete", key, d.cfg.Name, err)
+	}
 
 	endpoint := d.objectURL(key)
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
@@ -348,6 +360,9 @@ func (d *Driver) Delete(ctx context.Context, key string) error {
 func (d *Driver) DeleteBatch(ctx context.Context, keys []string) ([]string, error) {
 	if len(keys) == 0 {
 		return nil, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("delete_batch", "", d.cfg.Name, err)
 	}
 	for _, k := range keys {
 		if err := blobkit.ValidateKey(k); err != nil {
@@ -408,10 +423,17 @@ func (d *Driver) DeleteBatch(ctx context.Context, keys []string) ([]string, erro
 
 // Copy duplicates an object using WebDAV standard RFC 4918 COPY method.
 func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
+	if err := ctx.Err(); err != nil {
+		return blobkit.WrapError("copy", srcKey, d.cfg.Name, err)
+	}
 	if err := blobkit.ValidateKey(srcKey); err != nil {
 		return err
 	}
 	if err := blobkit.ValidateKey(dstKey); err != nil {
+		return err
+	}
+	if srcKey == dstKey {
+		_, err := d.Head(ctx, srcKey)
 		return err
 	}
 
@@ -447,6 +469,10 @@ func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
 
 // List queries resources under the given prefix using WebDAV PROPFIND.
 func (d *Driver) List(ctx context.Context, opts blobkit.ListOptions) (*blobkit.ListResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, blobkit.WrapError("list", opts.Prefix, d.cfg.Name, err)
+	}
+
 	prefix := strings.Trim(opts.Prefix, "/")
 	reqURL := d.objectURL(prefix)
 	if prefix == "" {

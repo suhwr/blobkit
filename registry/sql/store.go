@@ -229,9 +229,9 @@ func (s *Store) Find(ctx context.Context, filter blobkit.Filter) ([]blobkit.Reco
 		argIdx++
 	}
 	if filter.Namespace != "" {
-		whereClauses = append(whereClauses, fmt.Sprintf("namespace = %s", s.dialect.Placeholder(argIdx)))
-		args = append(args, filter.Namespace)
-		argIdx++
+		whereClauses = append(whereClauses, fmt.Sprintf("(namespace = %s OR namespace LIKE %s)", s.dialect.Placeholder(argIdx), s.dialect.Placeholder(argIdx+1)))
+		args = append(args, filter.Namespace, filter.Namespace+"/%")
+		argIdx += 2
 	}
 	if filter.OwnerID != "" {
 		whereClauses = append(whereClauses, fmt.Sprintf("owner_id = %s", s.dialect.Placeholder(argIdx)))
@@ -268,6 +268,11 @@ func (s *Store) Find(ctx context.Context, filter blobkit.Filter) ([]blobkit.Reco
 		args = append(args, *filter.CreatedBefore)
 		argIdx++
 	}
+	if filter.DeletedBefore != nil {
+		whereClauses = append(whereClauses, fmt.Sprintf("deleted_at <= %s", s.dialect.Placeholder(argIdx)))
+		args = append(args, *filter.DeletedBefore)
+		argIdx++
+	}
 
 	whereSQL := ""
 	if len(whereClauses) > 0 {
@@ -289,7 +294,7 @@ func (s *Store) Find(ctx context.Context, filter blobkit.Filter) ([]blobkit.Reco
 		legal_hold, client_checksum, created_at, updated_at, deleted_at
 	FROM blobkit_records
 	%s
-	ORDER BY created_at ASC
+	ORDER BY created_at DESC
 	LIMIT %s OFFSET %s;`, whereSQL, s.dialect.Placeholder(argIdx), s.dialect.Placeholder(argIdx+1))
 
 	args = append(args, limit, filter.Offset)
@@ -337,18 +342,23 @@ func (s *Store) UpdateStatus(ctx context.Context, objectID string, status blobki
 	var query string
 	var err error
 
+	var res sql.Result
 	if status == blobkit.StateDeleted {
 		query = fmt.Sprintf(`UPDATE blobkit_records SET status = %s, updated_at = %s, deleted_at = %s WHERE object_id = %s;`,
 			s.dialect.Placeholder(1), s.dialect.Placeholder(2), s.dialect.Placeholder(3), s.dialect.Placeholder(4))
-		_, err = s.db.ExecContext(ctx, query, string(status), now, now, objectID)
+		res, err = s.db.ExecContext(ctx, query, string(status), now, now, objectID)
 	} else {
 		query = fmt.Sprintf(`UPDATE blobkit_records SET status = %s, updated_at = %s WHERE object_id = %s;`,
 			s.dialect.Placeholder(1), s.dialect.Placeholder(2), s.dialect.Placeholder(3))
-		_, err = s.db.ExecContext(ctx, query, string(status), now, objectID)
+		res, err = s.db.ExecContext(ctx, query, string(status), now, objectID)
 	}
 
 	if err != nil {
 		return fmt.Errorf("sql update status: %w", err)
+	}
+	affected, _ := res.RowsAffected()
+	if affected == 0 {
+		return blobkit.ErrObjectNotFound
 	}
 	return nil
 }
@@ -412,9 +422,13 @@ func (s *Store) HardDelete(ctx context.Context, objectID string) error {
 	}
 
 	query := fmt.Sprintf(`DELETE FROM blobkit_records WHERE object_id = %s;`, s.dialect.Placeholder(1))
-	_, err := s.db.ExecContext(ctx, query, objectID)
+	res, err := s.db.ExecContext(ctx, query, objectID)
 	if err != nil {
 		return fmt.Errorf("sql hard delete: %w", err)
+	}
+	affected, _ := res.RowsAffected()
+	if affected == 0 {
+		return blobkit.ErrObjectNotFound
 	}
 	return nil
 }
@@ -584,9 +598,13 @@ func (s *Store) DeleteSession(ctx context.Context, sessionID string) error {
 	}
 
 	query := fmt.Sprintf(`DELETE FROM blobkit_sessions WHERE session_id = %s;`, s.dialect.Placeholder(1))
-	_, err := s.db.ExecContext(ctx, query, sessionID)
+	res, err := s.db.ExecContext(ctx, query, sessionID)
 	if err != nil {
 		return fmt.Errorf("sql delete session: %w", err)
+	}
+	affected, _ := res.RowsAffected()
+	if affected == 0 {
+		return blobkit.ErrSessionNotFound
 	}
 	return nil
 }

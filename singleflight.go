@@ -1,6 +1,9 @@
 package blobkit
 
-import "sync"
+import (
+	"fmt"
+	"sync"
+)
 
 type singleflightCall struct {
 	wg  sync.WaitGroup
@@ -29,7 +32,21 @@ func (g *singleflightGroup) Do(key string, fn func() (any, error)) (any, error) 
 	g.m[key] = c
 	g.mu.Unlock()
 
+	var panicked = true
 	defer func() {
+		if r := recover(); r != nil || panicked {
+			if c.err == nil {
+				c.err = fmt.Errorf("singleflight panic: %v", r)
+			}
+			g.mu.Lock()
+			delete(g.m, key)
+			g.mu.Unlock()
+			c.wg.Done()
+			if r != nil {
+				panic(r)
+			}
+			return
+		}
 		g.mu.Lock()
 		delete(g.m, key)
 		g.mu.Unlock()
@@ -37,5 +54,6 @@ func (g *singleflightGroup) Do(key string, fn func() (any, error)) (any, error) 
 	}()
 
 	c.val, c.err = fn()
+	panicked = false
 	return c.val, c.err
 }

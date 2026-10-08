@@ -93,3 +93,35 @@ func TestLRUCache_Concurrency(t *testing.T) {
 
 	wg.Wait()
 }
+
+func TestLRUCache_DeepCloningMetadata(t *testing.T) {
+	c := cache.NewLRUCache(10)
+
+	meta := map[string]string{"foo": "bar", "env": "prod"}
+	obj := &blobkit.Object{
+		ID:       "id-1",
+		Key:      "k1",
+		Metadata: meta,
+	}
+
+	c.Set("k1", obj, time.Hour)
+
+	// Mutate original meta outside cache
+	meta["foo"] = "mutated"
+
+	retrieved, ok := c.Get("k1")
+	if !ok {
+		t.Fatal("expected object to be in cache")
+	}
+	if retrieved.Metadata["foo"] != "bar" {
+		t.Fatalf("expected cached metadata foo to be 'bar', got %q", retrieved.Metadata["foo"])
+	}
+
+	// Mutate retrieved metadata
+	retrieved.Metadata["foo"] = "retrieved-mutation"
+
+	retrievedAgain, _ := c.Get("k1")
+	if retrievedAgain.Metadata["foo"] != "bar" {
+		t.Fatalf("expected cached metadata foo to remain 'bar', got %q", retrievedAgain.Metadata["foo"])
+	}
+}

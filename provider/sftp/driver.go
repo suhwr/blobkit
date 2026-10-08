@@ -89,6 +89,9 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 	if obj == nil || obj.Key == "" {
 		return nil, blobkit.ErrInvalidKey
 	}
+	if err := blobkit.ValidateKey(obj.Key); err != nil {
+		return nil, err
+	}
 
 	client, err := d.getClient()
 	if err != nil {
@@ -145,11 +148,13 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 	}
 
 	// Atomically swap temp file to final destination
-	// Remove destination first if needed (some SFTP servers do not overwrite on Rename)
-	_ = client.Remove(targetPath)
 	if err := client.Rename(tmpPath, targetPath); err != nil {
-		_ = client.Remove(tmpPath)
-		return nil, mapSFTPError("put_rename", obj.Key, d.cfg.Name, err)
+		// Fallback for SFTP servers that do not support overwriting on Rename
+		_ = client.Remove(targetPath)
+		if retryErr := client.Rename(tmpPath, targetPath); retryErr != nil {
+			_ = client.Remove(tmpPath)
+			return nil, mapSFTPError("put_rename", obj.Key, d.cfg.Name, retryErr)
+		}
 	}
 
 	shaHex := hex.EncodeToString(hasher.Sum(nil))
@@ -202,6 +207,9 @@ func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (
 	if err := ctx.Err(); err != nil {
 		return nil, mapSFTPError("get", key, d.cfg.Name, err)
 	}
+	if err := blobkit.ValidateKey(key); err != nil {
+		return nil, err
+	}
 	client, err := d.getClient()
 	if err != nil {
 		return nil, err
@@ -227,19 +235,37 @@ func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (
 	var stream io.Reader = f
 	streamSize := totalSize
 
-	// Handle Byte-Range requests
+	// Handle Byte-Range requests (including suffix ranges bytes=-N)
 	if opts.Range != "" && strings.HasPrefix(opts.Range, "bytes=") {
 		spec := strings.TrimPrefix(opts.Range, "bytes=")
 		parts := strings.Split(spec, "-")
 		if len(parts) == 2 {
-			start, err1 := strconv.ParseInt(parts[0], 10, 64)
-			end := totalSize - 1
-			var err2 error
-			if parts[1] != "" {
-				end, err2 = strconv.ParseInt(parts[1], 10, 64)
-			}
-
-			if err1 != nil || err2 != nil || start < 0 || start > totalSize || end < start {
+			var start, end int64
+			if parts[0] == "" && parts[1] != "" {
+				// Suffix range: bytes=-N
+				suffixLen, err := strconv.ParseInt(parts[1], 10, 64)
+				if err != nil || suffixLen <= 0 {
+					_ = f.Close()
+					return nil, blobkit.WrapError("get", key, d.cfg.Name, blobkit.ErrPreconditionFailed)
+				}
+				if suffixLen >= totalSize {
+					start = 0
+				} else {
+					start = totalSize - suffixLen
+				}
+				end = totalSize - 1
+			} else if parts[0] != "" {
+				var err1, err2 error
+				start, err1 = strconv.ParseInt(parts[0], 10, 64)
+				end = totalSize - 1
+				if parts[1] != "" {
+					end, err2 = strconv.ParseInt(parts[1], 10, 64)
+				}
+				if err1 != nil || err2 != nil || start < 0 || start > totalSize || end < start {
+					_ = f.Close()
+					return nil, blobkit.WrapError("get", key, d.cfg.Name, blobkit.ErrPreconditionFailed)
+				}
+			} else {
 				_ = f.Close()
 				return nil, blobkit.WrapError("get", key, d.cfg.Name, blobkit.ErrPreconditionFailed)
 			}
@@ -305,6 +331,9 @@ func (d *Driver) Head(ctx context.Context, key string) (*blobkit.Object, error) 
 	if err := ctx.Err(); err != nil {
 		return nil, mapSFTPError("head", key, d.cfg.Name, err)
 	}
+	if err := blobkit.ValidateKey(key); err != nil {
+		return nil, err
+	}
 	client, err := d.getClient()
 	if err != nil {
 		return nil, err
@@ -356,6 +385,9 @@ func (d *Driver) Head(ctx context.Context, key string) (*blobkit.Object, error) 
 func (d *Driver) Delete(ctx context.Context, key string) error {
 	if err := ctx.Err(); err != nil {
 		return mapSFTPError("delete", key, d.cfg.Name, err)
+	}
+	if err := blobkit.ValidateKey(key); err != nil {
+		return err
 	}
 	client, err := d.getClient()
 	if err != nil {
@@ -450,6 +482,16 @@ func (d *Driver) DeleteBatch(ctx context.Context, keys []string) ([]string, erro
 func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
 	if err := ctx.Err(); err != nil {
 		return mapSFTPError("copy", srcKey, d.cfg.Name, err)
+	}
+	if err := blobkit.ValidateKey(srcKey); err != nil {
+		return err
+	}
+	if err := blobkit.ValidateKey(dstKey); err != nil {
+		return err
+	}
+	if srcKey == dstKey {
+		_, err := d.Head(ctx, srcKey)
+		return err
 	}
 	client, err := d.getClient()
 	if err != nil {

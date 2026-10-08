@@ -637,3 +637,37 @@ func TestDriver_IntegrationWithBlobKitClient(t *testing.T) {
 		t.Fatalf("expected ErrObjectNotFound, got: %v", err)
 	}
 }
+
+func TestDriver_SuffixByteRange(t *testing.T) {
+	driver, srv := setupTestSFTPDriver(t)
+	defer srv.close()
+	defer driver.Close()
+	ctx := context.Background()
+
+	payload := []byte("0123456789abcdefghijklmnopqrstuvwxyz")
+	key := "suffix/test_sftp.txt"
+	_, err := driver.Put(ctx, &blobkit.Object{Key: key}, bytes.NewReader(payload), blobkit.PutOptions{
+		Size: int64(len(payload)),
+	})
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	// Request last 6 bytes: bytes=-6
+	r, err := driver.Get(ctx, key, blobkit.GetOptions{
+		Range: "bytes=-6",
+	})
+	if err != nil {
+		t.Fatalf("Get with suffix range failed: %v", err)
+	}
+	defer r.Body.Close()
+
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		t.Fatalf("ReadAll failed: %v", err)
+	}
+	expected := "uvwxyz"
+	if string(data) != expected {
+		t.Fatalf("expected suffix %q, got %q", expected, string(data))
+	}
+}

@@ -24,11 +24,12 @@ import (
 )
 
 type mockBlob struct {
-	data        []byte
-	contentType string
-	etag        string
-	modTime     time.Time
-	metadata    map[string]string
+	data                 []byte
+	contentType          string
+	etag                 string
+	modTime              time.Time
+	metadata             map[string]string
+	useBlobContentLength bool
 }
 
 type mockAzureServer struct {
@@ -324,7 +325,11 @@ func (s *mockAzureServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		w.Header().Set("Content-Length", strconv.Itoa(len(b.data)))
+		if b.useBlobContentLength {
+			w.Header().Set("x-ms-blob-content-length", strconv.Itoa(len(b.data)))
+		} else {
+			w.Header().Set("Content-Length", strconv.Itoa(len(b.data)))
+		}
 		w.Header().Set("Content-Type", b.contentType)
 		w.Header().Set("ETag", b.etag)
 		w.Header().Set("Last-Modified", b.modTime.Format(http.TimeFormat))
@@ -920,3 +925,276 @@ func TestDriver_StreamingPut_AutoChunking_And_Security(t *testing.T) {
 		t.Fatalf("expected ErrSecurityViolation for traversal, got: %v", err)
 	}
 }
+
+func TestDriver_StreamingPut_UnknownSize_ReturnsCorrectFilesize(t *testing.T) {
+	mock := newMockAzureServer("blobs")
+	server := httptest.NewServer(mock)
+	defer server.Close()
+	ctx := context.Background()
+
+	mockKey := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte("A"), 32))
+	cfg := azure.Config{
+		Name:               "azure-test",
+		AccountName:        "mockstorageaccount",
+		AccountKey:         mockKey,
+		Container:          "blobs",
+		CustomEndpoint:     server.URL,
+		MultipartThreshold: 64,
+		PartSize:           32,
+		HTTPClient:         server.Client(),
+	}
+	driver, err := azure.NewDriver(cfg)
+	if err != nil {
+		t.Fatalf("failed to create driver: %v", err)
+	}
+
+	payload := []byte("this is a stream of unknown size that exceeds part size and should not result in 0 byte filesize")
+	key := "unknown-size/stream.txt"
+
+	// Put WITHOUT specifying Size (stream of unknown size)
+	putObj, err := driver.Put(ctx, &blobkit.Object{Key: key}, bytes.NewReader(payload), blobkit.PutOptions{
+		Size: blobkit.SizeUnknown,
+	})
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	if putObj.Size != int64(len(payload)) {
+		t.Fatalf("expected size %d, got %d (0-byte filesize bug!)", len(payload), putObj.Size)
+	}
+
+	headObj, err := driver.Head(ctx, key)
+	if err != nil {
+		t.Fatalf("Head failed: %v", err)
+	}
+	if headObj.Size != int64(len(payload)) {
+		t.Fatalf("Head expected size %d, got %d", len(payload), headObj.Size)
+	}
+}
+
+func TestDriver_Copy_WithSASToken_PreservesAndAppendsSAS(t *testing.T) {
+	var capturedCopySource string
+	mock := newMockAzureServer("blobs")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if src := r.Header.Get("x-ms-copy-source"); src != "" {
+			capturedCopySource = src
+		}
+		mock.ServeHTTP(w, r)
+	}))
+	defer server.Close()
+	ctx := context.Background()
+
+	cfg := azure.Config{
+		Name:           "azure-sas-test",
+		AccountName:    "mockstorageaccount",
+		Container:      "blobs",
+		CustomEndpoint: server.URL,
+		SASToken:       "?sv=2020-08-04&ss=b&srt=sco&sp=rwdlacupx&se=2099-01-01T00:00:00Z&st=2020-01-01T00:00:00Z&spr=https&sig=mock-sig",
+		HTTPClient:     server.Client(),
+	}
+	driver, err := azure.NewDriver(cfg)
+	if err != nil {
+		t.Fatalf("failed to create driver: %v", err)
+	}
+
+	payload := []byte("source data to copy")
+	_, err = driver.Put(ctx, &blobkit.Object{Key: "orig.txt"}, bytes.NewReader(payload), blobkit.PutOptions{
+		Size: int64(len(payload)),
+	})
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	err = driver.Copy(ctx, "orig.txt", "copied.txt")
+	if err != nil {
+		t.Fatalf("Copy failed: %v", err)
+	}
+
+	if !strings.Contains(capturedCopySource, "sig=mock-sig") {
+		t.Fatalf("expected x-ms-copy-source to contain SASToken, got: %q", capturedCopySource)
+	}
+}
+
+func TestAzure_ListParts_Deduplication(t *testing.T) {
+	key := "test-dedup.bin"
+	xmlResponse := `<?xml version="1.0" encoding="utf-8"?>
+<BlockList>
+	<CommittedBlocks>
+		<Block><Name>MDAwMDAwMDE=</Name><Size>100</Size></Block>
+		<Block><Name>MDAwMDAwMDI=</Name><Size>300</Size></Block>
+	</CommittedBlocks>
+	<UncommittedBlocks>
+		<Block><Name>MDAwMDAwMDE=</Name><Size>200</Size></Block>
+		<Block><Name>MDAwMDAwMDM=</Name><Size>400</Size></Block>
+	</UncommittedBlocks>
+</BlockList>`
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("comp") == "blocklist" && r.URL.Query().Get("blocklisttype") == "all" {
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(xmlResponse))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	ctx := context.Background()
+	driver, err := azure.NewDriver(azure.Config{
+		Name:           "azure-dedup-test",
+		AccountName:    "mockacct",
+		AccountKey:     "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI=",
+		Container:      "mockcontainer",
+		CustomEndpoint: server.URL,
+		HTTPClient:     server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("failed to create driver: %v", err)
+	}
+
+	uploadID, err := driver.CreateMultipart(ctx, &blobkit.Object{Key: key}, blobkit.PutOptions{})
+	if err != nil {
+		t.Fatalf("CreateMultipart failed: %v", err)
+	}
+
+	parts, err := driver.ListParts(ctx, key, uploadID)
+	if err != nil {
+		t.Fatalf("ListParts failed: %v", err)
+	}
+
+	if len(parts) != 3 {
+		t.Fatalf("expected 3 deduplicated parts, got %d: %+v", len(parts), parts)
+	}
+
+	// Part 1: uncommitted override (size 200, not 100)
+	if parts[0].PartNumber != 1 || parts[0].Size != 200 {
+		t.Errorf("part 0: expected part 1 size 200, got part %d size %d", parts[0].PartNumber, parts[0].Size)
+	}
+	// Part 2: committed (size 300)
+	if parts[1].PartNumber != 2 || parts[1].Size != 300 {
+		t.Errorf("part 1: expected part 2 size 300, got part %d size %d", parts[1].PartNumber, parts[1].Size)
+	}
+	// Part 3: uncommitted (size 400)
+	if parts[2].PartNumber != 3 || parts[2].Size != 400 {
+		t.Errorf("part 2: expected part 3 size 400, got part %d size %d", parts[2].PartNumber, parts[2].Size)
+	}
+}
+
+func TestAzure_Head_BlobContentLength(t *testing.T) {
+	server := httptest.NewServer(newMockAzureServer("mockcontainer"))
+	defer server.Close()
+
+	// Seed blob with useBlobContentLength = true
+	mockSrv := server.Config.Handler.(*mockAzureServer)
+	mockSrv.mu.Lock()
+	mockSrv.blobs["blob-bcl.dat"] = &mockBlob{
+		data:                 bytes.Repeat([]byte("Z"), 512),
+		contentType:          "application/octet-stream",
+		etag:                 "\"bcl-etag\"",
+		modTime:              time.Now().UTC(),
+		useBlobContentLength: true,
+	}
+	mockSrv.mu.Unlock()
+
+	driver, err := azure.NewDriver(azure.Config{
+		Name:           "azure-bcl",
+		AccountName:    "mockacct",
+		AccountKey:     "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI=",
+		Container:      "mockcontainer",
+		CustomEndpoint: server.URL,
+		HTTPClient:     server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("failed to create driver: %v", err)
+	}
+	defer driver.Close()
+
+	ctx := context.Background()
+	obj, err := driver.Head(ctx, "blob-bcl.dat")
+	if err != nil {
+		t.Fatalf("Head failed: %v", err)
+	}
+	if obj.Size != 512 {
+		t.Fatalf("expected size 512 from x-ms-blob-content-length, got %d", obj.Size)
+	}
+}
+
+func TestAzure_CompleteMultipart_HeadFallbackSize(t *testing.T) {
+	server := httptest.NewServer(newMockAzureServer("mockcontainer"))
+	defer server.Close()
+
+	driver, err := azure.NewDriver(azure.Config{
+		Name:           "azure-fallback-size",
+		AccountName:    "mockacct",
+		AccountKey:     "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI=",
+		Container:      "mockcontainer",
+		CustomEndpoint: server.URL,
+		HTTPClient:     server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("failed to create driver: %v", err)
+	}
+	defer driver.Close()
+
+	ctx := context.Background()
+	key := "multipart-nosize.bin"
+	chunk := bytes.Repeat([]byte("M"), 1024)
+
+	uploadID, err := driver.CreateMultipart(ctx, &blobkit.Object{Key: key}, blobkit.PutOptions{})
+	if err != nil {
+		t.Fatalf("CreateMultipart failed: %v", err)
+	}
+
+	etag, err := driver.UploadPart(ctx, key, uploadID, 1, bytes.NewReader(chunk), int64(len(chunk)))
+	if err != nil {
+		t.Fatalf("UploadPart failed: %v", err)
+	}
+
+	// Caller provides parts WITHOUT Size metadata (e.g. standard S3 client)
+	parts := []blobkit.CompletedPart{
+		{PartNumber: 1, ETag: etag, Size: 0},
+	}
+
+	completedObj, err := driver.CompleteMultipart(ctx, &blobkit.Object{Key: key}, uploadID, parts)
+	if err != nil {
+		t.Fatalf("CompleteMultipart failed: %v", err)
+	}
+
+	// Verify size is resolved accurately via Head fallback instead of remaining 0
+	if completedObj.Size != int64(len(chunk)) {
+		t.Fatalf("expected completed size %d via Head fallback, got %d", len(chunk), completedObj.Size)
+	}
+}
+
+func TestAzure_Copy_SameKey(t *testing.T) {
+	server := httptest.NewServer(newMockAzureServer("mockcontainer"))
+	defer server.Close()
+
+	driver, err := azure.NewDriver(azure.Config{
+		Name:           "azure-self-copy",
+		AccountName:    "mockacct",
+		AccountKey:     "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI=",
+		Container:      "mockcontainer",
+		CustomEndpoint: server.URL,
+		HTTPClient:     server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("failed to create driver: %v", err)
+	}
+	defer driver.Close()
+
+	ctx := context.Background()
+	key := "self-copy.txt"
+	_, err = driver.Put(ctx, &blobkit.Object{Key: key}, strings.NewReader("hello self"), blobkit.PutOptions{Size: 10})
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	// Copying to same key should succeed cleanly without triggering 409
+	err = driver.Copy(ctx, key, key)
+	if err != nil {
+		t.Fatalf("Copy to same key failed: %v", err)
+	}
+}
+

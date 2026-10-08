@@ -132,6 +132,9 @@ type Filter struct {
 	// CreatedBefore filters records created on or before this timestamp.
 	CreatedBefore *time.Time
 
+	// DeletedBefore filters records deleted on or before this timestamp.
+	DeletedBefore *time.Time
+
 	// Metadata requires matching key-value pairs.
 	Metadata map[string]string
 

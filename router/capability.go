@@ -39,8 +39,10 @@ func (r *CapabilityRouter) Select(ctx context.Context, rc RouteContext) (blobkit
 		required = blobkit.CapPresignGet
 	case blobkit.OpPresignPut:
 		required = blobkit.CapPresignPut
-	default:
+	case blobkit.OpPut:
 		required = blobkit.CapDirectPut
+	default:
+		required = 0
 	}
 
 	for _, d := range r.drivers {

@@ -34,7 +34,7 @@ func resolvePath(rootDir, key, stagingDir string) (string, error) {
 	fullPath := filepath.Join(rootDir, cleanKey)
 
 	// Strict chroot containment check: fullPath MUST have rootDir + separator as prefix
-	expectedPrefix := rootDir + string(filepath.Separator)
+	expectedPrefix := strings.TrimRight(rootDir, string(filepath.Separator)) + string(filepath.Separator)
 	if !strings.HasPrefix(fullPath, expectedPrefix) {
 		return "", blobkit.WrapError("path", key, "fs", blobkit.ErrSecurityViolation)
 	}

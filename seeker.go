@@ -114,10 +114,10 @@ func (s *SeekableReader) Read(p []byte) (int, error) {
 	n, err := s.activeBody.Read(p)
 	s.cursor += int64(n)
 
-	if err == io.EOF {
+	if err != nil {
 		_ = s.activeBody.Close()
 		s.activeBody = nil
-		if s.cursor < s.size {
+		if err == io.EOF && s.cursor < s.size {
 			// Partial range completed, clear EOF so subsequent reads can continue to the end
 			err = nil
 		}
@@ -129,6 +129,13 @@ func (s *SeekableReader) Read(p []byte) (int, error) {
 // ReadAt reads len(p) bytes into p at offset off without modifying the seeker's cursor.
 // It implements io.ReaderAt and is safe for concurrent execution across goroutines.
 func (s *SeekableReader) ReadAt(p []byte, off int64) (int, error) {
+	s.mu.Lock()
+	closed := s.closed
+	s.mu.Unlock()
+	if closed {
+		return 0, errors.New("blobkit: seeker is closed")
+	}
+
 	if off < 0 {
 		return 0, errors.New("blobkit: negative offset in ReadAt")
 	}
@@ -152,7 +159,11 @@ func (s *SeekableReader) ReadAt(p []byte, off int64) (int, error) {
 	defer reader.Close()
 
 	n, err := io.ReadFull(reader, p[:end-off+1])
-	if err == io.EOF || err == io.ErrUnexpectedEOF {
+	if err == nil {
+		if n < len(p) {
+			err = io.EOF
+		}
+	} else if err == io.EOF || err == io.ErrUnexpectedEOF {
 		if off+int64(n) >= s.size {
 			err = io.EOF
 		}

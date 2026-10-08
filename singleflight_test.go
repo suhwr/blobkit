@@ -123,3 +123,57 @@ func TestSingleflightGroup_PanicSafety(t *testing.T) {
 		t.Fatalf("singleflight wedged/deadlocked after panic on key %q", key)
 	}
 }
+
+func TestSingleflightGroup_PanicPropagationToFollowers(t *testing.T) {
+	var g singleflightGroup
+	key := "panic-follower-key"
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	followerDone := make(chan struct{})
+	var followerErr error
+	var followerVal any
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var leaderPanicked bool
+
+	go func() {
+		defer wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				leaderPanicked = true
+			}
+		}()
+		_, _ = g.Do(key, func() (any, error) {
+			close(started)
+			<-release
+			panic("leader exploded")
+		})
+	}()
+
+	<-started
+
+	go func() {
+		defer close(followerDone)
+		followerVal, followerErr = g.Do(key, func() (any, error) {
+			return "should not be called", nil
+		})
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	close(release)
+
+	wg.Wait()
+	<-followerDone
+
+	if !leaderPanicked {
+		t.Fatal("expected leader to panic")
+	}
+	if followerErr == nil {
+		t.Fatal("expected follower to receive error when leader panics, got nil (phantom success)")
+	}
+	if followerVal != nil {
+		t.Fatalf("expected follower to receive nil val, got %v", followerVal)
+	}
+}

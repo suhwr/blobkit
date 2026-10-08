@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 
@@ -240,3 +241,67 @@ func TestSeeker_UnsupportedCapability(t *testing.T) {
 		t.Fatalf("expected ErrUnsupportedOperation on driver without CapByteRangeGet, got: %v", err)
 	}
 }
+
+func TestSeeker_ReadAt_EOFContractCompliance(t *testing.T) {
+	ctx := context.Background()
+	driver := memory.NewDriver(memory.Config{Bucket: "test"})
+	bucket, _ := blobkit.NewBucket(driver)
+
+	payload := []byte("0123456789") // 10 bytes
+	key := "test/eof.txt"
+	_, _ = bucket.PutBytes(ctx, key, payload, blobkit.PutOptions{})
+
+	seeker, err := bucket.OpenSeeker(ctx, key)
+	if err != nil {
+		t.Fatalf("OpenSeeker failed: %v", err)
+	}
+	defer seeker.Close()
+
+	// 1. Partial read that hits EOF: offset 8, buffer length 5. Should read 2 bytes and return io.EOF
+	buf := make([]byte, 5)
+	n, err := seeker.ReadAt(buf, 8)
+	if err != io.EOF {
+		t.Fatalf("expected io.EOF on short read at EOF, got %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("expected n=2, got %d", n)
+	}
+	if string(buf[:n]) != "89" {
+		t.Fatalf("expected '89', got %q", string(buf[:n]))
+	}
+
+	// 2. ReadAt exactly at or beyond object size: offset 10. Should return 0, io.EOF
+	n, err = seeker.ReadAt(buf, 10)
+	if err != io.EOF || n != 0 {
+		t.Fatalf("expected n=0 and io.EOF at object boundary, got n=%d err=%v", n, err)
+	}
+}
+
+func TestSeeker_ReadAt_Closed(t *testing.T) {
+	ctx := context.Background()
+	driver := memory.NewDriver(memory.Config{Bucket: "test"})
+	bucket, _ := blobkit.NewBucket(driver)
+
+	payload := []byte("0123456789")
+	key := "test/closed.txt"
+	_, _ = bucket.PutBytes(ctx, key, payload, blobkit.PutOptions{})
+
+	seeker, err := bucket.OpenSeeker(ctx, key)
+	if err != nil {
+		t.Fatalf("OpenSeeker failed: %v", err)
+	}
+
+	if err := seeker.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	buf := make([]byte, 5)
+	_, err = seeker.ReadAt(buf, 0)
+	if err == nil {
+		t.Fatal("expected error calling ReadAt on closed seeker, got nil")
+	}
+	if !strings.Contains(err.Error(), "closed") {
+		t.Fatalf("expected 'closed' in error message, got: %v", err)
+	}
+}
+

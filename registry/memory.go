@@ -38,6 +38,7 @@ func (s *MemoryStore) Save(ctx context.Context, record *Record) error {
 	defer s.mu.Unlock()
 
 	rec := *record
+	rec.Metadata = cloneMetadata(record.Metadata)
 	now := time.Now().UTC()
 	if rec.CreatedAt.IsZero() {
 		rec.CreatedAt = now
@@ -46,7 +47,9 @@ func (s *MemoryStore) Save(ctx context.Context, record *Record) error {
 
 	if rec.Key != "" {
 		if existingID, ok := s.byKey[rec.Key]; ok && existingID != rec.ObjectID {
-			return blobkit.WrapError("registry_save", rec.Key, "", fmt.Errorf("key collision: key %q already belongs to object %q", rec.Key, existingID))
+			if existingRec, found := s.records[existingID]; found && existingRec.Status != blobkit.StateDeleted {
+				return blobkit.WrapError("registry_save", rec.Key, "", fmt.Errorf("key collision: key %q already belongs to object %q", rec.Key, existingID))
+			}
 		}
 	}
 
@@ -76,6 +79,7 @@ func (s *MemoryStore) GetByID(ctx context.Context, objectID string) (*Record, er
 		return nil, blobkit.ErrObjectNotFound
 	}
 	copyRec := rec
+	copyRec.Metadata = cloneMetadata(rec.Metadata)
 	return &copyRec, nil
 }
 
@@ -97,6 +101,7 @@ func (s *MemoryStore) GetByKey(ctx context.Context, key string) (*Record, error)
 		return nil, blobkit.ErrObjectNotFound
 	}
 	copyRec := rec
+	copyRec.Metadata = cloneMetadata(rec.Metadata)
 	return &copyRec, nil
 }
 
@@ -115,7 +120,7 @@ func (s *MemoryStore) Find(ctx context.Context, filter Filter) ([]Record, error)
 		if filter.Key != "" && rec.Key != filter.Key {
 			continue
 		}
-		if filter.Namespace != "" && !strings.HasPrefix(rec.Namespace, filter.Namespace) {
+		if filter.Namespace != "" && rec.Namespace != filter.Namespace && !strings.HasPrefix(rec.Namespace, filter.Namespace+"/") {
 			continue
 		}
 		if filter.OwnerID != "" && rec.OwnerID != filter.OwnerID {
@@ -139,6 +144,9 @@ func (s *MemoryStore) Find(ctx context.Context, filter Filter) ([]Record, error)
 		if filter.CreatedBefore != nil && rec.CreatedAt.After(*filter.CreatedBefore) {
 			continue
 		}
+		if filter.DeletedBefore != nil && (rec.DeletedAt == nil || rec.DeletedAt.After(*filter.DeletedBefore)) {
+			continue
+		}
 
 		// Metadata key-value matching
 		if len(filter.Metadata) > 0 {
@@ -154,7 +162,9 @@ func (s *MemoryStore) Find(ctx context.Context, filter Filter) ([]Record, error)
 			}
 		}
 
-		matched = append(matched, rec)
+		recCopy := rec
+		recCopy.Metadata = cloneMetadata(rec.Metadata)
+		matched = append(matched, recCopy)
 	}
 
 	// Sort newest first
@@ -220,12 +230,14 @@ func (s *MemoryStore) UpdateMetadata(ctx context.Context, objectID string, metad
 		return blobkit.ErrObjectNotFound
 	}
 
-	if rec.Metadata == nil {
-		rec.Metadata = make(map[string]string)
+	newMeta := cloneMetadata(rec.Metadata)
+	if newMeta == nil {
+		newMeta = make(map[string]string)
 	}
 	for k, v := range metadata {
-		rec.Metadata[k] = v
+		newMeta[k] = v
 	}
+	rec.Metadata = newMeta
 	rec.UpdatedAt = time.Now().UTC()
 	s.records[objectID] = rec
 	return nil
@@ -281,7 +293,7 @@ func (s *MemoryStore) HardDelete(ctx context.Context, objectID string) error {
 
 	rec, ok := s.records[objectID]
 	if !ok {
-		return nil
+		return blobkit.ErrObjectNotFound
 	}
 	delete(s.records, objectID)
 	if rec.Key != "" {
@@ -307,7 +319,9 @@ func (s *MemoryStore) FindExpired(ctx context.Context, before time.Time, limit i
 			continue
 		}
 		if rec.ExpiresAt != nil && !rec.ExpiresAt.After(before) {
-			expired = append(expired, rec)
+			recCopy := rec
+			recCopy.Metadata = cloneMetadata(rec.Metadata)
+			expired = append(expired, recCopy)
 			if len(expired) >= limit {
 				break
 			}
@@ -324,7 +338,9 @@ func (s *MemoryStore) SaveSession(ctx context.Context, session *UploadSession) e
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.sessions[session.ID] = *session
+	sess := *session
+	sess.Parts = cloneParts(session.Parts)
+	s.sessions[session.ID] = sess
 	return nil
 }
 
@@ -342,6 +358,7 @@ func (s *MemoryStore) GetSession(ctx context.Context, sessionID string) (*Upload
 	}
 
 	copySess := sess
+	copySess.Parts = cloneParts(sess.Parts)
 	return &copySess, nil
 }
 
@@ -353,6 +370,9 @@ func (s *MemoryStore) DeleteSession(ctx context.Context, sessionID string) error
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if _, ok := s.sessions[sessionID]; !ok {
+		return blobkit.ErrSessionNotFound
+	}
 	delete(s.sessions, sessionID)
 	return nil
 }
@@ -368,7 +388,9 @@ func (s *MemoryStore) FindStaleSessions(ctx context.Context, before time.Time, l
 	var stale []UploadSession
 	for _, sess := range s.sessions {
 		if sess.Status == blobkit.SessionActive && !sess.ExpiresAt.After(before) {
-			stale = append(stale, sess)
+			staleSess := sess
+			staleSess.Parts = cloneParts(sess.Parts)
+			stale = append(stale, staleSess)
 			if len(stale) >= limit {
 				break
 			}
@@ -384,4 +406,24 @@ func (s *MemoryStore) Close() error {
 	s.sessions = make(map[string]UploadSession)
 	s.mu.Unlock()
 	return nil
+}
+
+func cloneMetadata(m map[string]string) map[string]string {
+	if m == nil {
+		return nil
+	}
+	cp := make(map[string]string, len(m))
+	for k, v := range m {
+		cp[k] = v
+	}
+	return cp
+}
+
+func cloneParts(parts []blobkit.CompletedPart) []blobkit.CompletedPart {
+	if parts == nil {
+		return nil
+	}
+	cp := make([]blobkit.CompletedPart, len(parts))
+	copy(cp, parts)
+	return cp
 }

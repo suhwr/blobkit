@@ -189,7 +189,7 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 
 	stored := *obj
 	stored.Bucket = d.cfg.Container
-	stored.Size = opts.Size
+	stored.Size = payloadSize
 	stored.ContentType = contentType
 	stored.ETag = etag
 	stored.Metadata = meta
@@ -250,6 +250,19 @@ func (d *Driver) uploadStreamMultipart(ctx context.Context, obj *blobkit.Object,
 		if readErr != nil {
 			_ = d.AbortMultipart(context.Background(), obj.Key, uploadID)
 			return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, readErr)
+		}
+	}
+
+	if opts.ExplicitSize || (opts.Size > 0 && opts.Size != blobkit.SizeUnknown) {
+		if totalSize != opts.Size {
+			_ = d.AbortMultipart(context.Background(), obj.Key, uploadID)
+			return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, blobkit.ErrSizeMismatch)
+		}
+	}
+	if sr, ok := r.(*blobkit.SizeReader); ok {
+		if vErr := sr.Verify(); vErr != nil {
+			_ = d.AbortMultipart(context.Background(), obj.Key, uploadID)
+			return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, vErr)
 		}
 	}
 
@@ -317,6 +330,10 @@ func (d *Driver) Get(ctx context.Context, key string, opts blobkit.GetOptions) (
 	if cl := resp.Header.Get("Content-Length"); cl != "" {
 		if s, err := strconv.ParseInt(cl, 10, 64); err == nil {
 			size = s
+		}
+	} else if bcl := resp.Header.Get("x-ms-blob-content-length"); bcl != "" {
+		if totalSize, err := strconv.ParseInt(bcl, 10, 64); err == nil {
+			size = totalSize
 		}
 	}
 
@@ -386,6 +403,13 @@ func (d *Driver) Head(ctx context.Context, key string) (*blobkit.Object, error) 
 	if cl := resp.Header.Get("Content-Length"); cl != "" {
 		if s, err := strconv.ParseInt(cl, 10, 64); err == nil {
 			size = s
+		}
+	}
+	if size == 0 {
+		if bcl := resp.Header.Get("x-ms-blob-content-length"); bcl != "" {
+			if totalSize, err := strconv.ParseInt(bcl, 10, 64); err == nil {
+				size = totalSize
+			}
 		}
 	}
 
@@ -526,8 +550,17 @@ func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
 	if err := validateKey(dstKey); err != nil {
 		return blobkit.WrapError("copy", dstKey, d.cfg.Name, err)
 	}
+	if srcKey == dstKey {
+		_, err := d.Head(ctx, srcKey)
+		return err
+	}
 	srcURL := d.blobURL(srcKey)
 	dstURL := d.blobURL(dstKey)
+
+	if d.cfg.SASToken != "" && !strings.Contains(srcURL, "?") {
+		sas := strings.TrimPrefix(d.cfg.SASToken, "?")
+		srcURL = srcURL + "?" + sas
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, dstURL, nil)
 	if err != nil {

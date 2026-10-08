@@ -29,8 +29,25 @@ type Client struct {
 	cache             Cache
 	sf                singleflightGroup
 
-	sessionsMu sync.RWMutex
-	sessions   map[string]*UploadSession
+	sessionsMu   sync.RWMutex
+	sessions     map[string]*UploadSession
+	sessionLocks sync.Map
+}
+
+func (c *Client) getSessionLock(sessionID string) *sync.Mutex {
+	v, _ := c.sessionLocks.LoadOrStore(sessionID, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
+
+func cloneMetadata(m map[string]string) map[string]string {
+	if m == nil {
+		return nil
+	}
+	cp := make(map[string]string, len(m))
+	for k, v := range m {
+		cp[k] = v
+	}
+	return cp
 }
 
 // New constructs a new BlobKit Client configured with the provided options.
@@ -149,6 +166,21 @@ func (c *Client) Put(ctx context.Context, r io.Reader, opts PutOptions) (savedOb
 		})
 		if genErr != nil {
 			return nil, WrapError("generate_key", "", "", genErr)
+		}
+	} else if c.registry != nil {
+		existingByKey, getErr := c.registry.GetByKey(ctx, storageKey)
+		if getErr == nil && existingByKey != nil {
+			if existingByKey.LegalHold {
+				return nil, WrapError("put_overwrite", existingByKey.Key, existingByKey.Provider, ErrObjectLocked)
+			}
+			if existingByKey.RetentionUntil != nil && existingByKey.RetentionUntil.After(time.Now().UTC()) {
+				return nil, WrapError("put_overwrite", existingByKey.Key, existingByKey.Provider, ErrObjectLocked)
+			}
+			if opts.ID == "" {
+				objID = existingByKey.ObjectID
+			} else if opts.ID != existingByKey.ObjectID {
+				return nil, WrapError("put_collision", storageKey, existingByKey.Provider, fmt.Errorf("key %q already belongs to object %q", storageKey, existingByKey.ObjectID))
+			}
 		}
 	}
 
@@ -554,13 +586,16 @@ func (c *Client) DeleteBatch(ctx context.Context, targets []string) (deleted []s
 		provider string
 	}
 
-	byProvider := make(map[string][]targetItem)
+	byDriver := make(map[string][]targetItem)
+	driverMap := make(map[string]Driver)
+
 	for _, t := range targets {
 		key, providerName, resErr := c.resolveTarget(ctx, t)
 		if resErr != nil {
 			key = strings.TrimLeft(t, "/")
 		}
 		objID := t
+		var namespace string
 		if c.registry != nil {
 			rec, _ := c.registry.GetByID(ctx, t)
 			if rec == nil {
@@ -568,6 +603,7 @@ func (c *Client) DeleteBatch(ctx context.Context, targets []string) (deleted []s
 			}
 			if rec != nil {
 				objID = rec.ObjectID
+				namespace = rec.Namespace
 				if providerName == "" {
 					providerName = rec.Provider
 				}
@@ -576,27 +612,32 @@ func (c *Client) DeleteBatch(ctx context.Context, targets []string) (deleted []s
 				}
 			}
 		}
-		byProvider[providerName] = append(byProvider[providerName], targetItem{
+
+		drv, rErr := c.router.Select(ctx, RouteContext{
+			Op:             OpDelete,
+			Key:            key,
+			Namespace:      namespace,
+			ForcedProvider: providerName,
+		})
+		if rErr != nil {
+			err = WrapError("route_driver", key, providerName, rErr)
+			return deleted, err
+		}
+		dName := drv.Name()
+		driverMap[dName] = drv
+		byDriver[dName] = append(byDriver[dName], targetItem{
 			target:   t,
 			key:      key,
 			objectID: objID,
-			provider: providerName,
+			provider: dName,
 		})
 	}
 
-	for prov, items := range byProvider {
+	for prov, items := range byDriver {
+		driver := driverMap[prov]
 		keys := make([]string, len(items))
 		for i, item := range items {
 			keys[i] = item.key
-		}
-
-		driver, rErr := c.router.Select(ctx, RouteContext{
-			Op:             OpDelete,
-			ForcedProvider: prov,
-		})
-		if rErr != nil {
-			err = WrapError("route_driver", "", prov, rErr)
-			return deleted, err
 		}
 
 		delBatch, dErr := driver.DeleteBatch(ctx, keys)
@@ -672,8 +713,26 @@ func (c *Client) Rename(ctx context.Context, target string, newFilename string) 
 	}
 
 	if c.registry != nil {
-		if err := c.registry.UpdateFilename(ctx, target, clean); err != nil {
+		objID := target
+		cleanKey := strings.TrimLeft(target, "/")
+		var keyToEvict string
+		if rec, err := c.registry.GetByID(ctx, target); err == nil && rec != nil {
+			objID = rec.ObjectID
+			keyToEvict = rec.Key
+		} else if rec, err := c.registry.GetByKey(ctx, cleanKey); err == nil && rec != nil {
+			objID = rec.ObjectID
+			keyToEvict = rec.Key
+		}
+		if err := c.registry.UpdateFilename(ctx, objID, clean); err != nil {
 			return WrapError("rename", target, "", err)
+		}
+		if c.cache != nil {
+			c.cache.Delete(target)
+			c.cache.Delete(cleanKey)
+			c.cache.Delete(objID)
+			if keyToEvict != "" {
+				c.cache.Delete(keyToEvict)
+			}
 		}
 		return nil
 	}
@@ -687,11 +746,24 @@ func (c *Client) UpdateMetadata(ctx context.Context, target string, metadata map
 	}
 	objID := target
 	cleanKey := strings.TrimLeft(target, "/")
-	if rec, err := c.registry.GetByKey(ctx, cleanKey); err == nil && rec != nil {
+	var keyToEvict string
+	if rec, err := c.registry.GetByID(ctx, target); err == nil && rec != nil {
 		objID = rec.ObjectID
+		keyToEvict = rec.Key
+	} else if rec, err := c.registry.GetByKey(ctx, cleanKey); err == nil && rec != nil {
+		objID = rec.ObjectID
+		keyToEvict = rec.Key
 	}
 	if err := c.registry.UpdateMetadata(ctx, objID, metadata); err != nil {
 		return WrapError("update_metadata", objID, "", err)
+	}
+	if c.cache != nil {
+		c.cache.Delete(target)
+		c.cache.Delete(cleanKey)
+		c.cache.Delete(objID)
+		if keyToEvict != "" {
+			c.cache.Delete(keyToEvict)
+		}
 	}
 	return nil
 }
@@ -702,8 +774,26 @@ func (c *Client) BatchUpdateMetadata(ctx context.Context, updates map[string]map
 		return ErrUnsupportedOperation
 	}
 	for id, meta := range updates {
-		if err := c.registry.UpdateMetadata(ctx, id, meta); err != nil {
-			return WrapError("batch_update_metadata", id, "", err)
+		objID := id
+		cleanKey := strings.TrimLeft(id, "/")
+		var keyToEvict string
+		if rec, err := c.registry.GetByID(ctx, id); err == nil && rec != nil {
+			objID = rec.ObjectID
+			keyToEvict = rec.Key
+		} else if rec, err := c.registry.GetByKey(ctx, cleanKey); err == nil && rec != nil {
+			objID = rec.ObjectID
+			keyToEvict = rec.Key
+		}
+		if err := c.registry.UpdateMetadata(ctx, objID, meta); err != nil {
+			return WrapError("batch_update_metadata", objID, "", err)
+		}
+		if c.cache != nil {
+			c.cache.Delete(id)
+			c.cache.Delete(cleanKey)
+			c.cache.Delete(objID)
+			if keyToEvict != "" {
+				c.cache.Delete(keyToEvict)
+			}
 		}
 	}
 	return nil
@@ -757,6 +847,21 @@ func (c *Client) Copy(ctx context.Context, srcTarget string, dstOpts PutOptions)
 		if err != nil {
 			return nil, WrapError("copy_dst_key", "", "", err)
 		}
+	} else if c.registry != nil {
+		existingRec, getErr := c.registry.GetByKey(ctx, dstKey)
+		if getErr == nil && existingRec != nil {
+			if existingRec.LegalHold {
+				return nil, WrapError("copy_overwrite", existingRec.Key, existingRec.Provider, ErrObjectLocked)
+			}
+			if existingRec.RetentionUntil != nil && existingRec.RetentionUntil.After(time.Now().UTC()) {
+				return nil, WrapError("copy_overwrite", existingRec.Key, existingRec.Provider, ErrObjectLocked)
+			}
+			if dstOpts.ID == "" {
+				dstID = existingRec.ObjectID
+			} else if dstOpts.ID != existingRec.ObjectID {
+				return nil, WrapError("copy_collision", dstKey, existingRec.Provider, fmt.Errorf("key %q already belongs to object %q", dstKey, existingRec.ObjectID))
+			}
+		}
 	}
 
 	dstDriver, err := c.router.Select(ctx, RouteContext{
@@ -769,13 +874,44 @@ func (c *Client) Copy(ctx context.Context, srcTarget string, dstOpts PutOptions)
 		return nil, WrapError("route_driver", dstKey, "", err)
 	}
 
+	var srcDriver Driver
+	if srcProvider != "" {
+		srcDriver, _ = c.router.Select(ctx, RouteContext{
+			Op:             OpGet,
+			Key:            srcKey,
+			ForcedProvider: srcProvider,
+		})
+	} else {
+		srcDriver, _ = c.router.Select(ctx, RouteContext{
+			Op:  OpGet,
+			Key: srcKey,
+		})
+	}
+
+	isSameDriver := srcDriver != nil && srcDriver.Name() == dstDriver.Name()
+
 	// Server-side copy if same driver and CapCopy is supported
-	if (srcProvider == "" || srcProvider == dstDriver.Name()) && (dstDriver.Capabilities()&CapCopy != 0) {
+	if isSameDriver && (dstDriver.Capabilities()&CapCopy != 0) {
+		dstPreexisted := false
+		if c.registry != nil {
+			if rec, err := c.registry.GetByKey(ctx, dstKey); err == nil && rec != nil && rec.Status == StateCommitted {
+				dstPreexisted = true
+			}
+		}
+		if !dstPreexisted {
+			if _, headErr := dstDriver.Head(ctx, dstKey); headErr == nil {
+				dstPreexisted = true
+			}
+		}
+
 		if err := dstDriver.Copy(ctx, srcKey, dstKey); err != nil {
 			return nil, err
 		}
 		copiedObj, err := dstDriver.Head(ctx, dstKey)
 		if err != nil {
+			if !dstPreexisted {
+				_ = dstDriver.Delete(ctx, dstKey)
+			}
 			return nil, err
 		}
 		copiedObj.ID = dstID
@@ -786,8 +922,34 @@ func (c *Client) Copy(ctx context.Context, srcTarget string, dstOpts PutOptions)
 			copiedObj.OriginalFilename = srcObj.OriginalFilename
 		}
 		copiedObj.Status = StateCommitted
+		if dstOpts.Visibility != "" {
+			copiedObj.Visibility = dstOpts.Visibility
+		} else if copiedObj.Visibility == "" {
+			copiedObj.Visibility = srcObj.Visibility
+		}
+		if copiedObj.Visibility == "" {
+			copiedObj.Visibility = c.defaultVisibility
+		}
+
+		retentionUntil := dstOpts.RetentionUntil
+		if retentionUntil == nil {
+			retentionUntil = srcObj.RetentionUntil
+		}
+		expiresAt := dstOpts.ExpiresAt
+		if expiresAt == nil {
+			expiresAt = srcObj.ExpiresAt
+		}
+		legalHold := dstOpts.LegalHold || srcObj.LegalHold
+
+		copiedObj.RetentionUntil = retentionUntil
+		copiedObj.ExpiresAt = expiresAt
+		copiedObj.LegalHold = legalHold
 
 		if c.registry != nil {
+			meta := dstOpts.Metadata
+			if meta == nil && srcObj.Metadata != nil {
+				meta = cloneMetadata(srcObj.Metadata)
+			}
 			rec := &Record{
 				ObjectID:         copiedObj.ID,
 				Namespace:        copiedObj.Namespace,
@@ -801,15 +963,24 @@ func (c *Client) Copy(ctx context.Context, srcTarget string, dstOpts PutOptions)
 				OriginalFilename: copiedObj.OriginalFilename,
 				Visibility:       copiedObj.Visibility,
 				Status:           StateCommitted,
-				Metadata:         dstOpts.Metadata,
+				Metadata:         meta,
+				RetentionUntil:   retentionUntil,
+				ExpiresAt:        expiresAt,
+				LegalHold:        legalHold,
 				CreatedAt:        time.Now().UTC(),
 				UpdatedAt:        time.Now().UTC(),
 			}
 			if err := c.registry.Save(ctx, rec); err != nil {
-				_ = dstDriver.Delete(ctx, copiedObj.Key)
+				if !dstPreexisted {
+					_ = dstDriver.Delete(ctx, copiedObj.Key)
+				}
 				c.abortRegistry(ctx, copiedObj.ID)
 				return nil, WrapError("registry_save_copy", copiedObj.Key, copiedObj.Provider, err)
 			}
+		}
+		if c.cache != nil {
+			c.cache.Set(copiedObj.ID, copiedObj, 0)
+			c.cache.Set(copiedObj.Key, copiedObj, 0)
 		}
 		return copiedObj, nil
 	}
@@ -827,6 +998,25 @@ func (c *Client) Copy(ctx context.Context, srcTarget string, dstOpts PutOptions)
 	if dstOpts.ContentType == "" {
 		dstOpts.ContentType = srcObj.ContentType
 	}
+	if dstOpts.Metadata == nil && srcObj.Metadata != nil {
+		dstOpts.Metadata = cloneMetadata(srcObj.Metadata)
+	}
+	if dstOpts.Size <= 0 && srcReader.Object.Size > 0 {
+		dstOpts.Size = srcReader.Object.Size
+		dstOpts.ExplicitSize = true
+	}
+	if dstOpts.Visibility == "" {
+		dstOpts.Visibility = srcObj.Visibility
+	}
+	if dstOpts.RetentionUntil == nil && srcObj.RetentionUntil != nil {
+		dstOpts.RetentionUntil = srcObj.RetentionUntil
+	}
+	if dstOpts.ExpiresAt == nil && srcObj.ExpiresAt != nil {
+		dstOpts.ExpiresAt = srcObj.ExpiresAt
+	}
+	if !dstOpts.LegalHold && srcObj.LegalHold {
+		dstOpts.LegalHold = true
+	}
 	dstOpts.ID = dstID
 	dstOpts.Key = dstKey
 
@@ -836,6 +1026,26 @@ func (c *Client) Copy(ctx context.Context, srcTarget string, dstOpts PutOptions)
 // Move is a best-effort copy and delete. It is not an atomic rename operation.
 // If the server-side copy succeeds but the deletion fails, the object will exist at both locations.
 func (c *Client) Move(ctx context.Context, srcTarget string, dstOpts PutOptions) (*Object, error) {
+	srcKey, srcProvider, _ := c.resolveTarget(ctx, srcTarget)
+	if srcKey != "" && dstOpts.Key != "" && srcKey == dstOpts.Key && (dstOpts.Provider == "" || dstOpts.Provider == srcProvider) {
+		return c.Head(ctx, srcTarget)
+	}
+
+	if c.registry != nil {
+		rec, _ := c.registry.GetByID(ctx, srcTarget)
+		if rec == nil && srcKey != "" {
+			rec, _ = c.registry.GetByKey(ctx, srcKey)
+		}
+		if rec != nil {
+			if rec.LegalHold {
+				return nil, WrapError("move", srcKey, srcProvider, ErrObjectLocked)
+			}
+			if rec.RetentionUntil != nil && rec.RetentionUntil.After(time.Now().UTC()) {
+				return nil, WrapError("move", srcKey, srcProvider, ErrObjectLocked)
+			}
+		}
+	}
+
 	copied, err := c.Copy(ctx, srcTarget, dstOpts)
 	if err != nil {
 		return nil, WrapError("move_copy_phase", "", "", err)
@@ -850,7 +1060,11 @@ func (c *Client) Move(ctx context.Context, srcTarget string, dstOpts PutOptions)
 
 // List lists objects directly from the storage driver.
 func (c *Client) List(ctx context.Context, opts ListOptions) (*ListResult, error) {
-	driver, err := c.router.Select(ctx, RouteContext{Op: OpList})
+	driver, err := c.router.Select(ctx, RouteContext{
+		Op:        OpList,
+		Key:       opts.Prefix,
+		Namespace: opts.Prefix,
+	})
 	if err != nil {
 		return nil, WrapError("route_driver", "", "", err)
 	}
@@ -1301,7 +1515,9 @@ func (c *Client) PermanentDelete(ctx context.Context, target string) error {
 	c.router.ReportSuccess(driver.Name())
 
 	if c.registry != nil && rec != nil {
-		_ = c.registry.HardDelete(ctx, rec.ObjectID)
+		if hErr := c.registry.HardDelete(ctx, rec.ObjectID); hErr != nil && !IsNotFound(hErr) {
+			return WrapError("permanent_delete_registry", target, driver.Name(), hErr)
+		}
 	}
 
 	if c.cache != nil {
@@ -1330,10 +1546,10 @@ func (c *Client) PermanentDeleteBatch(ctx context.Context, targets []string) ([]
 		target   string
 		key      string
 		objectID string
+		driver   Driver
 	}
 
-	// Group valid targets by provider
-	byProvider := make(map[string][]itemMeta)
+	byDriver := make(map[string][]itemMeta)
 	var errs []error
 
 	for _, target := range targets {
@@ -1344,6 +1560,7 @@ func (c *Client) PermanentDeleteBatch(ctx context.Context, targets []string) ([]
 		}
 
 		objID := target
+		var namespace string
 		if c.registry != nil {
 			rec, _ := c.registry.GetByID(ctx, target)
 			if rec == nil {
@@ -1351,6 +1568,10 @@ func (c *Client) PermanentDeleteBatch(ctx context.Context, targets []string) ([]
 			}
 			if rec != nil {
 				objID = rec.ObjectID
+				namespace = rec.Namespace
+				if providerName == "" {
+					providerName = rec.Provider
+				}
 				if rec.LegalHold {
 					errs = append(errs, WrapError("permanent_delete_batch", key, providerName, ErrObjectLocked))
 					continue
@@ -1362,27 +1583,30 @@ func (c *Client) PermanentDeleteBatch(ctx context.Context, targets []string) ([]
 			}
 		}
 
-		byProvider[providerName] = append(byProvider[providerName], itemMeta{
+		driver, rErr := c.router.Select(ctx, RouteContext{
+			Op:             OpPermanentDelete,
+			Key:            key,
+			Namespace:      namespace,
+			ForcedProvider: providerName,
+		})
+		if rErr != nil {
+			errs = append(errs, WrapError("route_driver", key, providerName, rErr))
+			continue
+		}
+
+		byDriver[driver.Name()] = append(byDriver[driver.Name()], itemMeta{
 			target:   target,
 			key:      key,
 			objectID: objID,
+			driver:   driver,
 		})
 	}
 
-	for provName, items := range byProvider {
+	for provName, items := range byDriver {
 		if len(items) == 0 {
 			continue
 		}
-
-		driver, rErr := c.router.Select(ctx, RouteContext{
-			Op:             OpDelete,
-			Key:            items[0].key,
-			ForcedProvider: provName,
-		})
-		if rErr != nil {
-			errs = append(errs, WrapError("route_driver", items[0].key, provName, rErr))
-			continue
-		}
+		driver := items[0].driver
 
 		keys := make([]string, len(items))
 		itemByKey := make(map[string]itemMeta, len(items))
@@ -1403,7 +1627,9 @@ func (c *Client) PermanentDeleteBatch(ctx context.Context, targets []string) ([]
 			it := itemByKey[delKey]
 			allDeleted = append(allDeleted, it.target)
 			if c.registry != nil && it.objectID != "" {
-				_ = c.registry.HardDelete(ctx, it.objectID)
+				if hErr := c.registry.HardDelete(ctx, it.objectID); hErr != nil && !IsNotFound(hErr) {
+					errs = append(errs, WrapError("permanent_delete_batch_registry", it.key, provName, hErr))
+				}
 			}
 			if c.cache != nil {
 				c.cache.Delete(it.target)
@@ -1435,6 +1661,16 @@ func (c *Client) InitiateResumableUpload(ctx context.Context, opts PutOptions, p
 		objID, err = key.NewObjectID()
 		if err != nil {
 			return nil, WrapError("initiate_resumable_upload", "", "", err)
+		}
+	} else if c.registry != nil {
+		existing, getErr := c.registry.GetByID(ctx, objID)
+		if getErr == nil && existing != nil {
+			if existing.LegalHold {
+				return nil, WrapError("initiate_resumable_upload", existing.Key, existing.Provider, ErrObjectLocked)
+			}
+			if existing.RetentionUntil != nil && existing.RetentionUntil.After(time.Now().UTC()) {
+				return nil, WrapError("initiate_resumable_upload", existing.Key, existing.Provider, ErrObjectLocked)
+			}
 		}
 	}
 
@@ -1473,6 +1709,21 @@ func (c *Client) InitiateResumableUpload(ctx context.Context, opts PutOptions, p
 		})
 		if err != nil {
 			return nil, WrapError("generate_key", "", "", err)
+		}
+	} else if c.registry != nil {
+		existingByKey, getErr := c.registry.GetByKey(ctx, storageKey)
+		if getErr == nil && existingByKey != nil {
+			if existingByKey.LegalHold {
+				return nil, WrapError("initiate_resumable_upload", existingByKey.Key, existingByKey.Provider, ErrObjectLocked)
+			}
+			if existingByKey.RetentionUntil != nil && existingByKey.RetentionUntil.After(time.Now().UTC()) {
+				return nil, WrapError("initiate_resumable_upload", existingByKey.Key, existingByKey.Provider, ErrObjectLocked)
+			}
+			if opts.ID == "" {
+				objID = existingByKey.ObjectID
+			} else if opts.ID != existingByKey.ObjectID {
+				return nil, WrapError("initiate_resumable_upload", storageKey, existingByKey.Provider, fmt.Errorf("key %q already belongs to object %q", storageKey, existingByKey.ObjectID))
+			}
 		}
 	}
 
@@ -1639,23 +1890,37 @@ func (c *Client) UploadPart(ctx context.Context, sessionID string, partNumber in
 		Size:       size,
 	}
 
-	// Update session parts
+	// Synchronize session update to eliminate lost updates on concurrent UploadPart calls
+	sessLock := c.getSessionLock(sessionID)
+	sessLock.Lock()
+	defer sessLock.Unlock()
+
+	freshSession, gErr := c.getSession(ctx, sessionID)
+	if gErr != nil {
+		return nil, gErr
+	}
+	if freshSession.Status != SessionActive {
+		return nil, fmt.Errorf("%w: session is %s", ErrSessionExpired, freshSession.Status)
+	}
+
 	found := false
-	for i, p := range session.Parts {
+	for i, p := range freshSession.Parts {
 		if p.PartNumber == int32(partNumber) {
-			session.Parts[i] = completed
+			freshSession.Parts[i] = completed
 			found = true
 			break
 		}
 	}
 	if !found {
-		session.Parts = append(session.Parts, completed)
+		freshSession.Parts = append(freshSession.Parts, completed)
 	}
 
-	if err = c.saveSession(ctx, session); err != nil {
-		if providerParts, pErr := driver.ListParts(ctx, session.Key, session.UploadID); pErr == nil {
-			session.Parts = providerParts
-			_ = c.saveSession(ctx, session)
+	if err = c.saveSession(ctx, freshSession); err != nil {
+		if driver.Capabilities()&CapMultipartSession != 0 {
+			if providerParts, pErr := driver.ListParts(ctx, freshSession.Key, freshSession.UploadID); pErr == nil {
+				freshSession.Parts = providerParts
+				_ = c.saveSession(ctx, freshSession)
+			}
 		}
 		return nil, WrapError("save_session_part", sessionID, "", err)
 	}
@@ -1701,10 +1966,45 @@ func (c *Client) CommitResumableUpload(ctx context.Context, sessionID string) (*
 		c.observer.OnOperationEnd(ctx, OpMultipart, sessionID, time.Since(start), err)
 	}()
 
+	sessLock := c.getSessionLock(sessionID)
+	sessLock.Lock()
+	defer sessLock.Unlock()
+
 	session, gErr := c.getSession(ctx, sessionID)
 	if gErr != nil {
 		err = gErr
 		return nil, err
+	}
+
+	driver, rErr := c.router.Select(ctx, RouteContext{
+		Op:             OpPut,
+		Key:            session.Key,
+		ForcedProvider: session.Provider,
+	})
+	if rErr != nil {
+		err = WrapError("route_driver", session.Key, "", rErr)
+		return nil, err
+	}
+
+	// Idempotent recovery: If session was already marked committed, verify physical object and registry
+	if session.Status == SessionCommitted {
+		if headObj, hErr := driver.Head(ctx, session.Key); hErr == nil {
+			if c.registry != nil {
+				if rec, _ := c.registry.GetByID(ctx, session.ObjectID); rec != nil && rec.Status != StateCommitted {
+					rec.Bucket = headObj.Bucket
+					rec.Size = headObj.Size
+					rec.ETag = headObj.ETag
+					rec.ChecksumSHA256 = headObj.ChecksumSHA256
+					rec.Status = StateCommitted
+					rec.UpdatedAt = time.Now().UTC()
+					_ = c.registry.Save(ctx, rec)
+				}
+			}
+			c.sessionLocks.Delete(sessionID)
+			headObj.ID = session.ObjectID
+			headObj.Status = StateCommitted
+			return headObj, nil
+		}
 	}
 
 	if session.Status != SessionActive {
@@ -1720,14 +2020,12 @@ func (c *Client) CommitResumableUpload(ctx context.Context, sessionID string) (*
 		return nil, err
 	}
 
-	driver, rErr := c.router.Select(ctx, RouteContext{
-		Op:             OpPut,
-		Key:            session.Key,
-		ForcedProvider: session.Provider,
-	})
-	if rErr != nil {
-		err = WrapError("route_driver", session.Key, "", rErr)
-		return nil, err
+	// Finding 7: Provider ListParts as ground truth authority
+	if driver.Capabilities()&CapMultipartSession != 0 {
+		if providerParts, pErr := driver.ListParts(ctx, session.Key, session.UploadID); pErr == nil && len(providerParts) > 0 {
+			session.Parts = providerParts
+			_ = c.saveSession(ctx, session)
+		}
 	}
 
 	obj := &Object{
@@ -1754,14 +2052,17 @@ func (c *Client) CommitResumableUpload(ctx context.Context, sessionID string) (*
 
 	completedObj, cErr := driver.CompleteMultipart(ctx, obj, session.UploadID, session.Parts)
 	if cErr != nil {
-		c.router.ReportFailure(driver.Name(), cErr)
-		err = cErr
-		return nil, err
+		// If CompleteMultipart failed, check if physical object already exists (e.g. backend succeeded on prior attempt)
+		if headObj, hErr := driver.Head(ctx, session.Key); hErr == nil {
+			completedObj = headObj
+			cErr = nil
+		} else {
+			c.router.ReportFailure(driver.Name(), cErr)
+			err = cErr
+			return nil, err
+		}
 	}
 	c.router.ReportSuccess(driver.Name())
-
-	session.Status = SessionCommitted
-	_ = c.saveSession(ctx, session)
 
 	if c.registry != nil {
 		rec, _ := c.registry.GetByID(ctx, session.ObjectID)
@@ -1773,16 +2074,22 @@ func (c *Client) CommitResumableUpload(ctx context.Context, sessionID string) (*
 			rec.Status = StateCommitted
 			rec.UpdatedAt = time.Now().UTC()
 			if sErr := c.registry.Save(ctx, rec); sErr != nil {
+				// Record registry error but preserve state for idempotent retry
 				err = fmt.Errorf("storage completed but registry commit failed: %w", sErr)
 				return nil, err
 			}
 		}
 	}
 
+	session.Status = SessionCommitted
+	_ = c.saveSession(ctx, session)
+
 	if c.cache != nil {
 		c.cache.Delete(completedObj.ID)
 		c.cache.Delete(completedObj.Key)
 	}
+
+	c.sessionLocks.Delete(sessionID)
 
 	return completedObj, nil
 }
@@ -1802,21 +2109,37 @@ func (c *Client) AbortResumableUpload(ctx context.Context, sessionID string) err
 		return err
 	}
 
+	var abortErrs []error
 	driver, rErr := c.router.Select(ctx, RouteContext{
 		Op:             OpDelete,
 		Key:            session.Key,
 		ForcedProvider: session.Provider,
 	})
 	if rErr == nil && driver != nil {
-		_ = driver.AbortMultipart(ctx, session.Key, session.UploadID)
+		if aErr := driver.AbortMultipart(ctx, session.Key, session.UploadID); aErr != nil {
+			abortErrs = append(abortErrs, aErr)
+		}
+	} else if rErr != nil {
+		abortErrs = append(abortErrs, rErr)
 	}
 
 	session.Status = SessionAborted
-	_ = c.saveSession(ctx, session)
-	_ = c.deleteSession(ctx, sessionID)
+	if sErr := c.saveSession(ctx, session); sErr != nil {
+		abortErrs = append(abortErrs, sErr)
+	}
+	if dErr := c.deleteSession(ctx, sessionID); dErr != nil {
+		abortErrs = append(abortErrs, dErr)
+	}
 
 	if c.registry != nil {
 		c.abortRegistry(ctx, session.ObjectID)
+	}
+
+	c.sessionLocks.Delete(sessionID)
+
+	if len(abortErrs) > 0 {
+		err = errors.Join(abortErrs...)
+		return err
 	}
 
 	return nil
@@ -1840,19 +2163,46 @@ func (c *Client) FindSoftDeletedObjects(ctx context.Context, before time.Time, l
 	if c.registry == nil {
 		return nil, nil
 	}
-	records, err := c.registry.Find(ctx, Filter{
-		Status: StateDeleted,
-		Limit:  limit,
-	})
-	if err != nil {
-		return nil, err
+	if limit <= 0 {
+		limit = 100
 	}
+
 	var res []Record
-	for _, r := range records {
-		if r.DeletedAt != nil && !r.DeletedAt.After(before) {
-			res = append(res, r)
-		}
+	offset := 0
+	batchSize := limit
+	if batchSize > 1000 {
+		batchSize = 1000
 	}
+
+	for {
+		records, err := c.registry.Find(ctx, Filter{
+			Status:        StateDeleted,
+			DeletedBefore: &before,
+			Limit:         batchSize,
+			Offset:        offset,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if len(records) == 0 {
+			break
+		}
+
+		for _, r := range records {
+			if r.DeletedAt != nil && !r.DeletedAt.After(before) {
+				res = append(res, r)
+				if len(res) >= limit {
+					return res, nil
+				}
+			}
+		}
+
+		if len(records) < batchSize {
+			break
+		}
+		offset += len(records)
+	}
+
 	return res, nil
 }
 
@@ -1886,6 +2236,7 @@ func (c *Client) getSession(ctx context.Context, sessionID string) (*UploadSessi
 }
 
 func (c *Client) deleteSession(ctx context.Context, sessionID string) error {
+	c.sessionLocks.Delete(sessionID)
 	if c.registry != nil {
 		return c.registry.DeleteSession(ctx, sessionID)
 	}
@@ -1933,7 +2284,15 @@ func (c *Client) OpenSeeker(ctx context.Context, target string) (*SeekableReader
 	if err != nil {
 		return nil, err
 	}
-	bucket, err := c.Bucket(ctx, providerName)
+	drv, err := c.router.Select(ctx, RouteContext{
+		Op:             OpGet,
+		Key:            key,
+		ForcedProvider: providerName,
+	})
+	if err != nil {
+		return nil, WrapError("open_seeker", key, providerName, err)
+	}
+	bucket, err := NewBucket(drv)
 	if err != nil {
 		return nil, err
 	}

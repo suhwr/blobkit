@@ -205,6 +205,13 @@ uploadLoop:
 		}
 	}
 
+	if opts.ExplicitSize || (opts.Size > 0 && opts.Size != blobkit.SizeUnknown) {
+		if totalBytes != opts.Size {
+			abortUpload()
+			return nil, d.wrapError("upload_multipart", obj.Key, blobkit.ErrSizeMismatch)
+		}
+	}
+
 	if len(completedParts) == 0 {
 		abortUpload()
 		return nil, d.wrapError("upload_multipart", obj.Key, fmt.Errorf("no parts uploaded"))

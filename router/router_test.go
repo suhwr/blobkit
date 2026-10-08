@@ -118,6 +118,18 @@ func TestNamespaceRouter(t *testing.T) {
 	if err != nil || sel.Name() != "s3-backups" {
 		t.Fatalf("expected forced 's3-backups', got %v", sel)
 	}
+
+	// 6. Multi-segment key route without explicit namespace
+	sel, err = nr.Select(ctx, router.RouteContext{Key: "bots/autorespon/group-1/file.json"})
+	if err != nil || sel.Name() != "r2-avatars" {
+		t.Fatalf("expected 'r2-avatars' for multi-segment key, got %v", sel)
+	}
+
+	// 7. Single-segment key route without explicit namespace
+	sel, err = nr.Select(ctx, router.RouteContext{Key: "avatars/user.png"})
+	if err != nil || sel.Name() != "r2-avatars" {
+		t.Fatalf("expected 'r2-avatars' for single-segment key, got %v", sel)
+	}
 }
 
 func TestWeightedRouter(t *testing.T) {

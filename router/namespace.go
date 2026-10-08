@@ -57,20 +57,21 @@ func (r *NamespaceRouter) Select(ctx context.Context, rc RouteContext) (blobkit.
 	}
 
 	target := strings.Trim(rc.Namespace, "/")
-	if target == "" && rc.Key != "" {
-		// Attempt to extract leading segment from key
-		parts := strings.Split(strings.Trim(rc.Key, "/"), "/")
-		if len(parts) > 1 {
-			target = parts[0]
-		}
-	}
+	cleanKey := strings.Trim(rc.Key, "/")
 
 	// Exact or longest prefix match
 	var bestMatch string
 	var selected blobkit.Driver
 
 	for prefix, driver := range r.routes {
-		if target == prefix || strings.HasPrefix(target, prefix+"/") {
+		matched := false
+		if target != "" && (target == prefix || strings.HasPrefix(target, prefix+"/")) {
+			matched = true
+		}
+		if !matched && cleanKey != "" && (cleanKey == prefix || strings.HasPrefix(cleanKey, prefix+"/")) {
+			matched = true
+		}
+		if matched {
 			if len(prefix) > len(bestMatch) {
 				bestMatch = prefix
 				selected = driver
