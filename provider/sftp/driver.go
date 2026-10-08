@@ -172,7 +172,10 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 			Metadata:    resolvedMeta,
 			UpdatedAt:   now,
 		}
-		_ = d.writeSidecar(client, targetPath, meta)
+		if err := d.writeSidecar(client, targetPath, meta); err != nil {
+			_ = client.Remove(targetPath)
+			return nil, mapSFTPError("put", obj.Key, d.cfg.Name, err)
+		}
 	}
 
 	resObj := *obj
@@ -506,7 +509,10 @@ func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
 		if meta, err := d.readSidecar(client, srcPath); err == nil && meta != nil {
 			meta.Key = dstKey
 			meta.UpdatedAt = time.Now().UTC()
-			_ = d.writeSidecar(client, dstPath, meta)
+			if err := d.writeSidecar(client, dstPath, meta); err != nil {
+				_ = client.Remove(dstPath)
+				return mapSFTPError("copy", dstKey, d.cfg.Name, err)
+			}
 		}
 	}
 
@@ -621,7 +627,7 @@ func (d *Driver) ResolveURL(key string) (string, error) {
 		return "", err
 	}
 	if d.cfg.PublicBaseURL != "" {
-		return fmt.Sprintf("%s/%s", strings.TrimRight(d.cfg.PublicBaseURL, "/"), strings.TrimLeft(key, "/")), nil
+		return fmt.Sprintf("%s/%s", strings.TrimRight(d.cfg.PublicBaseURL, "/"), blobkit.EscapeURLPath(key)), nil
 	}
 	return "", blobkit.WrapError("resolve_url", key, d.cfg.Name, blobkit.ErrUnsupportedOperation)
 }

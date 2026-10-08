@@ -82,6 +82,28 @@ func TestClient_Reconcile(t *testing.T) {
 		t.Fatalf("failed to save mismatch record: %v", err)
 	}
 
+	// 5. Zero-size registry mismatch: registry records 0 bytes, driver has physical bytes
+	zeroID := "zero-mismatch-789"
+	zeroData := []byte("physical blob data for zero-size registry object")
+	zeroObj := &blobkit.Object{Key: "zero-mismatch.txt", Size: int64(len(zeroData))}
+	_, err = memDriver.Put(ctx, zeroObj, bytes.NewReader(zeroData), blobkit.PutOptions{})
+	if err != nil {
+		t.Fatalf("failed to put zero mismatch object: %v", err)
+	}
+	err = regStore.Save(ctx, &registry.Record{
+		ObjectID:  zeroID,
+		Key:       "zero-mismatch.txt",
+		Bucket:    "reconcile-bucket",
+		Provider:  "primary",
+		Size:      0, // Registry thinks it is 0-byte!
+		Status:    blobkit.StateCommitted,
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("failed to save zero mismatch record: %v", err)
+	}
+
 	// Test DryRun = true
 	repDry, err := client.Reconcile(ctx, true)
 	if err != nil {
@@ -93,8 +115,8 @@ func TestClient_Reconcile(t *testing.T) {
 	if len(repDry.GhostRecords) != 1 || repDry.GhostRecords[0] != ghostID {
 		t.Fatalf("expected ghostID in GhostRecords, got: %v", repDry.GhostRecords)
 	}
-	if len(repDry.MismatchedSize) != 1 || repDry.MismatchedSize[0] != "mismatch.txt" {
-		t.Fatalf("expected mismatch.txt in MismatchedSize, got: %v", repDry.MismatchedSize)
+	if len(repDry.MismatchedSize) != 2 {
+		t.Fatalf("expected 2 items in MismatchedSize (including zero-byte mismatch), got: %v", repDry.MismatchedSize)
 	}
 	if repDry.Repaired != 0 {
 		t.Fatalf("expected 0 repairs in dry-run, got %d", repDry.Repaired)

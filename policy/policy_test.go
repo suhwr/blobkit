@@ -89,3 +89,26 @@ func TestPolicy_MIMEMismatch(t *testing.T) {
 		t.Fatalf("expected ErrMIMEMismatch, got %v", err)
 	}
 }
+
+func TestPolicy_MinObjectSize_ZeroByteObject(t *testing.T) {
+	pol := &policy.Policy{
+		MinObjectSize: 100,
+	}
+
+	// Known zero-byte object must fail MinObjectSize
+	_, err := pol.Validate(context.Background(), policy.ValidationInput{
+		Size:         0,
+		ExplicitSize: true,
+	})
+	if !errors.Is(err, blobkit.ErrSecurityViolation) {
+		t.Fatalf("expected ErrSecurityViolation for 0-byte object under MinObjectSize=100, got: %v", err)
+	}
+
+	// Unknown size (SizeUnknown = -1) should not fail pre-flight validation
+	_, err = pol.Validate(context.Background(), policy.ValidationInput{
+		Size: blobkit.SizeUnknown,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error for unknown size: %v", err)
+	}
+}

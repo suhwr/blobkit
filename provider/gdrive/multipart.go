@@ -101,21 +101,11 @@ func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, pa
 	}
 
 	sr := blobkit.NewSizeReader(r, size, true)
-	buf, err := io.ReadAll(sr)
-	if err != nil {
-		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, err)
-	}
-	if err := sr.Verify(); err != nil {
-		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, err)
-	}
-	actualSize := int64(len(buf))
-
-	// Compute MD5 for part verification
-	h := md5.Sum(buf)
-	etag := hex.EncodeToString(h[:])
+	h := md5.New()
+	tr := io.TeeReader(sr, h)
 
 	rangeStart := session.uploadedSize
-	rangeEnd := rangeStart + actualSize - 1
+	rangeEnd := rangeStart + size - 1
 
 	var contentRange string
 	if session.totalSize > 0 {
@@ -124,12 +114,13 @@ func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, pa
 		contentRange = fmt.Sprintf("bytes %d-%d/*", rangeStart, rangeEnd)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, session.uploadURI, bytes.NewReader(buf))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, session.uploadURI, tr)
 	if err != nil {
 		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, err)
 	}
 
-	req.Header.Set("Content-Length", strconv.FormatInt(actualSize, 10))
+	req.ContentLength = size
+	req.Header.Set("Content-Length", strconv.FormatInt(size, 10))
 	req.Header.Set("Content-Range", contentRange)
 	if session.mimeType != "" {
 		req.Header.Set("Content-Type", session.mimeType)
@@ -140,6 +131,12 @@ func (d *Driver) UploadPart(ctx context.Context, key string, uploadID string, pa
 		return "", wrapHTTPError("upload_part", key, d.cfg.Name, 0, nil, err)
 	}
 	defer resp.Body.Close()
+
+	if err := sr.Verify(); err != nil {
+		return "", blobkit.WrapError("upload_part", key, d.cfg.Name, err)
+	}
+	actualSize := sr.TotalRead()
+	etag := hex.EncodeToString(h.Sum(nil))
 
 	// 308 Resume Incomplete = chunk accepted, awaiting next chunks
 	// 200 OK / 201 Created = upload completed
@@ -197,12 +194,9 @@ func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, upl
 		seenParts[p.PartNumber] = true
 	}
 
-	d.sessionsMu.Lock()
+	d.sessionsMu.RLock()
 	session, found := d.sessions[uploadID]
-	if found && session.key == obj.Key {
-		delete(d.sessions, uploadID)
-	}
-	d.sessionsMu.Unlock()
+	d.sessionsMu.RUnlock()
 
 	if !found || session.key != obj.Key {
 		return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, blobkit.ErrSessionNotFound)
@@ -211,8 +205,24 @@ func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, upl
 	session.mu.Lock()
 	defer session.mu.Unlock()
 
+	// Cross-check caller parts against session parts if recorded
+	if len(session.parts) > 0 {
+		for _, p := range parts {
+			sessPart, exists := session.parts[p.PartNumber]
+			if !exists {
+				return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, fmt.Errorf("%w: part %d not found in recorded session", blobkit.ErrMultipartInvalidState, p.PartNumber))
+			}
+			if p.ETag != "" && sessPart.ETag != "" && p.ETag != sessPart.ETag {
+				return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, fmt.Errorf("%w: part %d ETag mismatch", blobkit.ErrMultipartInvalidState, p.PartNumber))
+			}
+		}
+	}
+
 	if session.completed && session.resultObj != nil {
 		res := *session.resultObj
+		d.sessionsMu.Lock()
+		delete(d.sessions, uploadID)
+		d.sessionsMu.Unlock()
 		return &res, nil
 	}
 
@@ -243,6 +253,11 @@ func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, upl
 		}
 		res := d.mapDriveFileToObject(obj.Key, &fileResp)
 		d.cache.Set(obj.Key, fileResp.ID)
+
+		d.sessionsMu.Lock()
+		delete(d.sessions, uploadID)
+		d.sessionsMu.Unlock()
+
 		return res, nil
 	}
 

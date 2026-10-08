@@ -29,12 +29,13 @@ func (g *singleflightGroup) Do(key string, fn func() (any, error)) (any, error) 
 	g.m[key] = c
 	g.mu.Unlock()
 
+	defer func() {
+		g.mu.Lock()
+		delete(g.m, key)
+		g.mu.Unlock()
+		c.wg.Done()
+	}()
+
 	c.val, c.err = fn()
-	c.wg.Done()
-
-	g.mu.Lock()
-	delete(g.m, key)
-	g.mu.Unlock()
-
 	return c.val, c.err
 }

@@ -154,12 +154,9 @@ func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, upl
 		seenParts[p.PartNumber] = true
 	}
 
-	d.sessionsMu.Lock()
+	d.sessionsMu.RLock()
 	session, found := d.sessions[uploadID]
-	if found && session.key == obj.Key {
-		delete(d.sessions, uploadID)
-	}
-	d.sessionsMu.Unlock()
+	d.sessionsMu.RUnlock()
 
 	if !found || session.key != obj.Key {
 		return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, blobkit.ErrSessionNotFound)
@@ -258,11 +255,18 @@ func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, upl
 			CreatedAt:      resObj.CreatedAt,
 			UpdatedAt:      resObj.UpdatedAt,
 		}
-		_ = writeMeta(targetPath, meta, d.cfg.FileMode)
+		if err := writeMeta(targetPath, meta, d.cfg.FileMode); err != nil {
+			_ = os.Remove(targetPath)
+			return nil, blobkit.WrapError("complete_multipart", resObj.Key, d.cfg.Name, err)
+		}
 	}
 
 	// Clean up staging directory
 	_ = os.RemoveAll(session.stagingDir)
+
+	d.sessionsMu.Lock()
+	delete(d.sessions, uploadID)
+	d.sessionsMu.Unlock()
 
 	return &resObj, nil
 }

@@ -46,6 +46,7 @@ type CircuitBreakerRouter struct {
 	consecutiveFails int
 	consecutiveWins  int
 	lastTripped      time.Time
+	probeInFlight    bool
 }
 
 // NewCircuitBreakerRouter constructs a 3-state circuit breaker router.
@@ -105,7 +106,8 @@ func (r *CircuitBreakerRouter) Select(ctx context.Context, rc RouteContext) (blo
 		if time.Since(r.lastTripped) > r.cooldown {
 			r.state = CircuitHalfOpen
 			r.consecutiveWins = 0
-			return r.primary, nil // Canary probe to primary
+			r.probeInFlight = true
+			return r.primary, nil // Grant canary probe lease
 		}
 
 		if r.fallback != nil {
@@ -115,7 +117,15 @@ func (r *CircuitBreakerRouter) Select(ctx context.Context, rc RouteContext) (blo
 	}
 
 	if r.state == CircuitHalfOpen {
-		return r.primary, nil
+		if !r.probeInFlight {
+			r.probeInFlight = true
+			return r.primary, nil // Grant canary probe lease
+		}
+		// Probe already in-flight: route other traffic to fallback
+		if r.fallback != nil {
+			return r.fallback, nil
+		}
+		return nil, fmt.Errorf("%w: primary driver circuit is half-open (probe in flight)", blobkit.ErrProviderUnavailable)
 	}
 
 	return r.primary, nil
@@ -148,6 +158,7 @@ func (r *CircuitBreakerRouter) ReportFailure(driver string, err error) {
 
 	if r.state == CircuitHalfOpen {
 		// Immediate trip back to open on canary failure
+		r.probeInFlight = false
 		r.state = CircuitOpen
 		r.lastTripped = time.Now()
 		r.consecutiveWins = 0
@@ -173,6 +184,7 @@ func (r *CircuitBreakerRouter) ReportSuccess(driver string) {
 	defer r.mu.Unlock()
 
 	if r.state == CircuitHalfOpen {
+		r.probeInFlight = false
 		r.consecutiveWins++
 		if r.consecutiveWins >= r.successThreshold {
 			r.state = CircuitClosed

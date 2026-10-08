@@ -645,11 +645,11 @@ func (d *Driver) PresignPut(ctx context.Context, key string, opts blobkit.Presig
 
 // ResolveURL builds a public access or CDN URL for the given key.
 func (d *Driver) ResolveURL(key string) (string, error) {
-	cleanKey := strings.TrimLeft(key, "/")
+	escapedKey := blobkit.EscapeURLPath(key)
 	if d.cfg.PublicBaseURL != "" {
-		return fmt.Sprintf("%s/%s", strings.TrimRight(d.cfg.PublicBaseURL, "/"), cleanKey), nil
+		return fmt.Sprintf("%s/%s", strings.TrimRight(d.cfg.PublicBaseURL, "/"), escapedKey), nil
 	}
-	return fmt.Sprintf("https://storage.googleapis.com/%s/%s", d.cfg.Bucket, cleanKey), nil
+	return fmt.Sprintf("https://storage.googleapis.com/%s/%s", d.cfg.Bucket, escapedKey), nil
 }
 
 // Close gracefully terminates open HTTP idle connections and clears session state.

@@ -172,3 +172,24 @@ func TestFaultDriver_Latency(t *testing.T) {
 		t.Fatalf("expected latency injection >= 25ms, got %v", elapsed)
 	}
 }
+
+func TestFaultDriver_Latency_ContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	mock := newTestDriver()
+	faulty := NewFaultDriver(mock, FaultConfig{
+		Latency: 500 * time.Millisecond,
+	})
+
+	start := time.Now()
+	_, err := faulty.Head(ctx, "nonexistent")
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context cancellation error, got %v", err)
+	}
+	if elapsed > 150*time.Millisecond {
+		t.Fatalf("latency injection did not respect context cancellation, took %v", elapsed)
+	}
+}

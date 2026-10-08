@@ -171,7 +171,10 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 			CreatedAt:      stored.CreatedAt,
 			UpdatedAt:      stored.UpdatedAt,
 		}
-		_ = writeMeta(targetPath, meta, d.cfg.FileMode)
+		if err := writeMeta(targetPath, meta, d.cfg.FileMode); err != nil {
+			_ = os.Remove(targetPath)
+			return nil, blobkit.WrapError("put", stored.Key, d.cfg.Name, err)
+		}
 	}
 
 	return &stored, nil
@@ -472,10 +475,13 @@ func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {
 
 	// Copy sidecar metadata if present
 	if d.cfg.EnableSidecarMeta {
-		if meta, err := readMeta(srcPath); err == nil {
+		if meta, err := readMeta(srcPath); err == nil && meta != nil {
 			meta.Key = dstKey
 			meta.UpdatedAt = time.Now().UTC()
-			_ = writeMeta(dstPath, meta, d.cfg.FileMode)
+			if err := writeMeta(dstPath, meta, d.cfg.FileMode); err != nil {
+				_ = os.Remove(dstPath)
+				return blobkit.WrapError("copy", dstKey, d.cfg.Name, err)
+			}
 		}
 	}
 
@@ -625,7 +631,7 @@ func (d *Driver) ResolveURL(key string) (string, error) {
 	}
 
 	if d.cfg.PublicBaseURL != "" {
-		return fmt.Sprintf("%s/%s", strings.TrimRight(d.cfg.PublicBaseURL, "/"), strings.TrimLeft(key, "/")), nil
+		return fmt.Sprintf("%s/%s", strings.TrimRight(d.cfg.PublicBaseURL, "/"), blobkit.EscapeURLPath(key)), nil
 	}
 
 	return (&url.URL{

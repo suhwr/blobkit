@@ -627,7 +627,7 @@ func (d *Driver) ResolveURL(key string) (string, error) {
 		return "", err
 	}
 	if d.cfg.PublicBaseURL != "" {
-		return fmt.Sprintf("%s/%s", strings.TrimRight(d.cfg.PublicBaseURL, "/"), strings.TrimLeft(key, "/")), nil
+		return fmt.Sprintf("%s/%s", strings.TrimRight(d.cfg.PublicBaseURL, "/"), blobkit.EscapeURLPath(key)), nil
 	}
 	return d.objectURL(key), nil
 }

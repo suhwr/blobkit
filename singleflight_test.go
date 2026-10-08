@@ -86,3 +86,40 @@ func TestSingleflightGroup_DoError(t *testing.T) {
 
 	wg.Wait()
 }
+
+func TestSingleflightGroup_PanicSafety(t *testing.T) {
+	var g singleflightGroup
+	key := "panic-key"
+
+	// 1. Initial call panics
+	assertPanics := func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatalf("expected panic, got none")
+			}
+		}()
+		_, _ = g.Do(key, func() (any, error) {
+			panic("intentional panic inside singleflight")
+		})
+	}
+	assertPanics()
+
+	// 2. Subsequent call for the SAME key must NOT deadlock or wedge
+	done := make(chan bool, 1)
+	go func() {
+		val, err := g.Do(key, func() (any, error) {
+			return "recovered-val", nil
+		})
+		if err != nil || val != "recovered-val" {
+			t.Errorf("expected recovered-val, got %v, %v", val, err)
+		}
+		done <- true
+	}()
+
+	select {
+	case <-done:
+		// Success!
+	case <-time.After(1 * time.Second):
+		t.Fatalf("singleflight wedged/deadlocked after panic on key %q", key)
+	}
+}

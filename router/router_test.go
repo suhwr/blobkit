@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/suhwr/blobkit"
 	"github.com/suhwr/blobkit/provider/memory"
 	"github.com/suhwr/blobkit/router"
 )
@@ -237,5 +238,82 @@ func TestCapabilityRouter(t *testing.T) {
 	sel, err := cr.Select(ctx, router.RouteContext{Op: router.OpCopy})
 	if err != nil || sel == nil {
 		t.Fatalf("failed to select driver with capability: %v", err)
+	}
+
+	// PresignPut vs PresignGet capability routing verification
+	getOnlyDriver := &mockCapDriver{name: "get-only", caps: blobkit.CapDirectPut | blobkit.CapPresignGet}
+	putOnlyDriver := &mockCapDriver{name: "put-only", caps: blobkit.CapDirectPut | blobkit.CapPresignPut}
+
+	presignRouter := router.NewCapabilityRouter(getOnlyDriver, putOnlyDriver)
+
+	// OpPresignPut must select putOnlyDriver, NOT getOnlyDriver
+	selPut, err := presignRouter.Select(ctx, router.RouteContext{Op: router.OpPresignPut})
+	if err != nil || selPut.Name() != "put-only" {
+		t.Fatalf("expected put-only driver for OpPresignPut, got %v (err: %v)", selPut, err)
+	}
+
+	// OpPresignGet must select getOnlyDriver
+	selGet, err := presignRouter.Select(ctx, router.RouteContext{Op: router.OpPresignGet})
+	if err != nil || selGet.Name() != "get-only" {
+		t.Fatalf("expected get-only driver for OpPresignGet, got %v (err: %v)", selGet, err)
+	}
+}
+
+type mockCapDriver struct {
+	blobkit.BaseDriver
+	name string
+	caps blobkit.Capability
+}
+
+func (m *mockCapDriver) Name() string                     { return m.name }
+func (m *mockCapDriver) Capabilities() blobkit.Capability { return m.caps }
+
+func TestCircuitBreakerRouter_CanaryProbeLease(t *testing.T) {
+	ctx := context.Background()
+	primary := memory.NewDriver(memory.Config{Name: "cb-primary"})
+	fallback := memory.NewDriver(memory.Config{Name: "cb-fallback"})
+
+	cb := router.NewCircuitBreakerRouter(router.CircuitBreakerConfig{
+		Primary:          primary,
+		Fallback:         fallback,
+		FailureThreshold: 1,
+		SuccessThreshold: 1,
+		Cooldown:         20 * time.Millisecond,
+	})
+
+	// 1. Trip breaker to Open
+	cb.ReportFailure("cb-primary", errors.New("simulated network failure"))
+	if cb.State() != router.CircuitOpen {
+		t.Fatalf("expected CircuitOpen, got %s", cb.State())
+	}
+
+	// 2. Wait for cooldown to expire
+	time.Sleep(30 * time.Millisecond)
+	if cb.State() != router.CircuitHalfOpen {
+		t.Fatalf("expected CircuitHalfOpen, got %s", cb.State())
+	}
+
+	// 3. First request obtains canary lease to primary
+	first, err := cb.Select(ctx, router.RouteContext{Op: router.OpPut})
+	if err != nil || first.Name() != "cb-primary" {
+		t.Fatalf("expected first request to get primary canary probe, got %v (err: %v)", first, err)
+	}
+
+	// 4. Concurrent request while probe is in flight MUST route to fallback
+	second, err := cb.Select(ctx, router.RouteContext{Op: router.OpPut})
+	if err != nil || second.Name() != "cb-fallback" {
+		t.Fatalf("expected concurrent request while probe in flight to route to fallback, got %v (err: %v)", second, err)
+	}
+
+	// 5. Complete probe with success
+	cb.ReportSuccess("cb-primary")
+	if cb.State() != router.CircuitClosed {
+		t.Fatalf("expected CircuitClosed after probe success, got %s", cb.State())
+	}
+
+	// Now all traffic routes to primary
+	third, err := cb.Select(ctx, router.RouteContext{Op: router.OpPut})
+	if err != nil || third.Name() != "cb-primary" {
+		t.Fatalf("expected primary after recovery, got %v", third)
 	}
 }

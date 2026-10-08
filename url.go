@@ -12,6 +12,20 @@ type URLResolver interface {
 	ResolveURL(key string) string
 }
 
+// EscapeURLPath escapes each segment of a key path with url.PathEscape,
+// preserving '/' path separators.
+func EscapeURLPath(key string) string {
+	cleanKey := strings.TrimLeft(key, "/")
+	if cleanKey == "" {
+		return ""
+	}
+	parts := strings.Split(cleanKey, "/")
+	for i, p := range parts {
+		parts[i] = url.PathEscape(p)
+	}
+	return strings.Join(parts, "/")
+}
+
 // CDNResolver resolves object keys against a base CDN or public domain URL (e.g. "https://cdn.example.com").
 type CDNResolver struct {
 	baseURL string
@@ -29,8 +43,8 @@ func (c *CDNResolver) ResolveURL(key string) string {
 	if c.baseURL == "" || key == "" {
 		return ""
 	}
-	cleanKey := strings.TrimLeft(key, "/")
-	return fmt.Sprintf("%s/%s", c.baseURL, cleanKey)
+	escapedKey := EscapeURLPath(key)
+	return fmt.Sprintf("%s/%s", c.baseURL, escapedKey)
 }
 
 // S3PathResolver formats standard path-style or virtual-hosted URLs for S3 endpoints.
@@ -52,8 +66,8 @@ func (s *S3PathResolver) ResolveURL(key string) string {
 	if s.endpoint == "" || s.bucket == "" || key == "" {
 		return ""
 	}
-	cleanKey := strings.TrimLeft(key, "/")
-	return fmt.Sprintf("%s/%s/%s", s.endpoint, s.bucket, cleanKey)
+	escapedKey := EscapeURLPath(key)
+	return fmt.Sprintf("%s/%s/%s", s.endpoint, s.bucket, escapedKey)
 }
 
 // CustomResolver adapts an arbitrary formatting function into a URLResolver.

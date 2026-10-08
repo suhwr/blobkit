@@ -166,12 +166,9 @@ func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, upl
 		seenParts[p.PartNumber] = true
 	}
 
-	d.sessionsMu.Lock()
+	d.sessionsMu.RLock()
 	expectedKey, ok := d.sessions[uploadID]
-	if ok {
-		delete(d.sessions, uploadID)
-	}
-	d.sessionsMu.Unlock()
+	d.sessionsMu.RUnlock()
 	if !ok || expectedKey != obj.Key {
 		return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, blobkit.ErrSessionNotFound)
 	}
@@ -240,6 +237,10 @@ func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, upl
 	}
 	res.Provider = d.cfg.Name
 	res.Status = blobkit.StateCommitted
+
+	d.sessionsMu.Lock()
+	delete(d.sessions, uploadID)
+	d.sessionsMu.Unlock()
 
 	return &res, nil
 }

@@ -59,7 +59,7 @@ func (d *FaultDriver) FaultsInjected() int64 {
 	return d.faults.Load()
 }
 
-func (d *FaultDriver) applyPreFlight(methodErr error) error {
+func (d *FaultDriver) applyPreFlight(ctx context.Context, methodErr error) error {
 	callNum := d.calls.Add(1)
 	cfg := d.cfg.Load()
 	if cfg == nil {
@@ -67,7 +67,15 @@ func (d *FaultDriver) applyPreFlight(methodErr error) error {
 	}
 
 	if cfg.Latency > 0 {
-		time.Sleep(cfg.Latency)
+		if ctx != nil {
+			select {
+			case <-time.After(cfg.Latency):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		} else {
+			time.Sleep(cfg.Latency)
+		}
 	}
 
 	if cfg.FailAfterCalls > 0 && callNum >= cfg.FailAfterCalls {
@@ -99,7 +107,7 @@ func (d *FaultDriver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader,
 	if cfg != nil {
 		methodErr = cfg.PutErr
 	}
-	if err := d.applyPreFlight(methodErr); err != nil {
+	if err := d.applyPreFlight(ctx, methodErr); err != nil {
 		return nil, err
 	}
 	return d.inner.Put(ctx, obj, r, opts)
@@ -111,7 +119,7 @@ func (d *FaultDriver) Head(ctx context.Context, key string) (*blobkit.Object, er
 	if cfg != nil {
 		methodErr = cfg.HeadErr
 	}
-	if err := d.applyPreFlight(methodErr); err != nil {
+	if err := d.applyPreFlight(ctx, methodErr); err != nil {
 		return nil, err
 	}
 	return d.inner.Head(ctx, key)
@@ -123,7 +131,7 @@ func (d *FaultDriver) Delete(ctx context.Context, key string) error {
 	if cfg != nil {
 		methodErr = cfg.DeleteErr
 	}
-	if err := d.applyPreFlight(methodErr); err != nil {
+	if err := d.applyPreFlight(ctx, methodErr); err != nil {
 		return err
 	}
 	return d.inner.Delete(ctx, key)
@@ -135,7 +143,7 @@ func (d *FaultDriver) DeleteBatch(ctx context.Context, keys []string) ([]string,
 	if cfg != nil {
 		methodErr = cfg.DeleteBatchErr
 	}
-	if err := d.applyPreFlight(methodErr); err != nil {
+	if err := d.applyPreFlight(ctx, methodErr); err != nil {
 		return nil, err
 	}
 	return d.inner.DeleteBatch(ctx, keys)
@@ -147,7 +155,7 @@ func (d *FaultDriver) List(ctx context.Context, opts blobkit.ListOptions) (*blob
 	if cfg != nil {
 		methodErr = cfg.ListErr
 	}
-	if err := d.applyPreFlight(methodErr); err != nil {
+	if err := d.applyPreFlight(ctx, methodErr); err != nil {
 		return nil, err
 	}
 	return d.inner.List(ctx, opts)
@@ -159,7 +167,7 @@ func (d *FaultDriver) Copy(ctx context.Context, srcKey, dstKey string) error {
 	if cfg != nil {
 		methodErr = cfg.CopyErr
 	}
-	if err := d.applyPreFlight(methodErr); err != nil {
+	if err := d.applyPreFlight(ctx, methodErr); err != nil {
 		return err
 	}
 	return d.inner.Copy(ctx, srcKey, dstKey)
@@ -224,7 +232,7 @@ func (d *FaultDriver) Get(ctx context.Context, key string, opts blobkit.GetOptio
 	if cfg != nil {
 		methodErr = cfg.GetErr
 	}
-	if err := d.applyPreFlight(methodErr); err != nil {
+	if err := d.applyPreFlight(ctx, methodErr); err != nil {
 		return nil, err
 	}
 
@@ -255,7 +263,7 @@ func (d *FaultDriver) CreateMultipart(ctx context.Context, obj *blobkit.Object, 
 	if cfg != nil {
 		methodErr = cfg.MultipartErr
 	}
-	if err := d.applyPreFlight(methodErr); err != nil {
+	if err := d.applyPreFlight(ctx, methodErr); err != nil {
 		return "", err
 	}
 	return d.inner.CreateMultipart(ctx, obj, opts)
@@ -267,7 +275,7 @@ func (d *FaultDriver) UploadPart(ctx context.Context, key string, uploadID strin
 	if cfg != nil {
 		methodErr = cfg.MultipartErr
 	}
-	if err := d.applyPreFlight(methodErr); err != nil {
+	if err := d.applyPreFlight(ctx, methodErr); err != nil {
 		return "", err
 	}
 	return d.inner.UploadPart(ctx, key, uploadID, partNumber, r, size)
@@ -279,7 +287,7 @@ func (d *FaultDriver) CompleteMultipart(ctx context.Context, obj *blobkit.Object
 	if cfg != nil {
 		methodErr = cfg.MultipartErr
 	}
-	if err := d.applyPreFlight(methodErr); err != nil {
+	if err := d.applyPreFlight(ctx, methodErr); err != nil {
 		return nil, err
 	}
 	return d.inner.CompleteMultipart(ctx, obj, uploadID, parts)
@@ -291,7 +299,7 @@ func (d *FaultDriver) AbortMultipart(ctx context.Context, key string, uploadID s
 	if cfg != nil {
 		methodErr = cfg.MultipartErr
 	}
-	if err := d.applyPreFlight(methodErr); err != nil {
+	if err := d.applyPreFlight(ctx, methodErr); err != nil {
 		return err
 	}
 	return d.inner.AbortMultipart(ctx, key, uploadID)
@@ -303,7 +311,7 @@ func (d *FaultDriver) ListParts(ctx context.Context, key string, uploadID string
 	if cfg != nil {
 		methodErr = cfg.MultipartErr
 	}
-	if err := d.applyPreFlight(methodErr); err != nil {
+	if err := d.applyPreFlight(ctx, methodErr); err != nil {
 		return nil, err
 	}
 	return d.inner.ListParts(ctx, key, uploadID)

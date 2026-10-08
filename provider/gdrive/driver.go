@@ -27,6 +27,39 @@ type Driver struct {
 
 	sessionsMu sync.RWMutex
 	sessions   map[string]*multipartSessionState
+
+	keyLocksMu sync.Mutex
+	keyLocks   map[string]*keyLockEntry
+}
+
+type keyLockEntry struct {
+	mu  sync.Mutex
+	ref int
+}
+
+func (d *Driver) acquireKeyLock(key string) func() {
+	d.keyLocksMu.Lock()
+	if d.keyLocks == nil {
+		d.keyLocks = make(map[string]*keyLockEntry)
+	}
+	e, ok := d.keyLocks[key]
+	if !ok {
+		e = &keyLockEntry{}
+		d.keyLocks[key] = e
+	}
+	e.ref++
+	d.keyLocksMu.Unlock()
+
+	e.mu.Lock()
+	return func() {
+		e.mu.Unlock()
+		d.keyLocksMu.Lock()
+		e.ref--
+		if e.ref == 0 {
+			delete(d.keyLocks, key)
+		}
+		d.keyLocksMu.Unlock()
+	}
 }
 
 // NewDriver constructs and initializes a new Google Drive storage driver.
@@ -47,6 +80,7 @@ func NewDriver(cfg Config) (*Driver, error) {
 		httpClient: httpClient,
 		cache:      NewKeyCache(cfg.KeyCacheCapacity),
 		sessions:   make(map[string]*multipartSessionState),
+		keyLocks:   make(map[string]*keyLockEntry),
 	}
 
 	return d, nil
@@ -97,6 +131,9 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 	if err := blobkit.ValidateKey(obj.Key); err != nil {
 		return nil, err
 	}
+
+	unlock := d.acquireKeyLock(obj.Key)
+	defer unlock()
 
 	resolvedR, effectiveSize, hasExplicitSize, err := blobkit.ResolvePayload(r, opts)
 	if err != nil {
@@ -256,6 +293,9 @@ func (d *Driver) Delete(ctx context.Context, key string) error {
 	if err := blobkit.ValidateKey(key); err != nil {
 		return err
 	}
+
+	unlock := d.acquireKeyLock(key)
+	defer unlock()
 
 	fileID, err := d.resolveFileID(ctx, key)
 	if err != nil {
@@ -538,7 +578,7 @@ func (d *Driver) ResolveURL(key string) (string, error) {
 		return "", err
 	}
 	if d.cfg.PublicBaseURL != "" {
-		return fmt.Sprintf("%s/%s", strings.TrimRight(d.cfg.PublicBaseURL, "/"), strings.TrimLeft(key, "/")), nil
+		return fmt.Sprintf("%s/%s", strings.TrimRight(d.cfg.PublicBaseURL, "/"), blobkit.EscapeURLPath(key)), nil
 	}
 
 	fileID, found := d.cache.Get(key)

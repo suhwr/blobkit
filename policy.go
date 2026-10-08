@@ -24,6 +24,8 @@ type ValidationInput struct {
 	Filename     string
 	ContentType  string
 	Size         int64
+	ExplicitSize bool // ExplicitSize indicates that Size was explicitly specified (even if 0)
+	SizeKnown    bool // SizeKnown indicates that the payload size is deterministically known
 	StreamReader io.Reader
 }
 
@@ -85,7 +87,11 @@ func (p *Policy) Validate(ctx context.Context, in ValidationInput) (io.Reader, e
 	}
 
 	// 2. Size boundary check (if size is known)
-	if in.Size > 0 {
+	sizeKnown := in.ExplicitSize || in.SizeKnown || in.Size > 0
+	if in.Size == SizeUnknown {
+		sizeKnown = false
+	}
+	if sizeKnown {
 		if p.MaxObjectSize > 0 && in.Size > p.MaxObjectSize {
 			return nil, fmt.Errorf("%w: size %d exceeds policy limit %d", ErrUploadTooLarge, in.Size, p.MaxObjectSize)
 		}

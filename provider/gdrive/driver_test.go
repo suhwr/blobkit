@@ -891,6 +891,48 @@ func TestDriver_Concurrency(t *testing.T) {
 	wg.Wait()
 }
 
+func TestDriver_ConcurrentPut_SameKey_NoDuplicates(t *testing.T) {
+	mock := newMockDriveServer()
+	driver, server := setupTestDriver(t, mock)
+	defer server.Close()
+	defer driver.Close()
+
+	ctx := context.Background()
+	concurrency := 10
+	var wg sync.WaitGroup
+	key := "concurrent/same_key.txt"
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		idx := i
+		go func() {
+			defer wg.Done()
+			payload := []byte(fmt.Sprintf("payload-%d", idx))
+			_, err := driver.Put(ctx, &blobkit.Object{Key: key}, bytes.NewReader(payload), blobkit.PutOptions{
+				Size: int64(len(payload)),
+			})
+			if err != nil {
+				t.Errorf("worker %d Put failed: %v", idx, err)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	mock.mu.Lock()
+	count := 0
+	for _, f := range mock.files {
+		if !f.Trashed && f.AppProperties["blobkit_key"] == key {
+			count++
+		}
+	}
+	mock.mu.Unlock()
+
+	if count != 1 {
+		t.Fatalf("expected exactly 1 physical file for key %q, got %d duplicates", key, count)
+	}
+}
+
 func TestDriver_List(t *testing.T) {
 	mock := newMockDriveServer()
 	driver, server := setupTestDriver(t, mock)

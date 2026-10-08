@@ -126,6 +126,8 @@ func (c *Client) Put(ctx context.Context, r io.Reader, opts PutOptions) (savedOb
 			Filename:     opts.Filename,
 			ContentType:  detectedMIME,
 			Size:         opts.Size,
+			ExplicitSize: opts.ExplicitSize,
+			SizeKnown:    opts.ExplicitSize || (opts.Size >= 0 && opts.Size != SizeUnknown),
 			StreamReader: reconstructedReader,
 		})
 		if err != nil {
@@ -1447,10 +1449,12 @@ func (c *Client) InitiateResumableUpload(ctx context.Context, opts PutOptions, p
 	}
 	if activePolicy != nil {
 		_, err = activePolicy.Validate(ctx, ValidationInput{
-			Namespace:   opts.Namespace,
-			Filename:    opts.Filename,
-			ContentType: opts.ContentType,
-			Size:        opts.Size,
+			Namespace:    opts.Namespace,
+			Filename:     opts.Filename,
+			ContentType:  opts.ContentType,
+			Size:         opts.Size,
+			ExplicitSize: opts.ExplicitSize,
+			SizeKnown:    opts.ExplicitSize || (opts.Size >= 0 && opts.Size != SizeUnknown),
 		})
 		if err != nil {
 			return nil, WrapError("policy_validation", "", "", err)

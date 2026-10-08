@@ -728,7 +728,7 @@ func (d *Driver) PresignPut(ctx context.Context, key string, opts blobkit.Presig
 // ResolveURL builds a public access or CDN URL for the given key.
 func (d *Driver) ResolveURL(key string) (string, error) {
 	if d.cfg.PublicBaseURL != "" {
-		return fmt.Sprintf("%s/%s", strings.TrimRight(d.cfg.PublicBaseURL, "/"), strings.TrimLeft(key, "/")), nil
+		return fmt.Sprintf("%s/%s", strings.TrimRight(d.cfg.PublicBaseURL, "/"), blobkit.EscapeURLPath(key)), nil
 	}
 	return d.blobURL(key), nil
 }

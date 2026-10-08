@@ -538,18 +538,18 @@ func (d *Driver) PresignPut(ctx context.Context, key string, opts blobkit.Presig
 }
 
 func (d *Driver) ResolveURL(key string) (string, error) {
-	cleanKey := strings.TrimLeft(key, "/")
+	escapedKey := blobkit.EscapeURLPath(key)
 	if d.cfg.PublicBaseURL != "" {
-		return fmt.Sprintf("%s/%s", d.cfg.PublicBaseURL, cleanKey), nil
+		return fmt.Sprintf("%s/%s", strings.TrimRight(d.cfg.PublicBaseURL, "/"), escapedKey), nil
 	}
 	if d.cfg.Endpoint != "" {
 		if d.cfg.UsePathStyle {
-			return fmt.Sprintf("%s/%s/%s", strings.TrimRight(d.cfg.Endpoint, "/"), d.cfg.Bucket, cleanKey), nil
+			return fmt.Sprintf("%s/%s/%s", strings.TrimRight(d.cfg.Endpoint, "/"), d.cfg.Bucket, escapedKey), nil
 		}
 		// Virtual-hosted style
-		return fmt.Sprintf("%s/%s", strings.TrimRight(d.cfg.Endpoint, "/"), cleanKey), nil
+		return fmt.Sprintf("%s/%s", strings.TrimRight(d.cfg.Endpoint, "/"), escapedKey), nil
 	}
-	return fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", d.cfg.Bucket, d.cfg.Region, cleanKey), nil
+	return fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", d.cfg.Bucket, d.cfg.Region, escapedKey), nil
 }
 
 func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {

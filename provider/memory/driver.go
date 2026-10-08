@@ -324,10 +324,11 @@ func (d *Driver) ResolveURL(key string) (string, error) {
 	if err := validateKey(key); err != nil {
 		return "", blobkit.WrapError("resolve_url", key, d.name, err)
 	}
+	escapedKey := blobkit.EscapeURLPath(key)
 	if d.publicBaseURL != "" {
-		return fmt.Sprintf("%s/%s", d.publicBaseURL, strings.TrimLeft(key, "/")), nil
+		return fmt.Sprintf("%s/%s", strings.TrimRight(d.publicBaseURL, "/"), escapedKey), nil
 	}
-	return fmt.Sprintf("mem://%s/%s", d.bucket, strings.TrimLeft(key, "/")), nil
+	return fmt.Sprintf("mem://%s/%s", d.bucket, escapedKey), nil
 }
 
 func (d *Driver) Copy(ctx context.Context, srcKey, dstKey string) error {

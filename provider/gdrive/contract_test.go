@@ -16,8 +16,6 @@ func TestGDriveDriver_Contract(t *testing.T) {
 			server.Close()
 		}
 	}, testutil.DriverContractOptions{
-		SkipCopy:        true,
-		SkipBatch:       true,
 		SkipConditional: true,
 	})
 }

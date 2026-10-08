@@ -39,7 +39,6 @@ func (r *CapabilityRouter) Select(ctx context.Context, rc RouteContext) (blobkit
 		required = blobkit.CapPresignGet
 	case blobkit.OpPresignPut:
 		required = blobkit.CapPresignPut
-		required = blobkit.CapPresignGet
 	default:
 		required = blobkit.CapDirectPut
 	}

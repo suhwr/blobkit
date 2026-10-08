@@ -60,14 +60,15 @@ func (c *Client) Reconcile(ctx context.Context, dryRun bool) (*ReconciliationRep
 			if IsNotFound(headErr) {
 				report.GhostRecords = append(report.GhostRecords, rec.ObjectID)
 				if !dryRun {
-					_ = c.registry.UpdateStatus(ctx, rec.ObjectID, StateDeleted)
-					report.Repaired++
+					if err := c.registry.UpdateStatus(ctx, rec.ObjectID, StateDeleted); err == nil {
+						report.Repaired++
+					}
 				}
 			}
 			continue
 		}
 
-		if rec.Size > 0 && headObj.Size != rec.Size {
+		if headObj.Size != rec.Size {
 			report.MismatchedSize = append(report.MismatchedSize, rec.Key)
 		}
 	}
