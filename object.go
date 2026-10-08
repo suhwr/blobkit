@@ -122,6 +122,19 @@ func (r *ObjectReader) Read(p []byte) (n int, err error) {
 	return r.Body.Read(p)
 }
 
+// WriteTo implements io.WriterTo by forwarding the stream directly to w.
+// If the underlying Body implements io.WriterTo (such as *os.File), it enables
+// zero-copy kernel transfer mechanisms (e.g. Linux sendfile(2) / splice(2)) in standard HTTP handlers.
+func (r *ObjectReader) WriteTo(w io.Writer) (int64, error) {
+	if r.Body == nil {
+		return 0, nil
+	}
+	if wt, ok := r.Body.(io.WriterTo); ok {
+		return wt.WriteTo(w)
+	}
+	return io.Copy(w, r.Body)
+}
+
 // PutOptions configures an upload operation, conveying semantic intent.
 type PutOptions struct {
 	// ID is an optional predetermined logical ID. If empty, a UUIDv7 is generated automatically.
