@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/suhwr/blobkit/key"
 	"github.com/suhwr/blobkit/mime"
 )
@@ -1304,17 +1305,22 @@ func (c *Client) resolveTargetWithDeleted(ctx context.Context, target string, al
 		return "", "", ErrInvalidKey
 	}
 
+	cleanTarget := strings.TrimSpace(target)
+	if strings.HasPrefix(cleanTarget, "blobkit:") && !strings.HasPrefix(cleanTarget, "blobkit://") {
+		cleanTarget = strings.TrimPrefix(cleanTarget, "blobkit:")
+	}
+
 	// If registry is configured, check if target matches a logical ObjectID
 	if c.registry != nil {
-		rec, err := c.registry.GetByID(ctx, target)
+		rec, err := c.registry.GetByID(ctx, cleanTarget)
 		if err == nil && rec != nil {
 			if rec.Status == StateCommitted || (allowDeleted && rec.Status == StateDeleted) {
 				return rec.Key, rec.Provider, nil
 			}
-			return "", "", WrapError("resolve_target", target, rec.Provider, ErrObjectNotFound)
+			return "", "", WrapError("resolve_target", cleanTarget, rec.Provider, ErrObjectNotFound)
 		}
 
-		cleanKey := strings.TrimLeft(target, "/")
+		cleanKey := strings.TrimLeft(cleanTarget, "/")
 		recByKey, errByKey := c.registry.GetByKey(ctx, cleanKey)
 		if errByKey == nil && recByKey != nil {
 			if recByKey.Status == StateCommitted || (allowDeleted && recByKey.Status == StateDeleted) {
@@ -1324,7 +1330,7 @@ func (c *Client) resolveTargetWithDeleted(ctx context.Context, target string, al
 		}
 
 		if allowDeleted {
-			recs, _ := c.registry.Find(ctx, Filter{ObjectID: target, Status: StateDeleted})
+			recs, _ := c.registry.Find(ctx, Filter{ObjectID: cleanTarget, Status: StateDeleted})
 			if len(recs) > 0 {
 				return recs[0].Key, recs[0].Provider, nil
 			}
@@ -1333,10 +1339,16 @@ func (c *Client) resolveTargetWithDeleted(ctx context.Context, target string, al
 				return recsByKey[0].Key, recsByKey[0].Provider, nil
 			}
 		}
+
+		// If cleanTarget matches a valid UUID format, it is an ObjectID that was not found in registry.
+		// It must NEVER be treated as a physical storage key.
+		if _, parseErr := uuid.Parse(cleanTarget); parseErr == nil {
+			return "", "", WrapError("resolve_target", cleanTarget, "", ErrObjectNotFound)
+		}
 	}
 
 	// If not found in registry or registry disabled, treat as physical key
-	cleanKey := strings.TrimLeft(target, "/")
+	cleanKey := strings.TrimLeft(cleanTarget, "/")
 	return cleanKey, "", nil
 }
 
