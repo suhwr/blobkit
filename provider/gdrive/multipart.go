@@ -253,6 +253,13 @@ func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, upl
 			return nil, blobkit.WrapError("complete_multipart", obj.Key, d.cfg.Name, err)
 		}
 		res := d.mapDriveFileToObject(obj.Key, &fileResp)
+		if obj != nil && obj.ID != "" {
+			res.ID = obj.ID
+			res.Namespace = obj.Namespace
+			res.OwnerID = obj.OwnerID
+			res.OriginalFilename = obj.OriginalFilename
+			res.Visibility = obj.Visibility
+		}
 		d.cache.Set(obj.Key, fileResp.ID)
 
 		d.sessionsMu.Lock()
@@ -496,6 +503,13 @@ func (d *Driver) uploadStreamResumable(ctx context.Context, obj *blobkit.Object,
 					return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
 				}
 				res := d.mapDriveFileToObject(obj.Key, &fileResp)
+				if obj != nil && obj.ID != "" {
+					res.ID = obj.ID
+					res.Namespace = obj.Namespace
+					res.OwnerID = obj.OwnerID
+					res.OriginalFilename = obj.OriginalFilename
+					res.Visibility = obj.Visibility
+				}
 				d.cache.Set(obj.Key, fileResp.ID)
 				return res, nil
 			} else if resp.StatusCode == 308 {
@@ -549,6 +563,13 @@ func (d *Driver) uploadStreamResumable(ctx context.Context, obj *blobkit.Object,
 			return nil, blobkit.WrapError("put", obj.Key, d.cfg.Name, err)
 		}
 		res := d.mapDriveFileToObject(obj.Key, &fileResp)
+		if obj != nil && obj.ID != "" {
+			res.ID = obj.ID
+			res.Namespace = obj.Namespace
+			res.OwnerID = obj.OwnerID
+			res.OriginalFilename = obj.OriginalFilename
+			res.Visibility = obj.Visibility
+		}
 		d.cache.Set(obj.Key, fileResp.ID)
 		return res, nil
 	}

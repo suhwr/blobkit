@@ -266,20 +266,31 @@ func (c *Client) Put(ctx context.Context, r io.Reader, opts PutOptions) (savedOb
 		return nil, WrapError("checksum_verify", savedObj.Key, driver.Name(), ErrChecksumMismatch)
 	}
 
+	savedObj.ID = obj.ID
+	savedObj.Namespace = obj.Namespace
+	savedObj.OwnerID = obj.OwnerID
+	savedObj.OriginalFilename = obj.OriginalFilename
+	savedObj.Visibility = obj.Visibility
 	savedObj.ChecksumSHA256 = calculatedHash
 	savedObj.ClientChecksum = opts.ClientChecksum
 	savedObj.RetentionUntil = opts.RetentionUntil
 	savedObj.ExpiresAt = opts.ExpiresAt
 	savedObj.LegalHold = opts.LegalHold
 	savedObj.Status = StateCommitted
+	if savedObj.CreatedAt.IsZero() {
+		savedObj.CreatedAt = obj.CreatedAt
+	}
+	if savedObj.UpdatedAt.IsZero() {
+		savedObj.UpdatedAt = time.Now().UTC()
+	}
 
 	// 9. Commit metadata record in database registry
 	if c.registry != nil {
 		rec := &Record{
-			ObjectID:         savedObj.ID,
-			Namespace:        savedObj.Namespace,
-			OwnerID:          savedObj.OwnerID,
-			Key:              savedObj.Key,
+			ObjectID:         obj.ID,
+			Namespace:        obj.Namespace,
+			OwnerID:          obj.OwnerID,
+			Key:              obj.Key,
 			Bucket:           savedObj.Bucket,
 			Provider:         savedObj.Provider,
 			MIMEType:         savedObj.ContentType,

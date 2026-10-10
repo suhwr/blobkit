@@ -34,16 +34,17 @@ type mockFile struct {
 }
 
 type mockSession struct {
-	ID           string
-	Key          string
-	Name         string
-	MimeType     string
-	TotalSize    int64
-	Buffer       []byte
-	Completed    bool
-	FileID       string
-	IsUpdate     bool
-	TargetFileID string
+	ID            string
+	Key           string
+	Name          string
+	MimeType      string
+	TotalSize     int64
+	Buffer        []byte
+	Completed     bool
+	FileID        string
+	IsUpdate      bool
+	TargetFileID  string
+	AppProperties map[string]string
 }
 
 type mockDriveServer struct {
@@ -217,17 +218,22 @@ func (s *mockDriveServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if file == nil {
 					s.nextID++
 					fileID := fmt.Sprintf("file_%d", s.nextID)
+					appProps := make(map[string]string)
+					for k, v := range session.AppProperties {
+						appProps[k] = v
+					}
+					if appProps["blobkit_key"] == "" {
+						appProps["blobkit_key"] = session.Key
+					}
 					file = &mockFile{
-						ID:           fileID,
-						Name:         session.Name,
-						MimeType:     session.MimeType,
-						Data:         session.Buffer,
-						MD5Checksum:  checksum,
-						CreatedTime:  time.Now().UTC(),
-						ModifiedTime: time.Now().UTC(),
-						AppProperties: map[string]string{
-							"blobkit_key": session.Key,
-						},
+						ID:            fileID,
+						Name:          session.Name,
+						MimeType:      session.MimeType,
+						Data:          session.Buffer,
+						MD5Checksum:   checksum,
+						CreatedTime:   time.Now().UTC(),
+						ModifiedTime:  time.Now().UTC(),
+						AppProperties: appProps,
 					}
 					s.files[fileID] = file
 				}
@@ -275,13 +281,14 @@ func (s *mockDriveServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		s.sessions[sessionID] = &mockSession{
-			ID:           sessionID,
-			Key:          meta.AppProperties["blobkit_key"],
-			Name:         meta.Name,
-			MimeType:     r.Header.Get("X-Upload-Content-Type"),
-			TotalSize:    totalSize,
-			IsUpdate:     isUpdate,
-			TargetFileID: targetFileID,
+			ID:            sessionID,
+			Key:           meta.AppProperties["blobkit_key"],
+			Name:          meta.Name,
+			MimeType:      r.Header.Get("X-Upload-Content-Type"),
+			TotalSize:     totalSize,
+			IsUpdate:      isUpdate,
+			TargetFileID:  targetFileID,
+			AppProperties: meta.AppProperties,
 		}
 
 		sessionURI := fmt.Sprintf("http://%s/upload_session/%s", r.Host, sessionID)
@@ -636,6 +643,48 @@ func TestDriver_CRUD_And_ByteRange(t *testing.T) {
 	err = driver.Delete(ctx, "documents/report.pdf")
 	if err != nil {
 		t.Fatalf("expected idempotent Delete, got error: %v", err)
+	}
+}
+
+func TestDriver_PreservesLogicalObjectIDAndMetadata(t *testing.T) {
+	ctx := context.Background()
+	mock := newMockDriveServer()
+	driver, server := setupTestDriver(t, mock)
+	defer server.Close()
+	defer driver.Close()
+
+	payload := []byte("media file content")
+	obj := &blobkit.Object{
+		ID:          "0192abcd-1234-7000-8000-123456789abc",
+		Key:         "developer/uploads/video.mp4",
+		ContentType: "video/mp4",
+		Namespace:   "developer/uploads",
+		OwnerID:     "user-123",
+	}
+
+	saved, err := driver.Put(ctx, obj, bytes.NewReader(payload), blobkit.PutOptions{
+		Size: int64(len(payload)),
+	})
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	if saved.ID != obj.ID {
+		t.Fatalf("expected saved.ID %q, got %q", obj.ID, saved.ID)
+	}
+	if saved.Namespace != obj.Namespace {
+		t.Fatalf("expected saved.Namespace %q, got %q", obj.Namespace, saved.Namespace)
+	}
+	if saved.OwnerID != obj.OwnerID {
+		t.Fatalf("expected saved.OwnerID %q, got %q", obj.OwnerID, saved.OwnerID)
+	}
+
+	// Head should also retrieve the logical ID from appProperties
+	head, err := driver.Head(ctx, obj.Key)
+	if err != nil {
+		t.Fatalf("Head failed: %v", err)
+	}
+	if head.ID != obj.ID {
+		t.Fatalf("expected head.ID %q, got %q", obj.ID, head.ID)
 	}
 }
 

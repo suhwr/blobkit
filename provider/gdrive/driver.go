@@ -101,13 +101,24 @@ func (d *Driver) Capabilities() blobkit.Capability {
 }
 
 func resolveMetadata(obj *blobkit.Object, opts blobkit.PutOptions) map[string]string {
-	if len(opts.Metadata) > 0 {
-		return opts.Metadata
-	}
+	meta := make(map[string]string)
 	if obj != nil && len(obj.Metadata) > 0 {
-		return obj.Metadata
+		for k, v := range obj.Metadata {
+			meta[k] = v
+		}
 	}
-	return nil
+	if len(opts.Metadata) > 0 {
+		for k, v := range opts.Metadata {
+			meta[k] = v
+		}
+	}
+	if obj != nil && obj.ID != "" {
+		meta["blobkit_id"] = obj.ID
+	}
+	if len(meta) == 0 {
+		return nil
+	}
+	return meta
 }
 
 const maxErrorBodyBytes = 64 * 1024
@@ -765,8 +776,13 @@ func (d *Driver) mapDriveFileToObject(key string, file *driveFileResponse) *blob
 		}
 	}
 
+	objectID := file.ID
+	if bid, ok := file.AppProperties["blobkit_id"]; ok && bid != "" {
+		objectID = bid
+	}
+
 	return &blobkit.Object{
-		ID:          file.ID,
+		ID:          objectID,
 		Key:         key,
 		Bucket:      d.cfg.FolderID,
 		Size:        size,
