@@ -176,6 +176,13 @@ func (d *Driver) Put(ctx context.Context, obj *blobkit.Object, r io.Reader, opts
 	}
 
 	result := d.mapObjectResource(cleanKey, &res)
+	if obj != nil && obj.ID != "" {
+		result.ID = obj.ID
+		result.Namespace = obj.Namespace
+		result.OwnerID = obj.OwnerID
+		result.OriginalFilename = obj.OriginalFilename
+		result.Visibility = obj.Visibility
+	}
 	result.ChecksumSHA256 = hex.EncodeToString(h.Sum(nil))
 	result.Metadata = meta
 	result.Provider = d.cfg.Name

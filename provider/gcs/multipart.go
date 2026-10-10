@@ -310,6 +310,13 @@ func (d *Driver) CompleteMultipart(ctx context.Context, obj *blobkit.Object, upl
 	}
 
 	resultObj := d.mapObjectResource(obj.Key, &res)
+	if obj != nil && obj.ID != "" {
+		resultObj.ID = obj.ID
+		resultObj.Namespace = obj.Namespace
+		resultObj.OwnerID = obj.OwnerID
+		resultObj.OriginalFilename = obj.OriginalFilename
+		resultObj.Visibility = obj.Visibility
+	}
 
 	d.sessionsMu.Lock()
 	delete(d.sessions, uploadID)
