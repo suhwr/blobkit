@@ -68,6 +68,70 @@ func NewDriver(cfg Config) (*Driver, error) {
 		return nil, err
 	}
 
+	if cfg.TokenFunc == nil && cfg.BearerToken == "" {
+		if cfg.OAuthFile != "" {
+			src, err := NewOAuthTokenSourceFromFile(cfg.OAuthFile, cfg.RefreshToken)
+			if err != nil {
+				return nil, err
+			}
+			if cfg.TokenURI != "" {
+				src.SetTokenURI(cfg.TokenURI)
+			}
+			if cfg.HTTPClient != nil {
+				src.SetHTTPClient(cfg.HTTPClient)
+			}
+			cfg.TokenFunc = src.Token
+		} else if len(cfg.OAuthJSON) > 0 {
+			src, err := NewOAuthTokenSourceFromJSON(cfg.OAuthJSON, cfg.RefreshToken)
+			if err != nil {
+				return nil, err
+			}
+			if cfg.TokenURI != "" {
+				src.SetTokenURI(cfg.TokenURI)
+			}
+			if cfg.HTTPClient != nil {
+				src.SetHTTPClient(cfg.HTTPClient)
+			}
+			cfg.TokenFunc = src.Token
+		} else if cfg.ClientID != "" || cfg.ClientSecret != "" || cfg.RefreshToken != "" {
+			src, err := NewOAuthTokenSource(cfg.ClientID, cfg.ClientSecret, cfg.RefreshToken)
+			if err != nil {
+				return nil, err
+			}
+			if cfg.TokenURI != "" {
+				src.SetTokenURI(cfg.TokenURI)
+			}
+			if cfg.HTTPClient != nil {
+				src.SetHTTPClient(cfg.HTTPClient)
+			}
+			cfg.TokenFunc = src.Token
+		} else if cfg.ServiceAccountFile != "" {
+			src, err := NewServiceAccountTokenSourceFromFile(cfg.ServiceAccountFile)
+			if err != nil {
+				return nil, err
+			}
+			if cfg.TokenURI != "" {
+				src.SetTokenURI(cfg.TokenURI)
+			}
+			if cfg.HTTPClient != nil {
+				src.SetHTTPClient(cfg.HTTPClient)
+			}
+			cfg.TokenFunc = src.Token
+		} else if len(cfg.ServiceAccountJSON) > 0 {
+			src, err := NewServiceAccountTokenSourceFromJSON(cfg.ServiceAccountJSON)
+			if err != nil {
+				return nil, err
+			}
+			if cfg.TokenURI != "" {
+				src.SetTokenURI(cfg.TokenURI)
+			}
+			if cfg.HTTPClient != nil {
+				src.SetHTTPClient(cfg.HTTPClient)
+			}
+			cfg.TokenFunc = src.Token
+		}
+	}
+
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
 		httpClient = &http.Client{

@@ -35,11 +35,22 @@ type Config struct {
     // HTTPClient is an optional preconfigured HTTP client. If nil, a client with Timeout=0 is used.
     HTTPClient *http.Client
 
-    // TokenFunc is a function that supplies fresh OAuth2 bearer tokens (recommended for production).
+    // TokenFunc is a function that supplies fresh OAuth2 bearer tokens (optional if OAuth/Service Account fields are set).
     TokenFunc func(ctx context.Context) (string, error)
 
     // BearerToken is a static OAuth2 token (primarily for testing or short-lived CLI tasks).
     BearerToken string
+
+    // Native OAuth2 User Token auto-initialization:
+    ClientID     string
+    ClientSecret string
+    RefreshToken string
+    OAuthFile    string // Path to oauth credentials file (client_secret.json or custom JSON)
+    OAuthJSON    []byte // Raw JSON bytes
+
+    // Native Service Account auto-initialization:
+    ServiceAccountFile string // Path to service-account.json
+    ServiceAccountJSON []byte // Raw JSON bytes
 
     // ChunkSize is the chunk size in bytes for resumable multipart uploads.
     // Must be an exact multiple of 256 KiB (MinChunkSize). Defaults to 8 MiB (DefaultChunkSize).
@@ -82,13 +93,15 @@ import (
 func main() {
     ctx := context.Background()
 
-    // Create a dynamic token provider using OAuth2 user credentials
-    tokenSource := NewOAuthTokenSource(clientID, clientSecret, refreshToken)
-
+    // BlobKit natively manages OAuth2 refresh tokens and token caching!
     driver, err := gdrive.NewDriver(gdrive.Config{
         Name:              "gdrive-personal",
         FolderID:          "1NAmklWOFHvDEJ1HV5jAeSbKmFpYfRZ5z", // Target folder ID
-        TokenFunc:         tokenSource.Token,
+        ClientID:          "your-client-id.apps.googleusercontent.com",
+        ClientSecret:      "your-client-secret",
+        RefreshToken:      "1//04your-refresh-token",
+        // Or specify an OAuth JSON file path:
+        // OAuthFile:      "/etc/secrets/gdrive_oauth.json",
         SupportsAllDrives: true,
         ChunkSize:         8 * 1024 * 1024, // 8 MiB chunks
     })
@@ -137,13 +150,12 @@ import (
 func main() {
     ctx := context.Background()
 
-    saTokenSource := NewServiceAccountTokenSource("path/to/service-account.json")
-
+    // BlobKit natively parses service account keys and manages RSA-signed JWT tokens!
     driver, err := gdrive.NewDriver(gdrive.Config{
-        Name:              "gdrive-shared",
-        FolderID:          "0AJk2...ABC", // Google Shared Drive ID
-        TokenFunc:         saTokenSource.Token,
-        SupportsAllDrives: true,
+        Name:               "gdrive-shared",
+        FolderID:           "0AJk2...ABC", // Google Shared Drive ID
+        ServiceAccountFile: "path/to/service-account.json",
+        SupportsAllDrives:  true,
     })
     if err != nil {
         panic(err)

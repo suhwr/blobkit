@@ -45,6 +45,20 @@ type Config struct {
 	// BearerToken is a static OAuth2 token. Used primarily for testing or short-lived executions.
 	BearerToken string
 
+	// User OAuth2 credentials (automatically initializes TokenFunc if TokenFunc is nil).
+	ClientID     string
+	ClientSecret string
+	RefreshToken string
+	OAuthFile    string
+	OAuthJSON    []byte
+
+	// Service Account credentials (automatically initializes TokenFunc if TokenFunc is nil).
+	ServiceAccountFile string
+	ServiceAccountJSON []byte
+
+	// TokenURI allows overriding the OAuth2 token endpoint (defaults to https://oauth2.googleapis.com/token).
+	TokenURI string
+
 	// ChunkSize is the chunk size in bytes for resumable multipart uploads.
 	// Must be an exact multiple of 256 KiB (MinChunkSize). Defaults to DefaultChunkSize (8 MiB).
 	ChunkSize int
