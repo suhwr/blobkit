@@ -61,6 +61,9 @@ func wrapHTTPError(op, key, driverName string, statusCode int, body []byte, rawE
 
 	switch statusCode {
 	case http.StatusNotFound:
+		if errMsg != "" && errMsg != "Not Found" {
+			return blobkit.WrapError(op, key, driverName, fmt.Errorf("%w: %s", blobkit.ErrObjectNotFound, errMsg))
+		}
 		return blobkit.WrapError(op, key, driverName, blobkit.ErrObjectNotFound)
 
 	case http.StatusPreconditionFailed, http.StatusRequestedRangeNotSatisfiable, http.StatusNotModified:

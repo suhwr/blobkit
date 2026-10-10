@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -415,7 +416,13 @@ func (d *Driver) uploadStreamResumable(ctx context.Context, obj *blobkit.Object,
 	meta := resolveMetadata(obj, opts)
 	session, err := d.initiateResumableSession(ctx, obj.Key, obj.ContentType, opts.Size, existingFileID, meta)
 	if err != nil {
-		return nil, err
+		if existingFileID != "" && errors.Is(err, blobkit.ErrObjectNotFound) {
+			d.cache.Delete(obj.Key)
+			session, err = d.initiateResumableSession(ctx, obj.Key, obj.ContentType, opts.Size, "", meta)
+		}
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	chunkSize := d.cfg.ChunkSize

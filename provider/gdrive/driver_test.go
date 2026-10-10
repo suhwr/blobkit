@@ -1238,3 +1238,44 @@ func TestGDrive_Copy_OverwritesAndDeletesDuplicate(t *testing.T) {
 	}
 }
 
+func TestGDrive_Put_StaleCacheRetry(t *testing.T) {
+	mock := newMockDriveServer()
+	driver, server := setupTestDriver(t, mock)
+	defer server.Close()
+	defer driver.Close()
+	ctx := context.Background()
+
+	key := "test/stale.txt"
+	// Put initial object
+	_, err := driver.Put(ctx, &blobkit.Object{Key: key}, strings.NewReader("initial"), blobkit.PutOptions{
+		Size:         7,
+		ExplicitSize: true,
+	})
+	if err != nil {
+		t.Fatalf("initial Put failed: %v", err)
+	}
+
+	// Now delete file directly behind driver's back on the mock server to simulate external deletion
+	mock.mu.Lock()
+	for id, f := range mock.files {
+		if f.AppProperties != nil && f.AppProperties["blobkit_key"] == key {
+			delete(mock.files, id)
+			break
+		}
+	}
+	mock.mu.Unlock()
+
+	// Put again: driver's cache has stale file ID, PATCH returns 404, driver should evict cache and retry as POST
+	saved, err := driver.Put(ctx, &blobkit.Object{Key: key}, strings.NewReader("updated after external delete"), blobkit.PutOptions{
+		Size:         29,
+		ExplicitSize: true,
+	})
+	if err != nil {
+		t.Fatalf("Put with stale cache failed to recover: %v", err)
+	}
+	if saved.Size != 29 {
+		t.Fatalf("expected size 29, got %d", saved.Size)
+	}
+}
+
+
